@@ -15,8 +15,10 @@ mod theme;
 mod util;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use app::LaunchOptions;
+use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 use luban_core::settings::Settings;
 
@@ -55,6 +57,20 @@ fn parse_args() -> LaunchOptions {
     }
 }
 
+/// Decode the icon embedded in the binary so the taskbar entry is correct even
+/// when the desktop entry and icon theme are not installed (X11 only).
+fn window_icon() -> Option<Arc<image::RgbaImage>> {
+    const ICON_PNG: &[u8] =
+        include_bytes!("../../../packaging/linux/icons/hicolor/256x256/apps/luban-notepad.png");
+    match image::load_from_memory(ICON_PNG) {
+        Ok(icon) => Some(Arc::new(icon.to_rgba8())),
+        Err(error) => {
+            log::warn!("failed to decode the embedded window icon: {error}");
+            None
+        }
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("luban_notepad=info,gpui=warn"),
@@ -79,9 +95,16 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Luban Notepad".into()),
-                    ..Default::default()
+                    ..TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                // The application draws its own title bar on every desktop;
+                // Linux compositors must hand window decorations to us.
+                window_decorations: Some(WindowDecorations::Client),
+                // Keep the window grouped with its desktop entry so docks and
+                // taskbars pick up the installed icon on Wayland as well.
+                app_id: Some("luban-notepad".into()),
+                icon: window_icon(),
+                ..TitleBar::window_options()
             };
             let result = gpui_kit::open_window(window_options, cx, |window, cx| {
                 cx.new(|cx| app::LubanApp::new(window, cx, options))

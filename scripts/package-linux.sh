@@ -59,7 +59,7 @@ mkdir -p "$stage"
 install -m 755 "$binary" "$stage/luban-notepad"
 install -m 644 README.md CHANGELOG.md LICENSE THIRD_PARTY_LICENSES.md "$stage/"
 install -m 644 packaging/linux/luban-notepad.desktop "$stage/"
-install -m 644 packaging/linux/luban-notepad.svg "$stage/"
+install -m 644 packaging/linux/luban-notepad.png "$stage/"
 
 mkdir -p "$dist"
 tar --sort=name --owner=0 --group=0 --numeric-owner \
@@ -75,13 +75,15 @@ if command -v dpkg-deb >/dev/null 2>&1; then
         "$deb_root/DEBIAN" \
         "$deb_root/usr/bin" \
         "$deb_root/usr/share/applications" \
-        "$deb_root/usr/share/icons/hicolor/scalable/apps" \
+        "$deb_root/usr/share/icons/hicolor" \
         "$deb_root/usr/share/doc/luban-notepad"
     install -m 755 "$binary" "$deb_root/usr/bin/luban-notepad"
     install -m 644 packaging/linux/luban-notepad.desktop \
         "$deb_root/usr/share/applications/luban-notepad.desktop"
-    install -m 644 packaging/linux/luban-notepad.svg \
-        "$deb_root/usr/share/icons/hicolor/scalable/apps/luban-notepad.svg"
+    for size in 16 24 32 48 64 128 256 512 1024; do
+        install -Dm644 "packaging/linux/icons/hicolor/${size}x${size}/apps/luban-notepad.png" \
+            "$deb_root/usr/share/icons/hicolor/${size}x${size}/apps/luban-notepad.png"
+    done
     install -m 644 README.md CHANGELOG.md THIRD_PARTY_LICENSES.md \
         "$deb_root/usr/share/doc/luban-notepad/"
     install -m 644 LICENSE "$deb_root/usr/share/doc/luban-notepad/copyright"

@@ -1,0 +1,216 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Check tag matches Cargo.toml
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          tag="${RELEASE_TAG#refs/tags/}"
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          if [ "${tag#v}" != "$version" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (version $version)"
+
+  linux:
+    name: Linux x86_64
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config clang cmake \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxcb1-dev libxcb-xkb-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libbz2-dev libpng-dev libbrotli-dev libffi-dev zlib1g-dev \
+            libexpat1-dev uuid-dev
+
+      - name: Build release
+        run: cargo build --release --locked -p luban-app
+
+      - name: Build packages
+        run: scripts/package-linux.sh --skip-build
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows x86_64
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked -p luban-app
+
+      - name: Build package
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -SkipBuild
+
+      - name: Verify executable icon
+        shell: pwsh
+        run: |
+          $signature = @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class IconCheck {
+              [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+              public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+          }
+          '@
+          Add-Type -TypeDefinition $signature
+          $exe = Get-ChildItem -Path dist -Recurse -Filter luban-notepad.exe | Select-Object -First 1
+          if (-not $exe) { throw "staged executable not found" }
+          $count = [IconCheck]::ExtractIconEx($exe.FullName, -1, $null, $null, 0)
+          if ($count -lt 1) { throw "luban-notepad.exe has no icon resource" }
+          Write-Host "embedded icon groups: $count"
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked -p luban-app
+
+      - name: Build package
+        run: scripts/package-macos.sh --skip-build
+
+      - name: Verify bundle icon
+        run: |
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" \
+            "dist/Luban Notepad.app/Contents/Info.plist"
+          test -f "dist/Luban Notepad.app/Contents/Resources/luban-notepad.icns"
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: find artifacts -type f -printf '%P %s bytes\n' | sort
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: Luban Notepad ${{ needs.validate.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.validate.outputs.tag, '-') }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

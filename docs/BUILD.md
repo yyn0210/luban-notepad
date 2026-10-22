@@ -18,7 +18,9 @@ cargo build -p luban-app
 ./target/debug/luban-notepad
 ```
 
-## 打包（Linux）
+## 打包
+
+### Linux
 
 `scripts/package-linux.sh` 会构建 release 二进制，并在 `dist/` 下生成可移植
 压缩包和 Debian 安装包（若系统提供 `dpkg-deb`）：
@@ -32,10 +34,55 @@ scripts/package-linux.sh
 - `dist/luban-notepad-<版本>-linux-<架构>.tar.gz`：二进制、README、许可证、
   更新日志以及 `.desktop`/图标文件。
 - `dist/luban-notepad_<版本>_<架构>.deb`：安装到 `/usr/bin`、
-  `/usr/share/applications` 和 `/usr/share/icons/hicolor/scalable/apps`。
+  `/usr/share/applications` 和 `/usr/share/icons/hicolor/<尺寸>x<尺寸>/apps`。
 
 已经构建过 release 二进制时，可加 `--skip-build` 复用现有产物。打包脚本使用
 `CARGO_TARGET_DIR`（若已设置）定位二进制。
+
+### macOS
+
+`scripts/package-macos.sh` 会生成 `dist/Luban Notepad.app`，其中包含
+`Contents/Resources/luban-notepad.icns` 和对应的 `Info.plist`，并打包为 zip：
+
+```bash
+scripts/package-macos.sh
+```
+
+同样支持 `--skip-build`。若系统提供 `codesign`，脚本会对 bundle 进行 ad-hoc
+签名。
+
+### Windows
+
+`cargo build --release -p luban-app` 时，`crates/luban-app/build.rs` 会把
+`packaging/windows/luban-notepad.ico` 编译进可执行文件。Windows 任务栏和窗口
+图标直接来自该资源，无需额外的打包步骤。
+
+需要便携压缩包时，在 PowerShell 中运行：
+
+```powershell
+scripts/package-windows.ps1
+```
+
+产物为 `dist/luban-notepad-<版本>-windows-<架构>.zip` 及其 `.sha256` 校验文件。
+
+平台图标由 `scripts/generate-platform-icons.py` 从 Linux hicolor PNG 集生成：
+Windows 使用多尺寸 `.ico`，macOS 使用 `.icns`。
+
+## 发布
+
+发布由 `.github/workflows/release.yml` 驱动。将 `Cargo.toml` 中的版本改为目标
+版本并提交后，推送同名标签：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流会校验标签与 `Cargo.toml` 版本一致，构建 Linux（`.tar.gz`、`.deb`）、
+Windows（`.zip`）以及 macOS arm64/x86_64（`.zip`），然后创建 GitHub Release，
+自动生成发布说明并附带各产物的 SHA-256 校验文件。
+
+也可以在 Actions 页面手动运行 `Release` 工作流，输入一个已经存在的标签。
 
 ## Linux
 
@@ -86,13 +133,17 @@ WGPU_BACKEND=gl target/release/luban-notepad
 - 安装 Xcode Command Line Tools：`xcode-select --install`。
 - 需要支持 Metal 的 Mac。
 
+`scripts/package-macos.sh` 会构建 release 并生成可双击运行的
+`dist/Luban Notepad.app`：
+
 ```bash
-cargo build --release -p luban-app
-open target/release/luban-notepad
+scripts/package-macos.sh
+open "dist/Luban Notepad.app"
 ```
 
-二进制文件未进行代码签名。Gatekeeper 可能要求首次运行时右键 → 打开，或进行
-临时签名（`codesign --force --deep -s -`）。
+直接运行 `target/release/luban-notepad` 时没有 app bundle，Dock 会显示通用图标；
+该二进制未签名，Gatekeeper 可能要求右键 → 打开。打包脚本生成的 `.app` 会进行
+ad-hoc 签名。
 
 ## Windows
 
@@ -105,6 +156,8 @@ open target/release/luban-notepad
 cargo build --release -p luban-app
 .\target\release\luban-notepad.exe
 ```
+
+构建时会自动嵌入 `packaging/windows/luban-notepad.ico`。
 
 ## CI 与冒烟测试
 

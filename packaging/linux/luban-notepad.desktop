@@ -8,6 +8,7 @@ Comment=Cross-platform tabbed text and source code editor
 Comment[zh_CN]=跨平台标签页文本与源代码编辑器
 Exec=luban-notepad %F
 Icon=luban-notepad
+StartupWMClass=luban-notepad
 Terminal=false
 Categories=Utility;TextEditor;
 Keywords=notepad;editor;text;code;source;

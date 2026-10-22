@@ -18,11 +18,15 @@ anyhow.workspace = true
 dirs.workspace = true
 env_logger = "0.11"
 gpui-kit = { version = "0.8.0", features = ["syntect"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 log.workspace = true
 rust-i18n.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 walkdir.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0"
 
 [dev-dependencies]
 serde-saphyr = "1.3"

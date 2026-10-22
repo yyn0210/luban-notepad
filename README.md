@@ -111,15 +111,17 @@ cargo build --release -p luban-app
 
 生成的二进制文件位于 `target/release/luban-notepad`。
 
-在 Linux 上生成可分发的压缩包与 Debian 安装包：
+在 Linux 和 macOS 上生成可分发的安装包：
 
 ```bash
-scripts/package-linux.sh
+scripts/package-linux.sh   # dist/*.tar.gz, dist/*.deb
+scripts/package-macos.sh   # dist/Luban Notepad.app, dist/*.zip
 ```
 
-产物写入 `dist/`（`.tar.gz` 与 `.deb`）。
+Windows 上运行 `scripts/package-windows.ps1` 可生成便携 zip；release 可执行文件
+也会通过构建脚本自动嵌入 `.ico` 图标资源。
 
-各平台的详细说明与故障排查：[docs/BUILD.md](docs/BUILD.md)。
+产物写入 `dist/`。各平台的详细说明与故障排查：[docs/BUILD.md](docs/BUILD.md)。
 
 ## 运行
 
@@ -203,6 +205,10 @@ xvfb-run -a -s "-screen 0 1440x900x24" \
 
 持续集成会在 Ubuntu、Windows 和 macOS 上构建并测试，同时运行 Linux GUI
 冒烟测试。参见 `.github/workflows/ci.yml`。
+
+发布由标签驱动：更新 `Cargo.toml` 中的版本后推送 `v<版本>` 标签，
+`.github/workflows/release.yml` 会构建三平台产物并创建 GitHub Release。
+详见 [docs/BUILD.md](docs/BUILD.md)。
 
 ## 功能对齐程度
 

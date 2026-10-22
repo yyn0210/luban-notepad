@@ -76,6 +76,22 @@ jobs:
       - name: Build release
         run: cargo build --release -p luban-app
 
+      - name: Verify executable icon
+        shell: pwsh
+        run: |
+          $signature = @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class IconCheck {
+              [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+              public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+          }
+          '@
+          Add-Type -TypeDefinition $signature
+          $count = [IconCheck]::ExtractIconEx("$PWD\target\release\luban-notepad.exe", -1, $null, $null, 0)
+          if ($count -lt 1) { throw "luban-notepad.exe has no icon resource" }
+          Write-Host "embedded icon groups: $count"
+
   macos:
     name: macOS
     runs-on: macos-14
@@ -93,3 +109,20 @@ jobs:
 
       - name: Build release
         run: cargo build --release -p luban-app
+
+      - name: Package app bundle
+        run: scripts/package-macos.sh --skip-build
+
+      - name: Verify bundle icon
+        run: |
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" \
+            "dist/Luban Notepad.app/Contents/Info.plist"
+          test -f "dist/Luban Notepad.app/Contents/Resources/luban-notepad.icns"
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: luban-notepad-macos
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256

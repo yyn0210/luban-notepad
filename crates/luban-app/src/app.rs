@@ -12,6 +12,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::theme::ActiveTheme as _;
+use gpui_kit::component::TitleBar;
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use luban_core::document::Document;
@@ -2249,7 +2250,7 @@ impl LubanApp {
         })
     }
 
-    fn render_menu_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_menu_buttons(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         let settings = self.settings.clone();
         let recent = self.settings.recent_files.clone();
@@ -2835,17 +2836,68 @@ impl LubanApp {
             .flex()
             .items_center()
             .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().colors.border)
-            .bg(cx.theme().colors.background)
             .child(file_menu)
             .child(edit_menu)
             .child(search_menu)
             .child(view_menu)
             .child(settings_menu)
             .child(help_menu)
+            .into_any_element()
+    }
+
+    /// Standalone menu row used when the platform falls back to server-side
+    /// decorations and the application must not draw its own title bar.
+    fn render_menu_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let menus = self.render_menu_buttons(cx);
+        div()
+            .flex()
+            .items_center()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().colors.border)
+            .bg(cx.theme().colors.background)
+            .child(menus)
+            .into_any_element()
+    }
+
+    /// The application title bar owns the window chrome: document title,
+    /// menus, and (on Windows/Linux) the window control buttons.
+    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let title = self.window_title.clone();
+        let menus = self.render_menu_buttons(cx);
+        let weak = cx.weak_entity();
+
+        TitleBar::new()
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .max_w(px(320.))
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(div().flex_shrink_0().child(menus)),
+            )
+            // `on_close_window` only takes effect on Linux, where the custom
+            // close button must go through the same unsaved-changes flow as
+            // the window manager's close request.
+            .on_close_window(move |_, window, cx| {
+                let should_close = weak
+                    .update(cx, |this, cx| this.on_should_close(window, cx))
+                    .unwrap_or(true);
+                if should_close {
+                    cx.quit();
+                }
+            })
             .into_any_element()
     }
 
@@ -4796,7 +4848,16 @@ impl Render for LubanApp {
         let show_find = self.find.open;
         let overlays = self.render_overlays(window, cx);
 
-        let menu = self.render_menu_bar(window, cx);
+        // Draw our own title bar unless Linux fell back to server-side
+        // decorations; in that case the window manager already owns the title
+        // bar, and the menus keep their own row.
+        let use_custom_title_bar = !cfg!(target_os = "linux")
+            || matches!(window.window_decorations(), Decorations::Client { .. });
+        let chrome = if use_custom_title_bar {
+            self.render_title_bar(cx)
+        } else {
+            self.render_menu_bar(window, cx)
+        };
         let toolbar = if show_toolbar {
             Some(self.render_toolbar(window, cx))
         } else {
@@ -4845,7 +4906,7 @@ impl Render for LubanApp {
                 }),
             )
             .capture_key_down(key_listener)
-            .child(menu);
+            .child(chrome);
         if let Some(toolbar) = toolbar {
             root = root.child(toolbar);
         }
