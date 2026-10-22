@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Luban Notepad
+Name[zh_CN]=鲁班记事本
+GenericName=Text Editor
+GenericName[zh_CN]=文本编辑器
+Comment=Cross-platform tabbed text and source code editor
+Comment[zh_CN]=跨平台标签页文本与源代码编辑器
+Exec=luban-notepad %F
+Icon=luban-notepad
+Terminal=false
+Categories=Utility;TextEditor;
+Keywords=notepad;editor;text;code;source;
+Keywords[zh_CN]=记事本;编辑器;文本;代码;源码;
+MimeType=text/plain;

@@ -1,0 +1,98 @@
+_version: 2
+
+core.error.io:
+  en: "I/O error: %{error}"
+  zh-CN: "输入/输出错误：%{error}"
+core.error.invalid_path:
+  en: "invalid path: %{path}"
+  zh-CN: "无效路径：%{path}"
+core.error.file_too_large:
+  en: "file is too large to open (%{size} bytes, limit is %{limit} bytes)"
+  zh-CN: "文件过大，无法打开（%{size} 字节，上限 %{limit} 字节）"
+core.error.binary_file:
+  en: "binary file detected: %{path}"
+  zh-CN: "检测到二进制文件：%{path}"
+core.error.encoding:
+  en: "encoding error: %{error}"
+  zh-CN: "编码错误：%{error}"
+core.error.serialization:
+  en: "serialization error: %{error}"
+  zh-CN: "序列化错误：%{error}"
+
+core.encoding.utf8:
+  en: "UTF-8"
+  zh-CN: "UTF-8"
+core.encoding.utf8_bom:
+  en: "UTF-8 with BOM"
+  zh-CN: "带 BOM 的 UTF-8"
+core.encoding.utf16_le:
+  en: "UTF-16 LE"
+  zh-CN: "UTF-16 LE"
+core.encoding.utf16_be:
+  en: "UTF-16 BE"
+  zh-CN: "UTF-16 BE"
+core.encoding.windows1252:
+  en: "ANSI (Windows-1252)"
+  zh-CN: "ANSI (Windows-1252)"
+core.encoding.iso88591:
+  en: "ISO-8859-1"
+  zh-CN: "ISO-8859-1"
+core.encoding.gb18030:
+  en: "GB18030 (Chinese)"
+  zh-CN: "GB18030（中文）"
+core.encoding.shift_jis:
+  en: "Shift-JIS (Japanese)"
+  zh-CN: "Shift-JIS（日文）"
+core.encoding.euc_kr:
+  en: "EUC-KR (Korean)"
+  zh-CN: "EUC-KR（韩文）"
+core.encoding.big5:
+  en: "Big5 (Traditional Chinese)"
+  zh-CN: "Big5（繁体中文）"
+
+core.eol.lf_long:
+  en: "Unix (LF)"
+  zh-CN: "Unix（LF）"
+core.eol.crlf_long:
+  en: "Windows (CRLF)"
+  zh-CN: "Windows（CRLF）"
+core.eol.cr_long:
+  en: "Macintosh (CR)"
+  zh-CN: "Macintosh（CR）"
+
+core.language.plain_text:
+  en: "Plain Text"
+  zh-CN: "纯文本"
+core.language.assembly:
+  en: "Assembly"
+  zh-CN: "汇编"
+core.language.batch:
+  en: "Batch"
+  zh-CN: "批处理"
+core.language.diff:
+  en: "Diff"
+  zh-CN: "差异"
+core.language.properties:
+  en: "Properties"
+  zh-CN: "属性"
+
+core.document.no_path:
+  en: "document has no path"
+  zh-CN: "文档尚未关联文件路径"
+core.document.read_only:
+  en: "document is read-only"
+  zh-CN: "文档为只读"
+
+core.search.empty_text:
+  en: "search text is empty"
+  zh-CN: "搜索内容为空"
+core.search.empty_pattern:
+  en: "empty search pattern"
+  zh-CN: "搜索模式为空"
+core.search.invalid_regex:
+  en: "invalid regular expression: %{error}"
+  zh-CN: "无效的正则表达式：%{error}"
+
+core.encoding.decode_failed:
+  en: "could not decode input"
+  zh-CN: "无法解码输入"

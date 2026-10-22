@@ -1,0 +1,709 @@
+_version: 2
+
+cli.help:
+  en: "Luban Notepad %{version}\n\nUsage: luban-notepad [--new] [--smoke-test] [FILE ...]\n\nA cross-platform Rust reimplementation of the Notepad++ editing experience."
+  zh-CN: "Luban Notepad %{version}\n\n用法：luban-notepad [--new] [--smoke-test] [文件 ...]\n\n使用 Rust 与 GPUI 跨平台重新实现 Notepad++ 的编辑体验。"
+
+common.close:
+  en: "Close"
+  zh-CN: "关闭"
+common.cancel:
+  en: "Cancel"
+  zh-CN: "取消"
+
+menu.file:
+  en: "File"
+  zh-CN: "文件"
+menu.file.new:
+  en: "New"
+  zh-CN: "新建"
+menu.file.open:
+  en: "Open…"
+  zh-CN: "打开…"
+menu.file.open_folder:
+  en: "Open Folder…"
+  zh-CN: "打开文件夹…"
+menu.file.no_recent:
+  en: "No Recent Files"
+  zh-CN: "无最近文件"
+menu.file.recent:
+  en: "Recent: %{path}"
+  zh-CN: "最近：%{path}"
+menu.file.save:
+  en: "Save"
+  zh-CN: "保存"
+menu.file.save_as:
+  en: "Save As…"
+  zh-CN: "另存为…"
+menu.file.save_all:
+  en: "Save All"
+  zh-CN: "全部保存"
+menu.file.reload:
+  en: "Reload from Disk"
+  zh-CN: "从磁盘重新加载"
+menu.file.close:
+  en: "Close"
+  zh-CN: "关闭"
+menu.file.close_all:
+  en: "Close All"
+  zh-CN: "全部关闭"
+menu.file.exit:
+  en: "Exit"
+  zh-CN: "退出"
+
+menu.edit:
+  en: "Edit"
+  zh-CN: "编辑"
+menu.edit.undo:
+  en: "Undo"
+  zh-CN: "撤销"
+menu.edit.redo:
+  en: "Redo"
+  zh-CN: "重做"
+menu.edit.cut:
+  en: "Cut"
+  zh-CN: "剪切"
+menu.edit.copy:
+  en: "Copy"
+  zh-CN: "复制"
+menu.edit.paste:
+  en: "Paste"
+  zh-CN: "粘贴"
+menu.edit.select_all:
+  en: "Select All"
+  zh-CN: "全选"
+menu.edit.indent:
+  en: "Indent"
+  zh-CN: "增加缩进"
+menu.edit.outdent:
+  en: "Outdent"
+  zh-CN: "减少缩进"
+menu.edit.duplicate_line:
+  en: "Duplicate Line"
+  zh-CN: "复制当前行"
+menu.edit.delete_line:
+  en: "Delete Line"
+  zh-CN: "删除当前行"
+menu.edit.toggle_comment:
+  en: "Toggle Comment"
+  zh-CN: "切换注释"
+menu.edit.trim_whitespace:
+  en: "Trim Trailing Whitespace"
+  zh-CN: "删除行尾空白"
+menu.edit.uppercase:
+  en: "Uppercase"
+  zh-CN: "转为大写"
+menu.edit.lowercase:
+  en: "Lowercase"
+  zh-CN: "转为小写"
+menu.edit.title_case:
+  en: "Title Case"
+  zh-CN: "转为标题格式"
+menu.edit.sort_asc:
+  en: "Sort Lines Ascending"
+  zh-CN: "按升序排序行"
+menu.edit.sort_desc:
+  en: "Sort Lines Descending"
+  zh-CN: "按降序排序行"
+menu.edit.eol:
+  en: "EOL: %{eol}"
+  zh-CN: "换行符：%{eol}"
+menu.edit.encoding:
+  en: "Encoding: %{encoding}"
+  zh-CN: "编码：%{encoding}"
+
+menu.search:
+  en: "Search"
+  zh-CN: "搜索"
+menu.search.find:
+  en: "Find…"
+  zh-CN: "查找…"
+menu.search.replace:
+  en: "Replace…"
+  zh-CN: "替换…"
+menu.search.find_next:
+  en: "Find Next"
+  zh-CN: "查找下一个"
+menu.search.find_previous:
+  en: "Find Previous"
+  zh-CN: "查找上一个"
+menu.search.go_to_line:
+  en: "Go to Line…"
+  zh-CN: "转到行…"
+menu.search.find_in_files:
+  en: "Find in Files…"
+  zh-CN: "在文件中查找…"
+menu.search.clear_highlights:
+  en: "Clear Search Highlights"
+  zh-CN: "清除搜索高亮"
+
+menu.view:
+  en: "View"
+  zh-CN: "视图"
+menu.view.word_wrap:
+  en: "Word Wrap"
+  zh-CN: "自动换行"
+menu.view.line_numbers:
+  en: "Line Numbers"
+  zh-CN: "行号"
+menu.view.toolbar:
+  en: "Toolbar"
+  zh-CN: "工具栏"
+menu.view.status_bar:
+  en: "Status Bar"
+  zh-CN: "状态栏"
+menu.view.explorer:
+  en: "File Explorer"
+  zh-CN: "文件浏览器"
+menu.view.zoom_in:
+  en: "Zoom In"
+  zh-CN: "放大"
+menu.view.zoom_out:
+  en: "Zoom Out"
+  zh-CN: "缩小"
+menu.view.zoom_reset:
+  en: "Reset Zoom"
+  zh-CN: "重置缩放"
+menu.view.light_theme:
+  en: "Light Theme"
+  zh-CN: "浅色主题"
+menu.view.dark_theme:
+  en: "Dark Theme"
+  zh-CN: "深色主题"
+menu.view.choose_language:
+  en: "Choose Language…"
+  zh-CN: "选择语言…"
+menu.view.language:
+  en: "Language: %{language}"
+  zh-CN: "语言：%{language}"
+
+menu.settings:
+  en: "Settings"
+  zh-CN: "设置"
+menu.settings.preferences:
+  en: "Preferences…"
+  zh-CN: "首选项…"
+menu.help:
+  en: "Help"
+  zh-CN: "帮助"
+menu.help.shortcuts:
+  en: "Keyboard Shortcuts"
+  zh-CN: "键盘快捷键"
+menu.help.about:
+  en: "About Luban Notepad"
+  zh-CN: "关于 Luban Notepad"
+
+toolbar.new:
+  en: "New"
+  zh-CN: "新建"
+toolbar.open:
+  en: "Open"
+  zh-CN: "打开"
+toolbar.save:
+  en: "Save"
+  zh-CN: "保存"
+toolbar.undo:
+  en: "Undo"
+  zh-CN: "撤销"
+toolbar.redo:
+  en: "Redo"
+  zh-CN: "重做"
+toolbar.find:
+  en: "Find"
+  zh-CN: "查找"
+toolbar.replace:
+  en: "Replace"
+  zh-CN: "替换"
+toolbar.find_in_files:
+  en: "Find in Files"
+  zh-CN: "在文件中查找"
+toolbar.wrap:
+  en: "Wrap"
+  zh-CN: "自动换行"
+toolbar.theme:
+  en: "Theme"
+  zh-CN: "主题"
+
+status.line_col:
+  en: "Ln %{line}, Col %{column}"
+  zh-CN: "行 %{line}，列 %{column}"
+status.selection:
+  en: "Sel %{count}"
+  zh-CN: "选区 %{count}"
+status.chars.one:
+  en: "1 char"
+  zh-CN: "1 个字符"
+status.chars.other:
+  en: "%{count} chars"
+  zh-CN: "%{count} 个字符"
+status.lines.one:
+  en: "1 line"
+  zh-CN: "1 行"
+status.lines.other:
+  en: "%{count} lines"
+  zh-CN: "%{count} 行"
+status.modified:
+  en: "MODIFIED"
+  zh-CN: "已修改"
+status.saved_state:
+  en: "Saved"
+  zh-CN: "已保存"
+status.zoom:
+  en: "%{percent}%"
+  zh-CN: "%{percent}%"
+header.unsaved:
+  en: "  ·  unsaved changes"
+  zh-CN: "  ·  有未保存的更改"
+untitled.name:
+  en: "new %{number}"
+  zh-CN: "新建 %{number}"
+
+explorer.title:
+  en: "EXPLORER"
+  zh-CN: "资源管理器"
+explorer.open_folder:
+  en: "Open Folder"
+  zh-CN: "打开文件夹"
+explorer.empty:
+  en: "No folder open. Use File → Open Folder or the button above."
+  zh-CN: "尚未打开文件夹。请使用“文件 → 打开文件夹”或上方按钮。"
+
+find.query_placeholder:
+  en: "Find"
+  zh-CN: "查找"
+find.replacement_placeholder:
+  en: "Replace with"
+  zh-CN: "替换为"
+find.previous:
+  en: "Previous"
+  zh-CN: "上一个"
+find.next:
+  en: "Next"
+  zh-CN: "下一个"
+find.match_case:
+  en: "Match case"
+  zh-CN: "区分大小写"
+find.whole_word:
+  en: "Whole word"
+  zh-CN: "全字匹配"
+find.regex:
+  en: "Regular expression"
+  zh-CN: "正则表达式"
+find.dot_newline:
+  en: ". matches newline"
+  zh-CN: "`.` 匹配换行"
+find.in_selection:
+  en: "In selection"
+  zh-CN: "仅在选区内"
+find.replace:
+  en: "Replace"
+  zh-CN: "替换"
+find.replace_all:
+  en: "Replace All"
+  zh-CN: "全部替换"
+find.select_scope_first:
+  en: "Select text to search inside first"
+  zh-CN: "请先选择要搜索的文本范围"
+find.no_matches:
+  en: "No matches"
+  zh-CN: "无匹配"
+find.match_found:
+  en: "Match found"
+  zh-CN: "已找到匹配"
+find.position:
+  en: "%{position} of %{count}"
+  zh-CN: "第 %{position} 个，共 %{count} 个"
+find.replaced_one:
+  en: "Replaced 1 occurrence"
+  zh-CN: "已替换 1 处"
+find.replaced_other:
+  en: "Replaced %{count} occurrences"
+  zh-CN: "已替换 %{count} 处"
+find.match_count.one:
+  en: "1 match"
+  zh-CN: "1 处匹配"
+find.match_count.other:
+  en: "%{count} matches"
+  zh-CN: "%{count} 处匹配"
+find.match_count_limited:
+  en: "%{count} matches (showing first %{first})"
+  zh-CN: "%{count} 处匹配（仅显示前 %{first} 处）"
+find.empty_query:
+  en: "search text is empty"
+  zh-CN: "搜索内容为空"
+
+ff.title:
+  en: "Find in Files"
+  zh-CN: "在文件中查找"
+ff.query_placeholder:
+  en: "Find in files"
+  zh-CN: "在文件中查找"
+ff.folder_placeholder:
+  en: "Folder"
+  zh-CN: "文件夹"
+ff.masks_placeholder:
+  en: "*.rs, *.toml, … (empty = all files)"
+  zh-CN: "*.rs, *.toml, …（留空表示所有文件）"
+ff.browse:
+  en: "Browse…"
+  zh-CN: "浏览…"
+ff.match_case:
+  en: "Match case"
+  zh-CN: "区分大小写"
+ff.whole_word:
+  en: "Whole word"
+  zh-CN: "全字匹配"
+ff.regex:
+  en: "Regex"
+  zh-CN: "正则表达式"
+ff.searching:
+  en: "Searching…"
+  zh-CN: "正在搜索…"
+ff.search:
+  en: "Search"
+  zh-CN: "搜索"
+ff.results.one:
+  en: "1 result"
+  zh-CN: "1 个结果"
+ff.results.other:
+  en: "%{count} results"
+  zh-CN: "%{count} 个结果"
+ff.enter_query:
+  en: "Enter text to find"
+  zh-CN: "请输入要查找的内容"
+ff.not_a_folder:
+  en: "Not a folder: %{path}"
+  zh-CN: "不是文件夹：%{path}"
+ff.cancelling:
+  en: "Cancelling…"
+  zh-CN: "正在取消…"
+ff.cancelled:
+  en: "Search cancelled"
+  zh-CN: "搜索已取消"
+ff.matches_in_files:
+  en: "Matches: %{matches} · Files with matches: %{files} · Files scanned: %{scanned}"
+  zh-CN: "匹配 %{matches} 处 · 命中文件 %{files} 个 · 扫描 %{scanned} 个文件"
+ff.matches_in_files_limited:
+  en: "Matches: %{matches} · Files with matches: %{files} (limit reached)"
+  zh-CN: "匹配 %{matches} 处 · 命中文件 %{files} 个（已达上限）"
+ff.search_failed:
+  en: "Search failed: %{error}"
+  zh-CN: "搜索失败：%{error}"
+
+dialog.open_file:
+  en: "Open File"
+  zh-CN: "打开文件"
+dialog.save_as:
+  en: "Save As"
+  zh-CN: "另存为"
+dialog.open_folder:
+  en: "Open Folder"
+  zh-CN: "打开文件夹"
+dialog.choose_search_folder:
+  en: "Choose Search Folder"
+  zh-CN: "选择搜索文件夹"
+dialog.choose_folder:
+  en: "Choose Folder"
+  zh-CN: "选择文件夹"
+dialog.open:
+  en: "Open"
+  zh-CN: "打开"
+dialog.save:
+  en: "Save"
+  zh-CN: "保存"
+dialog.up:
+  en: "Up"
+  zh-CN: "上一级"
+dialog.refresh:
+  en: "Refresh"
+  zh-CN: "刷新"
+dialog.file_name:
+  en: "File name"
+  zh-CN: "文件名"
+dialog.path_placeholder:
+  en: "Path"
+  zh-CN: "路径"
+dialog.file_name_placeholder:
+  en: "File name"
+  zh-CN: "文件名"
+dialog.current_folder:
+  en: "Current folder: %{path}"
+  zh-CN: "当前文件夹：%{path}"
+dialog.overwrite_title:
+  en: "Overwrite existing file?"
+  zh-CN: "覆盖现有文件？"
+dialog.overwrite:
+  en: "Overwrite"
+  zh-CN: "覆盖"
+dialog.go_to_line:
+  en: "Go to Line"
+  zh-CN: "转到行"
+dialog.go:
+  en: "Go"
+  zh-CN: "转到"
+dialog.line_placeholder:
+  en: "Line[:column]"
+  zh-CN: "行[:列]"
+dialog.language:
+  en: "Language"
+  zh-CN: "语言"
+dialog.filter_languages:
+  en: "Filter languages…"
+  zh-CN: "筛选语言…"
+dialog.file_not_found:
+  en: "File not found: %{path}"
+  zh-CN: "找不到文件：%{path}"
+dialog.enter_name:
+  en: "Enter a file name"
+  zh-CN: "请输入文件名"
+dialog.target_is_folder:
+  en: "The target path is a folder"
+  zh-CN: "目标路径是文件夹"
+dialog.not_a_folder:
+  en: "Not a folder: %{path}"
+  zh-CN: "不是文件夹：%{path}"
+
+confirm.save_changes_title:
+  en: "Save changes to “%{name}”?"
+  zh-CN: "是否保存对“%{name}”的更改？"
+confirm.save_changes_detail:
+  en: "Your changes will be lost if you close this document without saving."
+  zh-CN: "如果不保存就关闭此文档，更改将丢失。"
+confirm.close_all_title:
+  en: "Close all documents?"
+  zh-CN: "关闭所有文档？"
+confirm.close_all_detail.one:
+  en: "1 document has unsaved changes. Save it before closing?"
+  zh-CN: "有 1 个文档未保存。是否在关闭前保存？"
+confirm.close_all_detail.other:
+  en: "%{count} documents have unsaved changes. Save them before closing?"
+  zh-CN: "有 %{count} 个文档未保存。是否在关闭前保存？"
+confirm.quit_title:
+  en: "Save changes before quitting?"
+  zh-CN: "退出前保存更改？"
+confirm.quit_detail:
+  en: "Some documents have unsaved changes."
+  zh-CN: "部分文档有未保存的更改。"
+confirm.discard:
+  en: "Discard"
+  zh-CN: "放弃更改"
+confirm.discard_exit:
+  en: "Discard & Exit"
+  zh-CN: "放弃并退出"
+confirm.save_close:
+  en: "Save & Close"
+  zh-CN: "保存并关闭"
+confirm.save_exit:
+  en: "Save All & Exit"
+  zh-CN: "全部保存并退出"
+
+about.version:
+  en: "Version %{version}"
+  zh-CN: "版本 %{version}"
+about.description:
+  en: "A cross-platform, Rust reimplementation of the Notepad++ editing experience, built on GPUI Kit."
+  zh-CN: "使用 Rust 与 GPUI Kit 跨平台重新实现 Notepad++ 的编辑体验。"
+about.engine:
+  en: "Engine: luban-core  ·  UI: GPUI Kit 0.8  ·  License: Mulan PubL v2"
+  zh-CN: "引擎：luban-core  ·  界面：GPUI Kit 0.8  ·  许可证：木兰公共许可证第 2 版"
+
+shortcuts.title:
+  en: "Keyboard Shortcuts"
+  zh-CN: "键盘快捷键"
+shortcuts.new_open_save:
+  en: "New / Open / Save"
+  zh-CN: "新建 / 打开 / 保存"
+shortcuts.save_as_all:
+  en: "Save As / Save All"
+  zh-CN: "另存为 / 全部保存"
+shortcuts.close:
+  en: "Close / Close All"
+  zh-CN: "关闭 / 全部关闭"
+shortcuts.find_replace:
+  en: "Find / Replace"
+  zh-CN: "查找 / 替换"
+shortcuts.find_next_prev:
+  en: "Find Next / Previous"
+  zh-CN: "查找下一个 / 上一个"
+shortcuts.find_in_files:
+  en: "Find in Files"
+  zh-CN: "在文件中查找"
+shortcuts.go_to_line:
+  en: "Go to Line"
+  zh-CN: "转到行"
+shortcuts.undo_redo:
+  en: "Undo / Redo"
+  zh-CN: "撤销 / 重做"
+shortcuts.duplicate_delete_line:
+  en: "Duplicate / Delete Line"
+  zh-CN: "复制行 / 删除行"
+shortcuts.toggle_comment:
+  en: "Toggle Comment"
+  zh-CN: "切换注释"
+shortcuts.next_prev_tab:
+  en: "Next / Previous Tab"
+  zh-CN: "下一个 / 上一个标签页"
+shortcuts.zoom:
+  en: "Zoom In / Out / Reset"
+  zh-CN: "放大 / 缩小 / 重置缩放"
+shortcuts.quit:
+  en: "Quit"
+  zh-CN: "退出"
+
+prefs.title:
+  en: "Preferences"
+  zh-CN: "首选项"
+prefs.theme:
+  en: "Theme"
+  zh-CN: "主题"
+prefs.light:
+  en: "Light"
+  zh-CN: "浅色"
+prefs.dark:
+  en: "Dark"
+  zh-CN: "深色"
+prefs.language:
+  en: "UI language"
+  zh-CN: "界面语言"
+prefs.language_system:
+  en: "System"
+  zh-CN: "跟随系统"
+prefs.language_current:
+  en: "Current: %{language}"
+  zh-CN: "当前：%{language}"
+prefs.font_size:
+  en: "Font size"
+  zh-CN: "字号"
+prefs.font_family:
+  en: "Font family"
+  zh-CN: "字体"
+prefs.font_placeholder:
+  en: "Monospace font family (empty = theme default)"
+  zh-CN: "等宽字体（留空使用主题默认值）"
+prefs.apply:
+  en: "Apply"
+  zh-CN: "应用"
+prefs.tab_size:
+  en: "Tab size"
+  zh-CN: "制表符宽度"
+prefs.insert_spaces:
+  en: "Insert spaces"
+  zh-CN: "插入空格"
+prefs.editor:
+  en: "Editor"
+  zh-CN: "编辑器"
+prefs.line_numbers:
+  en: "Show line numbers"
+  zh-CN: "显示行号"
+prefs.word_wrap:
+  en: "Word wrap"
+  zh-CN: "自动换行"
+prefs.match_brackets:
+  en: "Match brackets"
+  zh-CN: "括号匹配"
+prefs.trim_on_save:
+  en: "Trim trailing whitespace on save"
+  zh-CN: "保存时删除行尾空白"
+prefs.session:
+  en: "Session"
+  zh-CN: "会话"
+prefs.restore_session:
+  en: "Restore session at startup"
+  zh-CN: "启动时恢复会话"
+prefs.autosave:
+  en: "Autosave session"
+  zh-CN: "自动保存会话"
+prefs.hidden_files:
+  en: "Show hidden files in explorer"
+  zh-CN: "在文件浏览器中显示隐藏文件"
+prefs.footer:
+  en: "Settings are applied immediately and stored in the Luban Notepad config directory."
+  zh-CN: "设置会立即应用，并保存在 Luban Notepad 配置目录中。"
+prefs.pixels:
+  en: "%{size} px"
+  zh-CN: "%{size} px"
+prefs.language_english:
+  en: "English"
+  zh-CN: "English"
+prefs.language_chinese:
+  en: "简体中文"
+  zh-CN: "简体中文"
+
+status.opened:
+  en: "Opened %{path}"
+  zh-CN: "已打开 %{path}"
+status.open_failed:
+  en: "Could not open %{path}: %{error}"
+  zh-CN: "无法打开 %{path}：%{error}"
+status.saved_lossy:
+  en: "Saved %{name}, but some characters are not representable in %{encoding}"
+  zh-CN: "已保存 %{name}，但部分字符无法用 %{encoding} 表示"
+status.saved:
+  en: "Saved %{name}"
+  zh-CN: "已保存 %{name}"
+status.save_failed:
+  en: "Save failed: %{error}"
+  zh-CN: "保存失败：%{error}"
+status.saved_modified:
+  en: "Saved modified documents"
+  zh-CN: "已保存修改的文档"
+status.saved_path_lossy:
+  en: "Saved %{path}, with unrepresentable characters replaced"
+  zh-CN: "已保存 %{path}，无法表示的字符已被替换"
+status.saved_path:
+  en: "Saved %{path}"
+  zh-CN: "已保存 %{path}"
+status.reload_untitled:
+  en: "Untitled documents cannot be reloaded"
+  zh-CN: "未命名文档无法重新加载"
+status.reloaded:
+  en: "Reloaded from disk"
+  zh-CN: "已从磁盘重新加载"
+status.reload_failed:
+  en: "Reload failed: %{error}"
+  zh-CN: "重新加载失败：%{error}"
+status.duplicated_line:
+  en: "Duplicated line"
+  zh-CN: "已复制当前行"
+status.deleted_line:
+  en: "Deleted line"
+  zh-CN: "已删除当前行"
+status.no_trailing_whitespace:
+  en: "No trailing whitespace found"
+  zh-CN: "未发现行尾空白"
+status.trimmed_whitespace:
+  en: "Trimmed trailing whitespace"
+  zh-CN: "已删除行尾空白"
+status.no_line_comment:
+  en: "%{language} has no single-line comment syntax"
+  zh-CN: "%{language} 没有单行注释语法"
+status.toggled_comment:
+  en: "Toggled line comment"
+  zh-CN: "已切换行注释"
+status.sorted_asc:
+  en: "Sorted lines ascending"
+  zh-CN: "已按升序排序行"
+status.sorted_desc:
+  en: "Sorted lines descending"
+  zh-CN: "已按降序排序行"
+status.select_for_case:
+  en: "Select text to change its case"
+  zh-CN: "请先选择要更改大小写的文本"
+status.changed_case:
+  en: "Changed case"
+  zh-CN: "已更改大小写"
+status.eol_set:
+  en: "Line endings set to %{eol}"
+  zh-CN: "换行符已设置为 %{eol}"
+status.encoding_set:
+  en: "Encoding set to %{encoding}; save to apply"
+  zh-CN: "编码已设置为 %{encoding}；保存后生效"
+status.language_set:
+  en: "Language set to %{language}"
+  zh-CN: "语言已设置为 %{language}"
+status.save_cancelled:
+  en: "Save cancelled"
+  zh-CN: "已取消保存"
+status.save_cancelled_close:
+  en: "Save cancelled; close aborted"
+  zh-CN: "已取消保存；关闭操作已中止"
