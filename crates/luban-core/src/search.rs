@@ -7,7 +7,7 @@
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
-use crate::text::{char_boundaries, char_count, char_to_byte};
+use crate::text::char_to_byte;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchOptions {
@@ -131,18 +131,13 @@ impl SearchEngine {
         };
         let (byte_start, byte_end, char_start) = resolve_range(text, range);
         let haystack = &text[byte_start..byte_end];
-        let boundaries = char_boundaries(haystack);
         let mut out = Vec::new();
+        let mut mapper = CharMapper::new();
         for m in regex.find_iter(haystack) {
             if out.len() >= limit {
                 break;
             }
-            let start = boundaries.partition_point(|&b| b < m.start());
-            let end = boundaries.partition_point(|&b| b < m.end());
-            out.push(Match {
-                start: char_start + start,
-                end: char_start + end,
-            });
+            out.push(mapper.map_match(haystack, m.start(), m.end(), char_start));
         }
         out
     }
@@ -158,33 +153,36 @@ impl SearchEngine {
     ) -> Option<Match> {
         let (byte_start, byte_end, char_start) = resolve_range(text, range);
         let haystack = &text[byte_start..byte_end];
-        let boundaries = char_boundaries(haystack);
-        let char_end = char_start + boundaries.len().saturating_sub(1);
-        let from = from.clamp(char_start, char_end);
-
-        let mut matches: Vec<Match> = Vec::new();
-        for m in self.regex.as_ref()?.find_iter(haystack) {
-            let start = boundaries.partition_point(|&b| b < m.start());
-            let end = boundaries.partition_point(|&b| b < m.end());
-            matches.push(Match {
-                start: char_start + start,
-                end: char_start + end,
-            });
-        }
-        if matches.is_empty() {
-            return None;
-        }
+        let regex = self.regex.as_ref()?;
+        let mut mapper = CharMapper::new();
         if forward {
-            if let Some(m) = matches.iter().find(|m| m.start >= from) {
-                return Some(*m);
+            let mut first = None;
+            for m in regex.find_iter(haystack) {
+                let mapped = mapper.map_match(haystack, m.start(), m.end(), char_start);
+                first.get_or_insert(mapped);
+                if mapped.start >= from {
+                    return Some(mapped);
+                }
             }
             if self.options.wrap_around {
-                return matches.first().copied();
+                return first;
             }
-        } else if let Some(m) = matches.iter().rev().find(|m| m.start < from) {
-            return Some(*m);
-        } else if self.options.wrap_around {
-            return matches.last().copied();
+        } else {
+            let mut last = None;
+            let mut before = None;
+            for m in regex.find_iter(haystack) {
+                let mapped = mapper.map_match(haystack, m.start(), m.end(), char_start);
+                last = Some(mapped);
+                if mapped.start < from {
+                    before = Some(mapped);
+                }
+            }
+            if before.is_some() {
+                return before;
+            }
+            if self.options.wrap_around {
+                return last;
+            }
         }
         None
     }
@@ -227,6 +225,10 @@ impl SearchEngine {
             count += 1;
         }
         out.push_str(&haystack[last..]);
+        if byte_start == 0 && byte_end == text.len() {
+            // The whole document was replaced in `out`; skip a second copy.
+            return Ok((out, count));
+        }
         let mut result = String::with_capacity(text.len());
         result.push_str(&text[..byte_start]);
         result.push_str(&out);
@@ -234,31 +236,32 @@ impl SearchEngine {
         Ok((result, count))
     }
 
+    /// Expand `replacement` for a single match without rebuilding the
+    /// surrounding text. Large files combine this with targeted editor edits
+    /// instead of materializing a whole replacement buffer.
+    pub fn replacement_for(&self, text: &str, matched: Match, replacement: &str) -> String {
+        if !self.options.regex {
+            return expand_literal_replacement(replacement);
+        }
+        let b0 = char_to_byte(text, matched.start);
+        if let Some(regex) = self.regex.as_ref() {
+            if let Some(captures) = regex.captures_at(text, b0) {
+                if captures.get(0).map(|m| m.start()) == Some(b0) {
+                    let mut out = String::new();
+                    captures.expand(replacement, &mut out);
+                    return out;
+                }
+            }
+        }
+        expand_literal_replacement(replacement)
+    }
+
     /// Replace a single previously found match, expanding capture references
     /// when in regex mode.
     pub fn replace_match(&self, text: &str, matched: Match, replacement: &str) -> String {
-        let regex = self.regex.as_ref();
         let b0 = char_to_byte(text, matched.start);
         let b1 = char_to_byte(text, matched.end);
-        let expanded = if self.options.regex {
-            if let Some(regex) = regex {
-                if let Some(captures) = regex.captures_at(text, b0) {
-                    if captures.get(0).map(|m| m.start()) == Some(b0) {
-                        let mut out = String::new();
-                        captures.expand(replacement, &mut out);
-                        out
-                    } else {
-                        expand_literal_replacement(replacement)
-                    }
-                } else {
-                    expand_literal_replacement(replacement)
-                }
-            } else {
-                expand_literal_replacement(replacement)
-            }
-        } else {
-            expand_literal_replacement(replacement)
-        };
+        let expanded = self.replacement_for(text, matched, replacement);
         let mut out = String::with_capacity(text.len() + expanded.len());
         out.push_str(&text[..b0]);
         out.push_str(&expanded);
@@ -268,14 +271,39 @@ impl SearchEngine {
 }
 
 fn resolve_range(text: &str, range: Option<(usize, usize)>) -> (usize, usize, usize) {
-    let total = char_count(text);
-    let (start, end) = range.unwrap_or((0, total));
-    let (start, end) = if start <= end {
-        (start.min(total), end.min(total))
-    } else {
-        (end.min(total), start.min(total))
+    let (start, end) = match range {
+        None => return (0, text.len(), 0),
+        Some((start, end)) if start <= end => (start, end),
+        Some((start, end)) => (end, start),
     };
     (char_to_byte(text, start), char_to_byte(text, end), start)
+}
+
+/// Incrementally converts regex byte offsets into character indices.
+///
+/// Regex matches arrive in byte order, so each conversion only scans the bytes
+/// since the previous match. This avoids the per-character boundary table that
+/// would otherwise allocate gigabytes for large files.
+struct CharMapper {
+    byte: usize,
+    chars: usize,
+}
+
+impl CharMapper {
+    fn new() -> Self {
+        Self { byte: 0, chars: 0 }
+    }
+
+    fn map_match(&mut self, haystack: &str, start: usize, end: usize, char_start: usize) -> Match {
+        self.chars += haystack[self.byte..start].chars().count();
+        let start_char = self.chars;
+        self.chars += haystack[start..end].chars().count();
+        self.byte = end;
+        Match {
+            start: char_start + start_char,
+            end: char_start + self.chars,
+        }
+    }
 }
 
 fn expand_literal_replacement(replacement: &str) -> String {
@@ -505,5 +533,49 @@ mod tests {
         assert!(!e.has_pattern());
         assert!(e.find_all("abc", None, 10).is_empty());
         assert!(e.replace_all("abc", "x", None).is_err());
+    }
+
+    #[test]
+    fn incremental_mapping_handles_many_unicode_matches() {
+        let e = engine("é", literal());
+        let text = "aé世é🙂é\n".repeat(500);
+        let matches = e.find_all(&text, None, 10_000);
+        assert_eq!(matches.len(), 1500);
+        for matched in &matches {
+            assert_eq!(
+                &text[char_to_byte(&text, matched.start)..char_to_byte(&text, matched.end)],
+                "é"
+            );
+        }
+    }
+
+    #[test]
+    fn find_from_stops_at_the_first_match_without_collecting() {
+        let e = engine("needle", literal());
+        let text = format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000));
+        let found = e.find_from(&text, 0, true, None).unwrap();
+        assert_eq!(found.start, 100_000);
+        assert_eq!(found.end, 100_006);
+        assert_eq!(e.find_from(&text, found.end, true, None), Some(found));
+    }
+
+    #[test]
+    fn expands_single_replacements_without_rebuilding_text() {
+        let options = SearchOptions {
+            regex: true,
+            match_case: true,
+            ..SearchOptions::default()
+        };
+        let e = engine(r"(\w+)@(\w+)", options);
+        let text = "a@b c@d";
+        let matched = e.find_all(text, None, 1)[0];
+        assert_eq!(e.replacement_for(text, matched, "$2:$1"), "b:a");
+        assert_eq!(e.replace_match(text, matched, "$2:$1"), "b:a c@d");
+
+        let e = engine("x", literal());
+        assert_eq!(
+            e.replacement_for("x", Match { start: 0, end: 1 }, r"\n"),
+            "\n"
+        );
     }
 }

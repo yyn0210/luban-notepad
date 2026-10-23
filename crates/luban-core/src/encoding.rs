@@ -114,6 +114,42 @@ pub struct DecodedText {
     pub had_bom: bool,
 }
 
+/// Decode a byte buffer, taking ownership when the data is valid UTF-8.
+///
+/// This is the preferred entry point for opening files: unlike [`decode`],
+/// plain UTF-8 (with or without BOM) is validated and then reused in place
+/// instead of being copied into a new `String`.
+pub fn decode_owned(mut bytes: Vec<u8>) -> DecodedText {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        let rest = &bytes[3..];
+        if std::str::from_utf8(rest).is_ok() {
+            bytes.drain(..3);
+            // SAFETY: `rest` was just validated as UTF-8.
+            return DecodedText {
+                text: unsafe { String::from_utf8_unchecked(bytes) },
+                encoding: TextEncoding::Utf8Bom,
+                had_bom: true,
+            };
+        }
+        return DecodedText {
+            text: String::from_utf8_lossy(rest).into_owned(),
+            encoding: TextEncoding::Utf8Bom,
+            had_bom: true,
+        };
+    }
+    if std::str::from_utf8(&bytes).is_ok() {
+        // SAFETY: validated immediately above.
+        return DecodedText {
+            text: unsafe { String::from_utf8_unchecked(bytes) },
+            encoding: TextEncoding::Utf8,
+            had_bom: false,
+        };
+    }
+    // UTF-16 and legacy code pages need transcoding, so the borrowed path
+    // already allocates exactly once.
+    decode(&bytes)
+}
+
 /// Detect a file's encoding, decode it to UTF-8 and strip any BOM.
 ///
 /// Detection order mirrors Notepad++/common editors:
@@ -438,5 +474,26 @@ mod tests {
         let (bytes, errors) = encode("a\nb\tc 世界", TextEncoding::Utf8);
         assert!(!errors);
         assert_eq!(decode(&bytes).text, "a\nb\tc 世界");
+    }
+
+    #[test]
+    fn owned_decode_matches_borrowed() {
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice("héllo\n世界".as_bytes());
+        let utf16 = encode("hello 世界", TextEncoding::Utf16Le).0;
+        let legacy = encode("hello", TextEncoding::Windows1252).0;
+        let cases: Vec<(Vec<u8>, TextEncoding)> = vec![
+            ("plain utf8\n".as_bytes().to_vec(), TextEncoding::Utf8),
+            (bom, TextEncoding::Utf8Bom),
+            (utf16, TextEncoding::Utf16Le),
+            (legacy, TextEncoding::Windows1252),
+            (vec![0xFF, 0xFE, 0x41], TextEncoding::Utf16Le),
+            (vec![], TextEncoding::Utf8),
+        ];
+        for (bytes, encoding) in cases {
+            let borrowed = decode(&bytes);
+            let owned = decode_owned(bytes);
+            assert_eq!(owned, borrowed, "{encoding:?}");
+        }
     }
 }

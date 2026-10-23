@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,8 +9,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, Indent, Input, InputEvent, InputState, Outdent, Paste,
-    RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo, Search, SelectAll,
-    TabSize, Undo,
+    RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo, RopeExt, Search,
+    SelectAll, TabSize, Undo,
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::theme::ActiveTheme as _;
@@ -22,9 +23,10 @@ use luban_core::encoding::TextEncoding;
 use luban_core::eol::{self, Eol};
 use luban_core::i18n::language_display_name;
 use luban_core::language;
+use luban_core::search::Match;
 use luban_core::session::{Session, SessionTab};
 use luban_core::settings::{Settings, ThemeChoice};
-use luban_core::text::{self as textutil, LineIndex};
+use luban_core::text as textutil;
 use luban_core::undo::EditKind;
 use luban_core::workspace::{list_directory, FileMatch, FindInFilesOptions, FindInFilesOutcome};
 
@@ -52,7 +54,99 @@ pub struct Tab {
     pub decorations: RangeDecorationCollection,
     pub needs_sync: bool,
     pub highlighted_revision: u64,
+    /// Files at or above `Settings::large_file_threshold` open in a reduced
+    /// mode: no syntax highlighting, wrapping, bracket matching or live find.
+    pub large_file: bool,
+    decorations_key: Option<DecorationKey>,
     _subscription: Subscription,
+}
+
+type DecorationKey = (u64, usize, u64, bool, bool, bool);
+
+struct PendingOpenAt {
+    path: PathBuf,
+    line: usize,
+    column: usize,
+    match_len: usize,
+}
+
+/// A session tab prepared for loading on the background executor.
+struct RestoreSpec {
+    path: Option<PathBuf>,
+    text: Option<String>,
+    encoding: TextEncoding,
+    eol: Eol,
+    language: String,
+    cursor: usize,
+    anchor: usize,
+    modified: bool,
+    fallback_name: String,
+}
+
+impl RestoreSpec {
+    fn load(self, max_size: u64) -> Document {
+        let mut doc = if let Some(path) = &self.path {
+            match Document::open_with_limit(path, max_size) {
+                Ok(mut doc) => {
+                    if let Some(text) = &self.text {
+                        doc.attach_text(eol::to_lf(text));
+                        doc.encoding = self.encoding;
+                        doc.eol = self.eol;
+                        doc.language = self.language.clone();
+                        if self.modified {
+                            doc.touch();
+                        } else {
+                            doc.mark_saved();
+                        }
+                    }
+                    doc
+                }
+                Err(err) => {
+                    log::warn!("could not restore {}: {err}", path.display());
+                    Self::untitled(
+                        self.fallback_name,
+                        self.text,
+                        self.encoding,
+                        self.eol,
+                        self.language,
+                        self.modified,
+                    )
+                }
+            }
+        } else {
+            Self::untitled(
+                self.fallback_name,
+                self.text,
+                self.encoding,
+                self.eol,
+                self.language,
+                self.modified,
+            )
+        };
+        let total = doc.char_count();
+        doc.cursor = self.cursor.min(total);
+        doc.anchor = self.anchor.min(total);
+        doc
+    }
+
+    fn untitled(
+        name: String,
+        text: Option<String>,
+        encoding: TextEncoding,
+        eol: Eol,
+        language: String,
+        modified: bool,
+    ) -> Document {
+        let mut doc = Document::new_untitled(name);
+        doc.attach_text(text.as_deref().map(eol::to_lf).unwrap_or_default());
+        doc.encoding = encoding;
+        doc.eol = eol;
+        doc.language = language;
+        if modified {
+            doc.touch();
+        }
+        doc
+    }
 }
 
 pub struct LubanApp {
@@ -61,6 +155,8 @@ pub struct LubanApp {
     pub active: usize,
     next_tab_id: u64,
     untitled_counter: usize,
+    pending_opens: Vec<PathBuf>,
+    pending_open_at: Option<PendingOpenAt>,
     pub find: FindPanel,
     pub find_in_files: FindInFilesPanel,
     pub explorer: ExplorerState,
@@ -105,6 +201,8 @@ impl LubanApp {
             active: 0,
             next_tab_id: 1,
             untitled_counter: 0,
+            pending_opens: Vec::new(),
+            pending_open_at: None,
             find: FindPanel::new(window, cx),
             find_in_files: FindInFilesPanel::new(window, cx),
             explorer: ExplorerState::new(),
@@ -206,7 +304,11 @@ impl LubanApp {
                 }
             }
             if opened == 0 {
+                // Keep the open error visible while still giving the user an
+                // editable window.
+                let status = std::mem::take(&mut app.status);
                 app.new_file(window, cx);
+                app.status = status;
             }
         } else if !options.new_window && app.settings.restore_session {
             let session = Session::load();
@@ -277,14 +379,25 @@ impl LubanApp {
 
     fn new_editor(
         &self,
-        doc: &Document,
+        doc: &mut Document,
+        large_file: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<EditorState>, RangeDecorationCollection, Subscription) {
-        let text = doc.text.clone();
-        let lang = language_key(&doc.language).to_string();
+        // Large documents are mounted by moving the decoded buffer into the
+        // editor; the document then releases its own copy.
+        let text = if large_file {
+            doc.detach_text().0
+        } else {
+            doc.text.clone()
+        };
+        let lang = if large_file {
+            "text".to_string()
+        } else {
+            language_key(&doc.language).to_string()
+        };
         let line_numbers = self.settings.show_line_numbers;
-        let wrap = self.settings.word_wrap;
+        let wrap = !large_file && self.settings.word_wrap;
         let tab_size = self.settings.tab_size;
         let use_spaces = self.settings.use_spaces;
 
@@ -313,21 +426,26 @@ impl LubanApp {
             state.create_range_decorations_collection(Vec::new(), cx)
         });
 
-        let start = textutil::char_to_byte(&doc.text, doc.anchor.min(doc.char_count()));
-        let end = textutil::char_to_byte(&doc.text, doc.cursor.min(doc.char_count()));
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        editor.update(cx, |state, cx| state.set_selected_range(start..end, cx));
+        let (anchor, cursor) = (doc.anchor, doc.cursor);
+        editor.update(cx, |state, cx| {
+            let total = state.text().len_chars();
+            let b0 = state.text().char_to_byte_idx(anchor.min(total));
+            let b1 = state.text().char_to_byte_idx(cursor.min(total));
+            let (start, end) = if b0 <= b1 { (b0, b1) } else { (b1, b0) };
+            state.set_selected_range(start..end, cx);
+        });
         if self.focus_editor {
             editor.update(cx, |state, cx| state.focus(window, cx));
         }
 
-        let subscription = cx.subscribe(&editor, |this, editor, _event, cx| {
+        let subscription = cx.subscribe(&editor, |this, editor, event, cx| {
             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.editor == editor) {
                 tab.needs_sync = true;
+                // Large documents never run the whole-buffer diff; the editor
+                // event is enough to track the modified state.
+                if tab.large_file && matches!(event, InputEvent::Change) {
+                    tab.doc.touch();
+                }
             }
             cx.notify();
         });
@@ -338,7 +456,10 @@ impl LubanApp {
     fn add_document(&mut self, doc: Document, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let (editor, decorations, subscription) = self.new_editor(&doc, window, cx);
+        let large_file =
+            doc.path.is_some() && doc.file_size >= self.settings.large_file_threshold as u64;
+        let mut doc = doc;
+        let (editor, decorations, subscription) = self.new_editor(&mut doc, large_file, window, cx);
         self.tabs.push(Tab {
             id,
             doc,
@@ -346,11 +467,14 @@ impl LubanApp {
             decorations,
             needs_sync: false,
             highlighted_revision: u64::MAX,
+            large_file,
+            decorations_key: None,
             _subscription: subscription,
         });
         self.active = self.tabs.len() - 1;
         self.focus_editor = true;
         self.status.clear();
+        self.find.clear();
         cx.notify();
     }
 
@@ -375,10 +499,74 @@ impl LubanApp {
         }) {
             self.active = index;
             self.focus_editor = true;
+            self.find.dirty = true;
             cx.notify();
             return true;
         }
+        if self
+            .pending_opens
+            .iter()
+            .any(|pending| util::same_path(pending, &path))
+        {
+            self.set_status(
+                tr_args("status.opening", &[("path", path.display().to_string())]),
+                cx,
+            );
+            return true;
+        }
         let max_size = self.settings.max_file_size_bytes();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                let err = luban_core::Error::Io(err);
+                self.set_status(
+                    tr_args(
+                        "status.open_failed",
+                        &[
+                            ("path", path.display().to_string()),
+                            ("error", err.to_string()),
+                        ],
+                    ),
+                    cx,
+                );
+                return false;
+            }
+        };
+        if metadata.is_dir() {
+            let err = luban_core::Error::InvalidPath(path.clone());
+            self.set_status(
+                tr_args(
+                    "status.open_failed",
+                    &[
+                        ("path", path.display().to_string()),
+                        ("error", err.to_string()),
+                    ],
+                ),
+                cx,
+            );
+            return false;
+        }
+        if metadata.len() > max_size {
+            let err = luban_core::Error::FileTooLarge {
+                size: metadata.len(),
+                limit: max_size,
+            };
+            self.set_status(
+                tr_args(
+                    "status.open_failed",
+                    &[
+                        ("path", path.display().to_string()),
+                        ("error", err.to_string()),
+                    ],
+                ),
+                cx,
+            );
+            return false;
+        }
+        if metadata.len() >= self.settings.large_file_threshold as u64 {
+            self.start_background_open(path, max_size, window, cx);
+            return true;
+        }
         match Document::open_with_limit(&path, max_size) {
             Ok(doc) => {
                 self.settings.add_recent(path.clone());
@@ -406,6 +594,119 @@ impl LubanApp {
         }
     }
 
+    /// Read and decode a large file on the background executor, then mount it
+    /// on the main thread. The window stays interactive while this runs.
+    fn start_background_open(
+        &mut self,
+        path: PathBuf,
+        max_size: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_opens.push(path.clone());
+        self.set_status(
+            tr_args("status.opening", &[("path", path.display().to_string())]),
+            cx,
+        );
+        let task_path = path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { Document::open_with_limit(&task_path, max_size) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_background_open(path, result, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_background_open(
+        &mut self,
+        path: PathBuf,
+        result: luban_core::Result<Document>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_opens
+            .retain(|pending| !util::same_path(pending, &path));
+        match result {
+            Ok(doc) => {
+                self.settings.add_recent(path.clone());
+                let _ = self.settings.save();
+                self.add_document(doc, window, cx);
+                self.set_status(
+                    tr_args("status.opened", &[("path", path.display().to_string())]),
+                    cx,
+                );
+                let pending_at = self
+                    .pending_open_at
+                    .as_ref()
+                    .is_some_and(|request| util::same_path(&request.path, &path));
+                if pending_at {
+                    if let Some(request) = self.pending_open_at.take() {
+                        let index = self.active;
+                        let (start, end) = self.line_selection_in_tab(
+                            index,
+                            request.line,
+                            request.column,
+                            request.match_len,
+                            cx,
+                        );
+                        self.select_char_range(start, end, window, cx);
+                    }
+                }
+            }
+            Err(err) => {
+                if self
+                    .pending_open_at
+                    .as_ref()
+                    .is_some_and(|request| util::same_path(&request.path, &path))
+                {
+                    self.pending_open_at = None;
+                }
+                let status = tr_args(
+                    "status.open_failed",
+                    &[
+                        ("path", path.display().to_string()),
+                        ("error", err.to_string()),
+                    ],
+                );
+                if self.tabs.is_empty() {
+                    self.new_file(window, cx);
+                }
+                self.set_status(status, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Character range for a 1-based line/column and match length, read from
+    /// the editor rope so no line index or full-text scan is needed.
+    fn line_selection_in_tab(
+        &self,
+        index: usize,
+        line: usize,
+        column: usize,
+        match_len: usize,
+        cx: &gpui_kit::App,
+    ) -> (usize, usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return (0, 0);
+        };
+        let state = tab.editor.read(cx);
+        let rope = state.text();
+        let rows = rope.lines_len();
+        let row = line.saturating_sub(1).min(rows.saturating_sub(1));
+        let line_start = rope.line_start_offset(row);
+        let line_slice = rope.slice_line(row);
+        let column = column.saturating_sub(1).min(line_slice.len_chars());
+        let byte = line_start + line_slice.char_to_byte_idx(column);
+        let start = rope.byte_to_char_idx(byte.min(rope.len()));
+        let end = (start + match_len).min(rope.len_chars());
+        (start, end)
+    }
+
     pub fn open_path_at(
         &mut self,
         path: &Path,
@@ -415,7 +716,28 @@ impl LubanApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.open_path(path, window, cx) {
+        let path = util::absolutize(path);
+        let already_open = self.tabs.iter().any(|t| {
+            t.doc
+                .path
+                .as_ref()
+                .is_some_and(|open| util::same_path(open, &path))
+        });
+        let large = fs::metadata(&path)
+            .map(|metadata| metadata.len() >= self.settings.large_file_threshold as u64)
+            .unwrap_or(false);
+        if !self.open_path(&path, window, cx) {
+            return;
+        }
+        if large && !already_open {
+            // The background loader will apply the selection when the tab is
+            // mounted.
+            self.pending_open_at = Some(PendingOpenAt {
+                path,
+                line,
+                column,
+                match_len,
+            });
             return;
         }
         let index = self
@@ -425,19 +747,14 @@ impl LubanApp {
                 t.doc
                     .path
                     .as_ref()
-                    .is_some_and(|p| util::same_path(p, path))
+                    .is_some_and(|open| util::same_path(open, &path))
             })
             .unwrap_or(self.active);
         self.active = index;
-        let char_start = {
-            let tab = &mut self.tabs[index];
-            let index = LineIndex::new(&tab.doc.text);
-            let start = index.char_index(line, column);
-            let end = (start + match_len).min(tab.doc.char_count());
-            (start, end)
-        };
-        self.select_char_range(char_start.0, char_start.1, window, cx);
+        let (start, end) = self.line_selection_in_tab(index, line, column, match_len, cx);
+        self.select_char_range(start, end, window, cx);
         self.focus_editor = true;
+        self.find.dirty = true;
         cx.notify();
     }
 
@@ -454,54 +771,82 @@ impl LubanApp {
         }
 
         let active = session.active_tab;
+        let max_size = self.settings.max_file_size_bytes();
+        let threshold = self.settings.large_file_threshold as u64;
+        let mut any_large = false;
+        let mut specs = Vec::with_capacity(session.tabs.len());
         for tab in session.tabs {
-            let mut doc = if let Some(path) = &tab.path {
-                match Document::open_with_limit(path, self.settings.max_file_size_bytes()) {
-                    Ok(mut doc) => {
-                        if let Some(text) = &tab.text {
-                            doc.text = eol::to_lf(text);
-                            doc.encoding = tab.encoding;
-                            doc.eol = tab.eol;
-                            doc.language = tab.language.clone();
-                            if tab.modified {
-                                doc.touch();
-                            } else {
-                                doc.mark_saved();
-                            }
-                        }
-                        doc
-                    }
-                    Err(err) => {
-                        log::warn!("could not restore {}: {err}", path.display());
-                        self.untitled_counter += 1;
-                        let mut doc = Document::new_untitled(tr_args(
-                            "untitled.name",
-                            &[("number", self.untitled_counter.to_string())],
-                        ));
-                        doc.text = tab.text.clone().map(|t| eol::to_lf(&t)).unwrap_or_default();
-                        doc.encoding = tab.encoding;
-                        doc.eol = tab.eol;
-                        doc.language = tab.language.clone();
-                        doc
-                    }
-                }
+            let large = tab
+                .path
+                .as_ref()
+                .and_then(|path| fs::metadata(path).ok())
+                .map(|metadata| metadata.len() >= threshold)
+                .unwrap_or(false);
+            any_large |= large;
+            let fallback_name = if let Some(path) = &tab.path {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
             } else {
                 self.untitled_counter += 1;
-                let mut doc = Document::new_untitled(tr_args(
+                tr_args(
                     "untitled.name",
                     &[("number", self.untitled_counter.to_string())],
-                ));
-                doc.text = tab.text.clone().map(|t| eol::to_lf(&t)).unwrap_or_default();
-                doc.encoding = tab.encoding;
-                doc.eol = tab.eol;
-                doc.language = tab.language.clone();
-                if tab.modified {
-                    doc.touch();
-                }
-                doc
+                )
             };
-            doc.cursor = tab.cursor.min(doc.char_count());
-            doc.anchor = tab.anchor.min(doc.char_count());
+            specs.push(RestoreSpec {
+                path: tab.path,
+                text: tab.text,
+                encoding: tab.encoding,
+                eol: tab.eol,
+                language: tab.language,
+                cursor: tab.cursor,
+                anchor: tab.anchor,
+                modified: tab.modified,
+                fallback_name,
+            });
+        }
+
+        if !any_large {
+            for spec in specs {
+                let doc = spec.load(max_size);
+                self.add_document(doc, window, cx);
+            }
+            self.active = active.min(self.tabs.len().saturating_sub(1));
+            self.focus_editor = true;
+            cx.notify();
+            return;
+        }
+
+        // A large tab in the session must not block startup.
+        self.set_status(tr("status.restoring_session"), cx);
+        let task = cx.background_executor().spawn(async move {
+            specs
+                .into_iter()
+                .map(|spec| spec.load(max_size))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let docs = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_restore(docs, active, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_restore(
+        &mut self,
+        docs: Vec<Document>,
+        active: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if docs.is_empty() {
+            self.new_file(window, cx);
+            return;
+        }
+        for doc in docs {
             self.add_document(doc, window, cx);
         }
         self.active = active.min(self.tabs.len().saturating_sub(1));
@@ -515,6 +860,15 @@ impl LubanApp {
         let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
             return;
         };
+        // Selection changes do not emit InputEvent, so they are synced from the
+        // editor Rope every frame. This is O(log n) and keeps the document's
+        // cursor/selection correct for replace-one, selection scope and session
+        // metadata; only text changes need the whole-buffer diff below.
+        let large_file = self.tabs[index].large_file;
+        if large_file || !self.tabs[index].needs_sync {
+            self.sync_editor_selection(index, large_file, cx);
+            return;
+        }
         let tab = &self.tabs[index];
         let (raw, cursor_byte, range) = {
             let state = tab.editor.read(cx);
@@ -563,6 +917,69 @@ impl LubanApp {
         }
     }
 
+    /// Copy the editor's caret and selection into the document without
+    /// materializing or diffing the buffer.
+    fn sync_editor_selection(&mut self, index: usize, clear_pending: bool, cx: &gpui_kit::App) {
+        let (cursor_byte, range) = {
+            let state = self.tabs[index].editor.read(cx);
+            (state.cursor(), state.selected_range())
+        };
+        let (anchor, cursor) = {
+            let state = self.tabs[index].editor.read(cx);
+            let rope = state.text();
+            let len = rope.len();
+            let cursor = rope.byte_to_char_idx(cursor_byte.min(len));
+            let start = rope.byte_to_char_idx(range.start.min(len));
+            let end = rope.byte_to_char_idx(range.end.min(len));
+            if cursor <= start {
+                (end, start)
+            } else {
+                (start, end)
+            }
+        };
+        let tab = &mut self.tabs[index];
+        tab.doc.set_selection(anchor, cursor);
+        if clear_pending {
+            tab.needs_sync = false;
+        }
+    }
+
+    /// Materialize a detached document buffer from its editor. Returns false
+    /// when the tab does not exist.
+    fn ensure_tab_text(&mut self, index: usize, cx: &gpui_kit::App) -> bool {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        if !tab.doc.is_text_detached() {
+            return true;
+        }
+        let (text, char_count) = {
+            let state = tab.editor.read(cx);
+            let rope = state.text();
+            (rope.to_string(), rope.len_chars())
+        };
+        tab.doc.attach_text_counted(text, char_count);
+        true
+    }
+
+    /// Release a large document's full-text snapshot after a transient
+    /// operation; the editor keeps the only copy.
+    fn release_tab_text(&mut self, index: usize) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            if tab.large_file {
+                let _ = tab.doc.detach_text();
+            }
+        }
+    }
+
+    fn ensure_active_text(&mut self, cx: &gpui_kit::App) -> bool {
+        self.ensure_tab_text(self.active, cx)
+    }
+
+    fn release_active_text(&mut self) {
+        self.release_tab_text(self.active);
+    }
+
     fn select_char_range(
         &mut self,
         start: usize,
@@ -579,10 +996,12 @@ impl LubanApp {
         } else {
             (end.min(total), start.min(total))
         };
-        let b0 = textutil::char_to_byte(&tab.doc.text, start);
-        let b1 = textutil::char_to_byte(&tab.doc.text, end);
         tab.doc.set_selection(start, end);
-        tab.editor.update(cx, |state, cx| {
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| {
+            let char_count = state.text().len_chars();
+            let b0 = state.text().char_to_byte_idx(start.min(char_count));
+            let b1 = state.text().char_to_byte_idx(end.min(char_count));
             state.set_selected_range(b0..b1, cx);
             state.focus(window, cx);
         });
@@ -600,19 +1019,36 @@ impl LubanApp {
             return;
         };
         let tab = &mut self.tabs[index];
-        let anchor = select_start.min(textutil::char_count(&new_text));
-        let cursor = select_end.min(textutil::char_count(&new_text));
-        tab.doc.replace_all_text(&new_text, EditKind::Other);
-        tab.doc.set_selection(anchor, cursor);
+        let char_count = textutil::char_count(&new_text);
+        let anchor = select_start.min(char_count);
+        let cursor = select_end.min(char_count);
+        let large_file = tab.large_file;
         tab.highlighted_revision = u64::MAX;
+        tab.decorations_key = None;
         let b0 = textutil::char_to_byte(&new_text, anchor);
         let b1 = textutil::char_to_byte(&new_text, cursor);
-        tab.editor.update(cx, |state, cx| {
-            // Preserve the editor's undo history across programmatic edits.
-            state.replace_all(new_text, window, cx);
-            state.set_selected_range(b0..b1, cx);
-            state.focus(window, cx);
-        });
+        if large_file {
+            // Free the document snapshot before handing the new buffer to the
+            // editor, so a replace never holds three full copies.
+            let _ = tab.doc.detach_text();
+            tab.doc.set_selection(anchor, cursor);
+            tab.editor.update(cx, |state, cx| {
+                state.replace_all(new_text, window, cx);
+                state.set_selected_range(b0..b1, cx);
+                state.focus(window, cx);
+            });
+            tab.doc
+                .record_external_replacement(char_count, anchor, cursor);
+        } else {
+            tab.doc.replace_all_text(&new_text, EditKind::Other);
+            tab.doc.set_selection(anchor, cursor);
+            tab.editor.update(cx, |state, cx| {
+                // Preserve the editor's undo history across programmatic edits.
+                state.replace_all(new_text, window, cx);
+                state.set_selected_range(b0..b1, cx);
+                state.focus(window, cx);
+            });
+        }
         tab.needs_sync = false;
         cx.notify();
     }
@@ -664,7 +1100,11 @@ impl LubanApp {
         if index >= self.tabs.len() {
             return;
         }
-        if self.settings.trim_trailing_whitespace_on_save {
+        if !self.ensure_tab_text(index, cx) {
+            return;
+        }
+        let large_file = self.tabs[index].large_file;
+        if self.settings.trim_trailing_whitespace_on_save && !large_file {
             let tab = &self.tabs[index];
             let trimmed = textutil::trim_trailing_whitespace(&tab.doc.text);
             if trimmed != tab.doc.text {
@@ -693,6 +1133,7 @@ impl LubanApp {
                 Err(err) => (name, encoding, None, None, Some(err.to_string())),
             }
         };
+        self.release_tab_text(index);
         if let Some(path) = path {
             self.settings.add_recent(path);
         }
@@ -751,9 +1192,13 @@ impl LubanApp {
         let Some(index) = self.tab_index_by_id(request.tab_id) else {
             return;
         };
+        if !self.ensure_tab_text(index, cx) {
+            return;
+        }
         let lossy = match self.tabs[index].doc.save_as(&request.path) {
             Ok(lossy) => lossy,
             Err(err) => {
+                self.release_tab_text(index);
                 self.set_status(
                     tr_args("status.save_failed", &[("error", err.to_string())]),
                     cx,
@@ -763,6 +1208,7 @@ impl LubanApp {
                 return;
             }
         };
+        self.release_tab_text(index);
         self.settings.add_recent(request.path.clone());
         let _ = self.settings.save();
         if lossy {
@@ -1067,14 +1513,19 @@ impl LubanApp {
         }
         match tab.doc.reload() {
             Ok(()) => {
-                let text = tab.doc.text.clone();
-                let cursor = tab.doc.cursor;
-                let anchor = tab.doc.anchor;
-                let b0 = textutil::char_to_byte(&text, anchor);
-                let b1 = textutil::char_to_byte(&text, cursor);
+                let (text, cursor, anchor) = if tab.large_file {
+                    let (text, _) = tab.doc.detach_text();
+                    (text, tab.doc.cursor, tab.doc.anchor)
+                } else {
+                    (tab.doc.text.clone(), tab.doc.cursor, tab.doc.anchor)
+                };
                 tab.highlighted_revision = u64::MAX;
+                tab.decorations_key = None;
                 tab.editor.update(cx, |state, cx| {
                     state.set_value(text, window, cx);
+                    let total = state.text().len_chars();
+                    let b0 = state.text().char_to_byte_idx(anchor.min(total));
+                    let b1 = state.text().char_to_byte_idx(cursor.min(total));
                     state.set_selected_range(b0..b1, cx);
                 });
                 tab.needs_sync = false;
@@ -1152,6 +1603,7 @@ impl LubanApp {
         }
         self.focus_editor = true;
         self.find.clear();
+        self.find.dirty = true;
         cx.notify();
     }
 
@@ -1372,7 +1824,9 @@ impl LubanApp {
             .iter()
             .map(|tab| SessionTab {
                 path: tab.doc.path.clone(),
-                text: if tab.doc.is_modified() || tab.doc.is_untitled() {
+                // Large buffers are never written to the session: the file is
+                // restored from disk instead.
+                text: if !tab.large_file && (tab.doc.is_modified() || tab.doc.is_untitled()) {
                     Some(tab.doc.text.clone())
                 } else {
                     None
@@ -1383,7 +1837,7 @@ impl LubanApp {
                 cursor: tab.doc.cursor,
                 anchor: tab.doc.anchor,
                 scroll_offset: 0.0,
-                modified: tab.doc.is_modified(),
+                modified: !tab.large_file && tab.doc.is_modified(),
             })
             .collect();
         Session {
@@ -1426,6 +1880,9 @@ impl LubanApp {
 
     pub fn duplicate_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        if !self.ensure_active_text(cx) {
+            return;
+        }
         let Some(tab) = self.active_tab() else { return };
         let (start, end) = tab.doc.selection();
         let (new_text, sel_start, sel_end) = textutil::duplicate_lines(&tab.doc.text, start, end);
@@ -1435,6 +1892,9 @@ impl LubanApp {
 
     pub fn delete_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        if !self.ensure_active_text(cx) {
+            return;
+        }
         let Some(tab) = self.active_tab() else { return };
         let (start, end) = tab.doc.selection();
         let (new_text, pos) = textutil::delete_lines(&tab.doc.text, start, end);
@@ -1444,6 +1904,9 @@ impl LubanApp {
 
     pub fn trim_trailing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        if !self.ensure_active_text(cx) {
+            return;
+        }
         let Some(tab) = self.active_tab() else { return };
         let trimmed = textutil::trim_trailing_whitespace(&tab.doc.text);
         if trimmed == tab.doc.text {
@@ -1458,6 +1921,9 @@ impl LubanApp {
 
     pub fn toggle_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        if !self.ensure_active_text(cx) {
+            return;
+        }
         let Some(tab) = self.active_tab() else { return };
         let Some(prefix) = language::line_comment(&tab.doc.language) else {
             self.set_status(
@@ -1478,6 +1944,9 @@ impl LubanApp {
 
     pub fn sort_selection(&mut self, ascending: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        if !self.ensure_active_text(cx) {
+            return;
+        }
         let Some(tab) = self.active_tab() else { return };
         let (start, end) = tab.doc.selection();
         let (new_text, sel_start, sel_end) =
@@ -1500,6 +1969,9 @@ impl LubanApp {
         cx: &mut Context<Self>,
     ) {
         self.sync_active(window, cx);
+        if !self.ensure_active_text(cx) {
+            return;
+        }
         let Some(tab) = self.active_tab() else { return };
         let (start, end) = tab.doc.selection();
         if start == end {
@@ -1545,8 +2017,11 @@ impl LubanApp {
         }
         let key = language_key(&name).to_string();
         tab.highlighted_revision = u64::MAX;
-        tab.editor
-            .update(cx, |state, cx| state.set_highlighter(key, cx));
+        tab.decorations_key = None;
+        if !tab.large_file {
+            tab.editor
+                .update(cx, |state, cx| state.set_highlighter(key, cx));
+        }
         self.set_status(
             tr_args(
                 "status.language_set",
@@ -1577,8 +2052,9 @@ impl LubanApp {
             tab_size: self.settings.tab_size,
             hard_tabs: !self.settings.use_spaces,
         };
-        for tab_entity in self.tabs.iter() {
-            tab_entity.editor.update(cx, |state, cx| {
+        for index in 0..self.tabs.len() {
+            let wrap = !self.tabs[index].large_file && wrap;
+            self.tabs[index].editor.update(cx, |state, cx| {
                 state.set_line_number(line_numbers, window, cx);
                 state.set_soft_wrap(wrap, window, cx);
                 state.set_tab_size(tab, cx);
@@ -1697,17 +2173,31 @@ impl LubanApp {
                 return;
             }
         }
+        let large = self.active_tab().is_some_and(|tab| tab.large_file);
         if self.find.dirty {
-            let text = self
-                .active_doc()
-                .map(|d| d.text.clone())
-                .unwrap_or_default();
-            self.find.refresh(&text, &query);
-            self.find.dirty = false;
+            if large {
+                // Typing in the find box never scans a large document.
+                self.find.dirty = false;
+                self.find.matches.clear();
+                self.find.current = None;
+                self.find.generation = self.find.generation.wrapping_add(1);
+            } else {
+                let text = self
+                    .tabs
+                    .get(self.active)
+                    .map(|tab| tab.doc.text.as_str())
+                    .unwrap_or("");
+                self.find.refresh(text, &query);
+                self.find.dirty = false;
+            }
         }
-        let Some(tab) = self.active_tab() else { return };
-        let text = tab.doc.text.clone();
-        let (a, b) = tab.doc.selection();
+        if !self.ensure_active_text(cx) {
+            return;
+        }
+        let (a, b) = self
+            .active_doc()
+            .map(|doc| doc.selection())
+            .unwrap_or((0, 0));
         let scope = if self.find.in_selection {
             self.find.scope
         } else {
@@ -1722,24 +2212,37 @@ impl LubanApp {
         } else {
             b
         };
-        let engine = self.find.engine(&query);
-        let found = engine.find_from(&text, from, forward, scope);
+        let found = {
+            let Some(tab) = self.tabs.get(self.active) else {
+                return;
+            };
+            self.find
+                .engine(&query)
+                .find_from(&tab.doc.text, from, forward, scope)
+        };
+        self.release_active_text();
         match found {
             Some(matched) => {
-                self.find.current = self.find.matches.iter().position(|m| *m == matched);
-                let count = self.find.matches.len();
-                let position = self.find.current.map(|i| i + 1).unwrap_or(0);
-                self.find.status = if count > 0 {
-                    tr_args(
-                        "find.position",
-                        &[
-                            ("position", position.to_string()),
-                            ("count", count.to_string()),
-                        ],
-                    )
+                if large {
+                    self.find.current = None;
+                    self.find.status = tr("find.match_found");
                 } else {
-                    tr("find.match_found")
-                };
+                    self.find.current = self.find.matches.iter().position(|m| *m == matched);
+                    let count = self.find.matches.len();
+                    let position = self.find.current.map(|i| i + 1).unwrap_or(0);
+                    self.find.status = if count > 0 {
+                        tr_args(
+                            "find.position",
+                            &[
+                                ("position", position.to_string()),
+                                ("count", count.to_string()),
+                            ],
+                        )
+                    } else {
+                        tr("find.match_found")
+                    };
+                }
+                self.find.generation = self.find.generation.wrapping_add(1);
                 self.select_char_range(matched.start, matched.end, window, cx);
                 self.focus_editor = true;
                 cx.notify();
@@ -1758,36 +2261,123 @@ impl LubanApp {
         if query.is_empty() {
             return;
         }
-        let Some(tab) = self.active_tab() else { return };
-        let text = tab.doc.text.clone();
-        let (a, b) = tab.doc.selection();
+        if !self.ensure_active_text(cx) {
+            return;
+        }
+        let large = self.active_tab().is_some_and(|tab| tab.large_file);
+        let (a, b) = self
+            .active_doc()
+            .map(|doc| doc.selection())
+            .unwrap_or((0, 0));
         let scope = self.find.effective_scope(a != b, (a, b));
-        let engine = self.find.engine(&query);
-        let target = if a != b {
-            if let Some(m) = engine
-                .find_all(&text, scope, usize::MAX)
-                .into_iter()
-                .find(|m| m.start == a && m.end == b)
-            {
-                Some(m)
+        let target = {
+            let Some(tab) = self.tabs.get(self.active) else {
+                return;
+            };
+            let text = tab.doc.text.as_str();
+            let engine = self.find.engine(&query);
+            if a != b {
+                // Replace the selection when it is itself a match; otherwise
+                // advance to the next match. `find_from` stops at the first
+                // match, so this stays allocation-free for large files.
+                match engine.find_from(text, a, true, scope) {
+                    Some(m) if m.start == a && m.end == b => Some(m),
+                    _ => engine.find_from(text, b, true, scope),
+                }
             } else {
-                engine.find_from(&text, b, true, scope)
+                engine.find_from(text, b, true, scope)
             }
-        } else {
-            engine.find_from(&text, b, true, scope)
         };
         let Some(matched) = target else {
+            self.release_active_text();
             self.find.status = tr("find.no_matches");
             cx.notify();
             return;
         };
-        let new_text = self
-            .find
-            .replace_match(&text, &query, matched, &replacement);
-        let new_cursor = matched.start + textutil::char_count(&replacement);
-        self.find.dirty = true;
-        self.replace_document_text(new_text, new_cursor, new_cursor, window, cx);
+        let (expanded, new_cursor, old_total) = {
+            let text = self
+                .tabs
+                .get(self.active)
+                .map(|tab| tab.doc.text.as_str())
+                .unwrap_or("");
+            let expanded = self
+                .find
+                .engine(&query)
+                .replacement_for(text, matched, &replacement);
+            let new_cursor = matched.start + expanded.chars().count();
+            (
+                expanded,
+                new_cursor,
+                self.tabs[self.active].doc.char_count(),
+            )
+        };
+        if large {
+            self.release_active_text();
+            self.apply_large_edits(&[(matched, expanded)], new_cursor, old_total, window, cx);
+        } else {
+            let new_text = {
+                let text = self
+                    .tabs
+                    .get(self.active)
+                    .map(|tab| tab.doc.text.as_str())
+                    .unwrap_or("");
+                self.find.replace_match(text, &query, matched, &replacement)
+            };
+            self.find.dirty = true;
+            self.replace_document_text(new_text, new_cursor, new_cursor, window, cx);
+        }
         self.find.status = tr("find.replaced_one");
+    }
+
+    /// Apply small targeted replacements directly to a large editor buffer.
+    /// Edits run back to front so earlier character positions stay valid.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_large_edits(
+        &mut self,
+        edits: &[(Match, String)],
+        cursor_after: usize,
+        old_total: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
+            return old_total;
+        };
+        let mut new_total = old_total;
+        let editor = self.tabs[index].editor.clone();
+        for (matched, expanded) in edits.iter().rev() {
+            new_total = new_total + expanded.chars().count() - matched.len();
+            let (b0, b1) = {
+                let state = editor.read(cx);
+                let rope = state.text();
+                let total = rope.len_chars();
+                (
+                    rope.char_to_byte_idx(matched.start.min(total)),
+                    rope.char_to_byte_idx(matched.end.min(total)),
+                )
+            };
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(b0..b1, cx);
+                state.replace(expanded.clone(), window, cx);
+            });
+        }
+        let cursor_byte = {
+            let state = editor.read(cx);
+            state
+                .text()
+                .char_to_byte_idx(cursor_after.min(state.text().len_chars()))
+        };
+        editor.update(cx, |state, cx| {
+            state.set_selected_range(cursor_byte..cursor_byte, cx);
+            state.focus(window, cx);
+        });
+        let tab = &mut self.tabs[index];
+        tab.doc
+            .record_external_replacement(new_total, cursor_after, cursor_after);
+        tab.highlighted_revision = u64::MAX;
+        tab.decorations_key = None;
+        tab.needs_sync = false;
+        new_total
     }
 
     pub fn replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1797,9 +2387,48 @@ impl LubanApp {
         if query.is_empty() {
             return;
         }
-        let Some(tab) = self.active_tab() else { return };
-        let text = tab.doc.text.clone();
-        match self.find.replace_all(&text, &query, &replacement) {
+        if !self.ensure_active_text(cx) {
+            return;
+        }
+        let large = self.active_tab().is_some_and(|tab| tab.large_file);
+        if large {
+            let (edits, old_total, cursor) = {
+                let text = self
+                    .tabs
+                    .get(self.active)
+                    .map(|tab| tab.doc.text.as_str())
+                    .unwrap_or("");
+                let engine = self.find.engine(&query);
+                let edits: Vec<(Match, String)> = engine
+                    .find_all(text, self.find.scope, usize::MAX)
+                    .into_iter()
+                    .map(|matched| (matched, engine.replacement_for(text, matched, &replacement)))
+                    .collect();
+                let cursor = edits.first().map(|(matched, _)| matched.start).unwrap_or(0);
+                (edits, self.tabs[self.active].doc.char_count(), cursor)
+            };
+            if edits.is_empty() {
+                self.release_active_text();
+                self.find.status = tr_args("find.replaced_other", &[("count", "0".to_string())]);
+                cx.notify();
+                return;
+            }
+            let count = edits.len();
+            self.release_active_text();
+            self.apply_large_edits(&edits, cursor, old_total, window, cx);
+            self.find.status = tr_args("find.replaced_other", &[("count", count.to_string())]);
+            cx.notify();
+            return;
+        }
+        let replaced = {
+            let text = self
+                .tabs
+                .get(self.active)
+                .map(|tab| tab.doc.text.as_str())
+                .unwrap_or("");
+            self.find.replace_all(text, &query, &replacement)
+        };
+        match replaced {
             Ok((new_text, count)) => {
                 let cursor = self
                     .find
@@ -1814,6 +2443,7 @@ impl LubanApp {
                 cx.notify();
             }
             Err(err) => {
+                self.release_active_text();
                 self.find.error = Some(err);
                 cx.notify();
             }
@@ -1967,52 +2597,73 @@ impl LubanApp {
     // ------------------------------------------------------------------
 
     fn refresh_decorations(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active) else {
+        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
             return;
         };
-        let text = tab.doc.text.clone();
-        let matches = if self.find.open {
+        let large = self.tabs[index].large_file;
+        let key = {
+            let tab = &self.tabs[index];
+            (
+                tab.doc.revision(),
+                tab.doc.cursor,
+                self.find.generation,
+                self.find.open,
+                self.settings.highlight_matching_brackets,
+                large,
+            )
+        };
+        if self.tabs[index].decorations_key == Some(key) {
+            return;
+        }
+        let current = self.find.current;
+        let matches = if self.find.open && !large {
             self.find.matches.clone()
         } else {
             Vec::new()
         };
-        let current = self.find.current;
-        let bracket = if self.settings.highlight_matching_brackets {
-            textutil::matching_bracket(&text, tab.doc.cursor)
+        // Bracket matching walks the whole buffer; large files skip it.
+        let bracket = if self.settings.highlight_matching_brackets && !large {
+            textutil::matching_bracket(&self.tabs[index].doc.text, self.tabs[index].doc.cursor)
         } else {
             None
         };
+        let editor = self.tabs[index].editor.clone();
         let mut decorations: Vec<RangeDecoration> = Vec::new();
-        for (index, matched) in matches.iter().enumerate() {
-            let b0 = textutil::char_to_byte(&text, matched.start);
-            let b1 = textutil::char_to_byte(&text, matched.end);
-            if b0 == b1 {
-                continue;
+        {
+            let state = editor.read(cx);
+            let rope = state.text();
+            let total = rope.len_chars();
+            for (match_index, matched) in matches.iter().enumerate() {
+                let b0 = rope.char_to_byte_idx(matched.start.min(total));
+                let b1 = rope.char_to_byte_idx(matched.end.min(total));
+                if b0 == b1 {
+                    continue;
+                }
+                let color = if current == Some(match_index) {
+                    rgba(0x2F81F7AA)
+                } else {
+                    rgba(0xF2C94C55)
+                };
+                decorations.push(
+                    RangeDecoration::new(b0..b1)
+                        .with_style(RangeDecorationStyle::Fill)
+                        .with_color(color.into()),
+                );
             }
-            let color = if current == Some(index) {
-                rgba(0x2F81F7AA)
-            } else {
-                rgba(0xF2C94C55)
-            };
-            decorations.push(
-                RangeDecoration::new(b0..b1)
-                    .with_style(RangeDecorationStyle::Fill)
-                    .with_color(color.into()),
-            );
+            if let Some((a, b)) = bracket {
+                let b0 = rope.char_to_byte_idx(a.min(total));
+                let b1 = rope.char_to_byte_idx((b + 1).min(total));
+                decorations.push(
+                    RangeDecoration::new(b0..b1)
+                        .with_style(RangeDecorationStyle::Frame)
+                        .with_color(rgba(0x2F81F799).into()),
+                );
+            }
         }
-        if let Some((a, b)) = bracket {
-            let b0 = textutil::char_to_byte(&text, a);
-            let b1 = textutil::char_to_byte(&text, b + 1);
-            decorations.push(
-                RangeDecoration::new(b0..b1)
-                    .with_style(RangeDecorationStyle::Frame)
-                    .with_color(rgba(0x2F81F799).into()),
-            );
-        }
+        let tab = &mut self.tabs[index];
         tab.decorations.set(decorations, cx);
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.highlighted_revision = tab.doc.revision();
-        }
+        tab.decorations_key = Some(key);
+        tab.highlighted_revision = tab.doc.revision();
     }
 
     fn process_enter_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2039,11 +2690,26 @@ impl LubanApp {
             return;
         }
         let query = self.find.query_text(cx);
+        if self.active_tab().is_some_and(|tab| tab.large_file) {
+            // Large files only search when the user asks for it.
+            self.find.dirty = false;
+            self.find.matches.clear();
+            self.find.current = None;
+            self.find.error = None;
+            self.find.generation = self.find.generation.wrapping_add(1);
+            if query.is_empty() {
+                self.find.status.clear();
+            } else {
+                self.find.status = tr("find.large_file_hint");
+            }
+            return;
+        }
         let text = self
-            .active_doc()
-            .map(|d| d.text.clone())
-            .unwrap_or_default();
-        self.find.refresh(&text, &query);
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.doc.text.as_str())
+            .unwrap_or("");
+        self.find.refresh(text, &query);
         self.find.dirty = false;
     }
 
@@ -2162,6 +2828,7 @@ impl LubanApp {
             self.active = index;
             self.focus_editor = true;
             self.find.clear();
+            self.find.dirty = true;
             cx.notify();
         }
     }
@@ -2175,6 +2842,7 @@ impl LubanApp {
         self.active = ((self.active as isize + delta).rem_euclid(len)) as usize;
         self.focus_editor = true;
         self.find.clear();
+        self.find.dirty = true;
         cx.notify();
     }
 
@@ -2204,9 +2872,9 @@ impl LubanApp {
         let mut parts = value.split([':', ',']).map(|p| p.trim().parse::<usize>());
         let line = parts.next().and_then(Result::ok).unwrap_or(1).max(1);
         let column = parts.next().and_then(Result::ok).unwrap_or(1).max(1);
-        let Some(tab) = self.active_tab() else { return };
-        let index = LineIndex::new(&tab.doc.text);
-        let position = index.char_index(line, column);
+        let index = self.active;
+        let (position, position_end) = self.line_selection_in_tab(index, line, column, 0, cx);
+        let _ = position_end;
         self.select_char_range(position, position, window, cx);
         self.focus_editor = true;
         cx.notify();
@@ -2907,7 +3575,8 @@ impl LubanApp {
 
     fn render_toolbar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
-        let wrap_enabled = self.settings.word_wrap;
+        let wrap_enabled =
+            self.settings.word_wrap && !self.active_tab().is_some_and(|tab| tab.large_file);
         let (theme_icon, theme_label) = if self.settings.theme == ThemeChoice::Light {
             (IconName::Moon, tr("menu.view.dark_theme"))
         } else {
@@ -3133,12 +3802,20 @@ impl LubanApp {
     fn render_status_bar(&self, cx: &gpui_kit::App) -> AnyElement {
         let (mut line, mut column) = (1, 1);
         let (mut sel_len, mut chars, mut lines) = (0, 0, 0);
-        if let Some(doc) = self.active_doc() {
-            (line, column) = doc.line_col();
-            let (a, b) = doc.selection();
-            sel_len = b.saturating_sub(a);
-            chars = doc.char_count();
-            lines = doc.line_count();
+        let mut large_file = false;
+        if let Some(tab) = self.active_tab() {
+            large_file = tab.large_file;
+            let state = tab.editor.read(cx);
+            let rope = state.text();
+            chars = rope.len_chars();
+            lines = rope.lines_len();
+            let position = rope.offset_to_position(state.cursor());
+            line = position.line as usize + 1;
+            column = position.character as usize + 1;
+            let range = state.selected_range();
+            let start = rope.byte_to_char_idx(range.start.min(rope.len()));
+            let end = rope.byte_to_char_idx(range.end.min(rope.len()));
+            sel_len = end.saturating_sub(start);
         }
         let eol_label = self.active_doc().map(|d| d.eol.label()).unwrap_or("LF");
         let encoding = self
@@ -3190,6 +3867,11 @@ impl LubanApp {
                 div().child(selection),
                 div().child(chars_label),
                 div().child(lines_label),
+                div().child(if large_file {
+                    tr("status.large_file")
+                } else {
+                    String::new()
+                }),
                 div().child(state_label),
                 div().child(if self.status.is_empty() {
                     String::new()

@@ -28,6 +28,9 @@ pub struct FindPanel {
     pub dirty: bool,
     pub scope: Option<(usize, usize)>,
     pub highlighted_revision: u64,
+    /// Bumped whenever the match set or current match changes, so decorations
+    /// can skip rebuilding on unrelated renders.
+    pub generation: u64,
     pub status: String,
 }
 
@@ -53,6 +56,7 @@ impl FindPanel {
             dirty: true,
             scope: None,
             highlighted_revision: u64::MAX,
+            generation: 0,
             status: String::new(),
         }
     }
@@ -100,6 +104,7 @@ impl FindPanel {
 
     pub fn refresh(&mut self, text: &str, query: &str) {
         self.error = None;
+        self.generation = self.generation.wrapping_add(1);
         if query.is_empty() {
             self.matches.clear();
             self.current = None;
@@ -163,6 +168,7 @@ impl FindPanel {
         self.status.clear();
         self.scope = None;
         self.highlighted_revision = u64::MAX;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 

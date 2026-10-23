@@ -310,6 +310,9 @@ find.no_matches:
 find.match_found:
   en: "Match found"
   zh-CN: "已找到匹配"
+find.large_file_hint:
+  en: "Large file: press Enter or click Find Next to search"
+  zh-CN: "大文件：按回车或点击“查找下一个”开始搜索"
 find.position:
   en: "%{position} of %{count}"
   zh-CN: "第 %{position} 个，共 %{count} 个"
@@ -632,6 +635,15 @@ prefs.language_chinese:
 status.opened:
   en: "Opened %{path}"
   zh-CN: "已打开 %{path}"
+status.opening:
+  en: "Opening %{path}…"
+  zh-CN: "正在打开 %{path}…"
+status.restoring_session:
+  en: "Restoring session…"
+  zh-CN: "正在恢复会话…"
+status.large_file:
+  en: "Large file mode"
+  zh-CN: "大文件模式"
 status.open_failed:
   en: "Could not open %{path}: %{error}"
   zh-CN: "无法打开 %{path}：%{error}"

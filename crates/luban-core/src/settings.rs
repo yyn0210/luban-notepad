@@ -82,7 +82,7 @@ impl Default for Settings {
             session_interval_secs: 20,
             max_recent_files: 20,
             recent_files: Vec::new(),
-            large_file_threshold: 2 * 1024 * 1024,
+            large_file_threshold: 100 * 1024 * 1024,
             max_file_size_mb: 256,
             default_encoding: TextEncoding::Utf8,
             default_eol: Eol::native(),
@@ -212,6 +212,20 @@ mod tests {
         assert!(s.restore_session);
         assert_eq!(s.default_encoding, TextEncoding::Utf8);
         assert_eq!(s.max_file_size_bytes(), 256 * 1024 * 1024);
+        assert_eq!(s.large_file_threshold, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn large_file_threshold_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"large_file_threshold": 0}"#).unwrap();
+        assert_eq!(Settings::load_from(&path).large_file_threshold, 64 * 1024);
+        fs::write(&path, r#"{"large_file_threshold": 999999999999}"#).unwrap();
+        assert_eq!(
+            Settings::load_from(&path).large_file_threshold,
+            512 * 1024 * 1024
+        );
     }
 
     #[test]

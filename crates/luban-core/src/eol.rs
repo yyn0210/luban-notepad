@@ -139,6 +139,86 @@ pub fn to_lf(text: &str) -> String {
     normalize(text, Eol::Lf)
 }
 
+/// Owned variant of [`to_lf`] that avoids a second full-size allocation.
+///
+/// Text without `\r` is returned unchanged. Otherwise CRLF and CR sequences are
+/// compacted in place; CR and LF are ASCII, so rewriting them never splits a
+/// multi-byte UTF-8 sequence.
+pub fn to_lf_owned(mut text: String) -> String {
+    if !text.as_bytes().contains(&b'\r') {
+        return text;
+    }
+    // SAFETY: only ASCII bytes are rewritten or removed, so the buffer stays
+    // valid UTF-8.
+    let bytes = unsafe { text.as_mut_vec() };
+    let mut read = 0usize;
+    let mut write = 0usize;
+    while read < bytes.len() {
+        let byte = bytes[read];
+        if byte == b'\r' {
+            bytes[write] = b'\n';
+            write += 1;
+            read += 1;
+            if read < bytes.len() && bytes[read] == b'\n' {
+                read += 1;
+            }
+        } else {
+            if write != read {
+                bytes[write] = byte;
+            }
+            write += 1;
+            read += 1;
+        }
+    }
+    bytes.truncate(write);
+    text
+}
+
+/// Owned variant of [`normalize`]. LF output reuses the input buffer; CR output
+/// is compacted in place; CRLF output falls back to building a new string.
+pub fn normalize_owned(text: String, eol: Eol) -> String {
+    match eol {
+        Eol::Lf => to_lf_owned(text),
+        Eol::Cr => {
+            let mut text = text;
+            if !text.as_bytes().iter().any(|b| *b == b'\r' || *b == b'\n') {
+                return text;
+            }
+            // SAFETY: only ASCII bytes are rewritten or removed.
+            let bytes = unsafe { text.as_mut_vec() };
+            let mut read = 0usize;
+            let mut write = 0usize;
+            while read < bytes.len() {
+                match bytes[read] {
+                    b'\r' => {
+                        bytes[write] = b'\r';
+                        write += 1;
+                        read += 1;
+                        if read < bytes.len() && bytes[read] == b'\n' {
+                            read += 1;
+                        }
+                    }
+                    b'\n' => {
+                        bytes[write] = b'\r';
+                        write += 1;
+                        read += 1;
+                    }
+                    byte => {
+                        if write != read {
+                            bytes[write] = byte;
+                        }
+                        write += 1;
+                        read += 1;
+                    }
+                }
+            }
+            bytes.truncate(write);
+            text
+        }
+        Eol::CrLf => normalize(&text, eol),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +247,43 @@ mod tests {
         let once = to_lf(mixed);
         assert_eq!(once, "one\ntwo\nthree\nfour");
         assert_eq!(to_lf(&once), once);
+    }
+
+    #[test]
+    fn owned_lf_normalization_matches_borrowed() {
+        let cases = [
+            "",
+            "no line breaks",
+            "a\nb\n",
+            "a\r\nb\r\n",
+            "a\rb\r",
+            "mixed\r\nlf\ncr\rend",
+            "héllo\r\n世界\r\n🙂",
+        ];
+        for case in cases {
+            assert_eq!(to_lf_owned(case.to_string()), to_lf(case), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn owned_normalization_matches_borrowed() {
+        let cases = [
+            "",
+            "no line breaks",
+            "a\nb\n",
+            "a\r\nb\r\n",
+            "a\rb\r",
+            "mixed\r\nlf\ncr\rend",
+            "héllo\r\n世界\r\n🙂",
+        ];
+        for eol in Eol::ALL {
+            for case in cases {
+                assert_eq!(
+                    normalize_owned(case.to_string(), eol),
+                    normalize(case, eol),
+                    "{eol:?} {case:?}"
+                );
+            }
+        }
     }
 }

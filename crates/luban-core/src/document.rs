@@ -1,6 +1,7 @@
 //! The editor document: text, file metadata, selection and undo history.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -37,6 +38,11 @@ pub struct Document {
     pub untitled_name: String,
     revision: u64,
     saved_revision: u64,
+    /// The text buffer lives only in the editor while this is set. Operations
+    /// that need the full text must materialize it first with
+    /// [`Document::attach_text`].
+    text_detached: bool,
+    cached_chars: Option<usize>,
 }
 
 impl Document {
@@ -58,6 +64,8 @@ impl Document {
             untitled_name: name.into(),
             revision: 0,
             saved_revision: 0,
+            text_detached: false,
+            cached_chars: Some(0),
         }
     }
 
@@ -72,6 +80,7 @@ impl Document {
         let text = text.into();
         let mut doc = Self::new_untitled("new 1");
         doc.file_size = text.len() as u64;
+        doc.cached_chars = Some(text::char_count(&text));
         doc.text = text;
         doc.encoding = encoding;
         doc.eol = eol;
@@ -102,14 +111,15 @@ impl Document {
         if encoding::looks_binary(&bytes) {
             return Err(Error::BinaryFile(path.to_path_buf()));
         }
-        let decoded = encoding::decode(&bytes);
+        let decoded = encoding::decode_owned(bytes);
         let detected_eol = eol::detect(&decoded.text);
         let language_name = language::detect_from_path(path);
         let mut doc = Self::new_untitled("new 1");
         doc.path = Some(path.to_path_buf());
         // The editing buffer is always LF; the file's convention lives in
         // `doc.eol` and is restored when saving.
-        doc.text = eol::to_lf(&decoded.text);
+        doc.text = eol::to_lf_owned(decoded.text);
+        doc.cached_chars = Some(text::char_count(&doc.text));
         doc.encoding = decoded.encoding;
         doc.eol = detected_eol;
         doc.language = language_name.to_string();
@@ -126,11 +136,60 @@ impl Document {
         let text = text.into();
         let detected_eol = eol::detect(&text);
         let mut doc = Self::new_untitled("new 1");
-        doc.text = eol::to_lf(&text);
+        doc.text = eol::to_lf_owned(text);
+        doc.cached_chars = Some(text::char_count(&doc.text));
         doc.eol = detected_eol;
         doc.revision = 1;
         doc.saved_revision = 0; // unsaved content
         doc
+    }
+
+    /// Whether the document's buffer currently lives only in the editor.
+    pub fn is_text_detached(&self) -> bool {
+        self.text_detached
+    }
+
+    /// Move the buffer out for the editor and release the document's copy.
+    ///
+    /// Returns the text and its character count. The document keeps the count
+    /// so selection and status queries stay O(1) until the text is attached
+    /// again.
+    pub fn detach_text(&mut self) -> (String, usize) {
+        let count = self.char_count();
+        self.text_detached = true;
+        (std::mem::take(&mut self.text), count)
+    }
+
+    /// Install a materialized snapshot, computing the character count.
+    pub fn attach_text(&mut self, text: String) {
+        let count = text::char_count(&text);
+        self.attach_text_counted(text, count);
+    }
+
+    /// Install a materialized snapshot with a known character count.
+    pub fn attach_text_counted(&mut self, text: String, char_count: usize) {
+        self.text = text;
+        self.cached_chars = Some(char_count);
+        self.text_detached = false;
+    }
+
+    /// Compute and cache the character count without other work.
+    pub fn prime_char_count(&mut self) -> usize {
+        if self.cached_chars.is_none() {
+            self.cached_chars = Some(text::char_count(&self.text));
+        }
+        self.cached_chars.unwrap_or(0)
+    }
+
+    /// Record a whole-buffer replacement that was applied directly in the
+    /// editor, without materializing a second copy in the document.
+    pub fn record_external_replacement(&mut self, char_count: usize, anchor: usize, cursor: usize) {
+        self.text.clear();
+        self.text_detached = true;
+        self.cached_chars = Some(char_count);
+        self.anchor = anchor.min(char_count);
+        self.cursor = cursor.min(char_count);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn display_name(&self) -> String {
@@ -195,19 +254,22 @@ impl Document {
     }
 
     pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
-        let total = text::char_count(&self.text);
+        let total = self.char_count();
         self.anchor = anchor.min(total);
         self.cursor = cursor.min(total);
     }
 
     pub fn select_all(&mut self) {
-        let total = text::char_count(&self.text);
+        let total = self.char_count();
         self.anchor = 0;
         self.cursor = total;
     }
 
     pub fn char_count(&self) -> usize {
-        text::char_count(&self.text)
+        match self.cached_chars {
+            Some(count) => count,
+            None => text::char_count(&self.text),
+        }
     }
 
     /// Apply a replacement edit and record it in the undo history.
@@ -220,6 +282,9 @@ impl Document {
         cursor_after: usize,
         anchor_after: usize,
     ) -> bool {
+        if self.text_detached {
+            return false;
+        }
         let total = self.char_count();
         if start > total {
             return false;
@@ -228,33 +293,35 @@ impl Document {
         if removed_chars == 0 && inserted.is_empty() {
             return false;
         }
-        let removed = text::slice_chars(&self.text, start, start + removed_chars);
         let selection_before = (self.anchor, self.cursor);
 
         let b0 = text::char_to_byte(&self.text, start);
         let b1 = text::char_to_byte(&self.text, start + removed_chars);
+        let removed = self.text[b0..b1].to_owned();
+        let inserted_chars = inserted.chars().count();
+        let new_count = total - removed_chars + inserted_chars;
         let mut new_text = String::with_capacity(self.text.len() + inserted.len() - (b1 - b0));
         new_text.push_str(&self.text[..b0]);
         new_text.push_str(inserted);
         new_text.push_str(&self.text[b1..]);
 
+        let cursor_after = cursor_after.min(new_count);
+        let anchor_after = anchor_after.min(new_count);
         let edit = Edit {
             start,
             removed,
             inserted: inserted.to_owned(),
             cursor_before: self.cursor,
-            cursor_after: cursor_after.min(text::char_count(&new_text)),
+            cursor_after,
             selection_before: Some(selection_before),
-            selection_after: Some((
-                anchor_after.min(text::char_count(&new_text)),
-                cursor_after.min(text::char_count(&new_text)),
-            )),
+            selection_after: Some((anchor_after, cursor_after)),
             kind,
             at: Instant::now(),
         };
         self.text = new_text;
-        self.cursor = edit.cursor_after;
-        self.anchor = edit.selection_after.map(|s| s.0).unwrap_or(self.cursor);
+        self.cached_chars = Some(new_count);
+        self.cursor = cursor_after;
+        self.anchor = anchor_after;
         self.revision = self.revision.wrapping_add(1);
         self.undo.push(edit);
         true
@@ -268,9 +335,13 @@ impl Document {
         cursor_after: usize,
         anchor_after: usize,
     ) -> bool {
+        if self.text_detached {
+            return false;
+        }
         if new_text == self.text {
-            self.cursor = cursor_after.min(self.char_count());
-            self.anchor = anchor_after.min(self.char_count());
+            let total = self.char_count();
+            self.cursor = cursor_after.min(total);
+            self.anchor = anchor_after.min(total);
             return false;
         }
         let (start, removed, inserted) = diff_chars(&self.text, new_text);
@@ -316,6 +387,9 @@ impl Document {
     }
 
     fn apply_history(&mut self, edit: &Edit, undo: bool) -> bool {
+        if self.text_detached {
+            return false;
+        }
         let (remove_len, insert_text, selection) = if undo {
             (
                 edit.inserted.chars().count(),
@@ -333,26 +407,28 @@ impl Document {
         if edit.start > total || remove_len > total - edit.start {
             return false;
         }
-        let current = text::slice_chars(&self.text, edit.start, edit.start + remove_len);
+        let b0 = text::char_to_byte(&self.text, edit.start);
+        let b1 = text::char_to_byte(&self.text, edit.start + remove_len);
         let expected = if undo {
             edit.inserted.as_str()
         } else {
             edit.removed.as_str()
         };
-        if current != expected {
+        if &self.text[b0..b1] != expected {
             return false;
         }
-        let b0 = text::char_to_byte(&self.text, edit.start);
-        let b1 = text::char_to_byte(&self.text, edit.start + remove_len);
+        let inserted_chars = insert_text.chars().count();
+        let new_count = total - remove_len + inserted_chars;
         let mut new_text = String::with_capacity(self.text.len() + insert_text.len());
         new_text.push_str(&self.text[..b0]);
         new_text.push_str(insert_text);
         new_text.push_str(&self.text[b1..]);
         self.text = new_text;
+        self.cached_chars = Some(new_count);
         self.revision = self.revision.wrapping_add(1);
         if let Some((anchor, cursor)) = selection {
-            self.anchor = anchor.min(self.char_count());
-            self.cursor = cursor.min(self.char_count());
+            self.anchor = anchor.min(new_count);
+            self.cursor = cursor.min(new_count);
         }
         true
     }
@@ -420,12 +496,37 @@ impl Document {
         if self.read_only {
             return Err(Error::Other(crate::i18n::tr("core.document.read_only")));
         }
-        let with_eol = eol::normalize(&self.text, self.eol);
-        let (bytes, lossy) = encoding::encode(&with_eol, self.encoding);
-        fs::write(path, &bytes)?;
+        if self.text_detached {
+            return Err(Error::Other("document text is not materialized".into()));
+        }
+        let mut file = fs::File::create(path)?;
+        let lossy = if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom)
+            && self.eol == Eol::Lf
+            && !self.text.as_bytes().contains(&b'\r')
+        {
+            // Fast path: LF UTF-8 is already the on-disk representation.
+            file.write_all(self.encoding.bom())?;
+            file.write_all(self.text.as_bytes())?;
+            false
+        } else {
+            let with_eol = eol::normalize(&self.text, self.eol);
+            let (bytes, lossy) =
+                if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom) {
+                    let mut bytes = Vec::with_capacity(self.encoding.bom().len() + with_eol.len());
+                    bytes.extend_from_slice(self.encoding.bom());
+                    bytes.extend_from_slice(with_eol.as_bytes());
+                    (bytes, false)
+                } else {
+                    encoding::encode(&with_eol, self.encoding)
+                };
+            file.write_all(&bytes)?;
+            lossy
+        };
+        drop(file);
         let metadata = fs::metadata(path)?;
         self.file_size = metadata.len();
         self.last_modified = metadata.modified().ok();
+        self.prime_char_count();
         self.mark_saved();
         Ok(lossy)
     }
@@ -438,6 +539,8 @@ impl Document {
             .ok_or_else(|| Error::Other(crate::i18n::tr("core.document.no_path")))?;
         let replacement = Self::open(&path)?;
         self.text = replacement.text;
+        self.cached_chars = replacement.cached_chars;
+        self.text_detached = false;
         self.encoding = replacement.encoding;
         self.eol = replacement.eol;
         self.last_modified = replacement.last_modified;
@@ -495,11 +598,12 @@ impl Document {
 
     /// Replace the whole buffer while keeping the undo history useful.
     pub fn replace_all_text(&mut self, new_text: &str, kind: EditKind) -> bool {
-        if new_text == self.text {
+        if self.text_detached || new_text == self.text {
             return false;
         }
-        let cursor = self.cursor.min(text::char_count(new_text));
-        let anchor = self.anchor.min(text::char_count(new_text));
+        let count = text::char_count(new_text);
+        let cursor = self.cursor.min(count);
+        let anchor = self.anchor.min(count);
         self.apply_edit(0, self.char_count(), new_text, kind, cursor, anchor)
     }
 }
@@ -686,5 +790,67 @@ mod tests {
         assert_eq!(doc.line_col(), (2, 1));
         doc.select_all();
         assert_eq!(doc.selected_text(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn detaches_and_restores_the_text_snapshot() {
+        let mut doc =
+            Document::from_text("héllo\nworld", TextEncoding::Utf8, Eol::Lf, "Plain Text");
+        let (text, count) = doc.detach_text();
+        assert!(doc.is_text_detached());
+        assert!(doc.text.is_empty());
+        assert_eq!(count, 11);
+        assert_eq!(doc.char_count(), 11);
+
+        // Edits require the buffer to be materialized again.
+        assert!(!doc.apply_edit(0, 0, "x", EditKind::Typing, 1, 1));
+        doc.set_selection(99, 99);
+        assert_eq!(doc.selection(), (11, 11));
+
+        doc.attach_text_counted(text, count);
+        assert!(!doc.is_text_detached());
+        assert_eq!(doc.text, "héllo\nworld");
+        assert_eq!(doc.char_count(), 11);
+        assert!(doc.apply_edit(0, 0, "x", EditKind::Typing, 1, 1));
+        assert_eq!(doc.char_count(), 12);
+    }
+
+    #[test]
+    fn cached_char_count_tracks_edits_and_undo() {
+        let mut doc = Document::from_text("abc", TextEncoding::Utf8, Eol::Lf, "Plain Text");
+        assert_eq!(doc.char_count(), 3);
+        doc.apply_edit(3, 0, "世界", EditKind::Typing, 5, 5);
+        assert_eq!(doc.char_count(), 5);
+        assert!(doc.undo());
+        assert_eq!(doc.char_count(), 3);
+        assert!(doc.redo());
+        assert_eq!(doc.char_count(), 5);
+    }
+
+    #[test]
+    fn saves_lf_utf8_without_changing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lf.txt");
+        let mut doc =
+            Document::from_text("héllo\nworld\n", TextEncoding::Utf8, Eol::Lf, "Plain Text");
+        doc.save_as(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), "héllo\nworld\n".as_bytes());
+        assert_eq!(doc.char_count(), 12);
+    }
+
+    #[test]
+    fn saves_owned_crlf_and_cr() {
+        let dir = tempfile::tempdir().unwrap();
+        for (eol, expected) in [
+            (Eol::CrLf, "a\r\nb\r\n".as_bytes().to_vec()),
+            (Eol::Cr, b"a\rb\r".to_vec()),
+        ] {
+            let path = dir.path().join(format!("{}.txt", eol.label()));
+            let mut doc = Document::from_text("a\nb\n", TextEncoding::Utf8, eol, "Plain Text");
+            doc.save_as(&path).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert_eq!(doc.text, "a\nb\n", "{eol:?}");
+            assert_eq!(doc.char_count(), 4);
+        }
     }
 }
