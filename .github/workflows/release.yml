@@ -106,10 +106,16 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed" }
+
       - name: Build release
         run: cargo build --release --locked -p luban-app
 
-      - name: Build package
+      - name: Build packages
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -SkipBuild
 
@@ -131,13 +137,27 @@ jobs:
           if ($count -lt 1) { throw "luban-notepad.exe has no icon resource" }
           Write-Host "embedded icon groups: $count"
 
-      - name: Upload Windows package
+      - name: Verify packages
+        shell: pwsh
+        run: |
+          $portable = Get-ChildItem -Path dist -Filter '*-windows-*-portable.zip'
+          if (-not $portable) { throw "portable zip not found" }
+          $installer = Get-ChildItem -Path dist -Filter '*-windows-*-setup.exe'
+          if (-not $installer) { throw "installer not found" }
+          $marker = Get-ChildItem -Path dist -Recurse -Filter 'luban-notepad.portable'
+          if (-not $marker) { throw "portable marker not found" }
+          Write-Host "portable: $($portable.Name)"
+          Write-Host "installer: $($installer.Name)"
+
+      - name: Upload Windows packages
         uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
           path: |
-            dist/*.zip
-            dist/*.zip.sha256
+            dist/*-portable.zip
+            dist/*-portable.zip.sha256
+            dist/*-setup.exe
+            dist/*-setup.exe.sha256
           if-no-files-found: error
           retention-days: 7
 

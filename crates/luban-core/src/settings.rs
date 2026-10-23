@@ -187,17 +187,37 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Marker file shipped next to the executable by the Windows portable build.
+pub const PORTABLE_MARKER: &str = "luban-notepad.portable";
+
 /// Per-user configuration directory. `LUBAN_NOTEPAD_CONFIG_DIR` overrides it,
-/// which is useful for portable installs and tests.
+/// which is useful for tests and for launchers that relocate the profile.
+///
+/// A portable install keeps `settings.json` and `session.json` in `data/` next
+/// to the executable, selected by a [`PORTABLE_MARKER`] file. Installed builds
+/// fall back to the normal per-user directory.
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = env::var("LUBAN_NOTEPAD_CONFIG_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = portable_config_dir(&exe) {
+            return dir;
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("luban-notepad")
+}
+
+/// Returns `<exe dir>/data` when the portable marker sits next to `exe`.
+fn portable_config_dir(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    dir.join(PORTABLE_MARKER)
+        .is_file()
+        .then(|| dir.join("data"))
 }
 
 #[cfg(test)]
@@ -309,5 +329,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loaded = Settings::load_from(&dir.path().join("absent.json"));
         assert_eq!(loaded.tab_size, Settings::default().tab_size);
+    }
+
+    #[test]
+    fn portable_marker_moves_config_next_to_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("luban-notepad.exe");
+        fs::write(&exe, b"").unwrap();
+        assert_eq!(portable_config_dir(&exe), None);
+
+        fs::write(dir.path().join(PORTABLE_MARKER), b"").unwrap();
+        assert_eq!(portable_config_dir(&exe), Some(dir.path().join("data")));
     }
 }

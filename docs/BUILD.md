@@ -57,13 +57,36 @@ scripts/package-macos.sh
 `packaging/windows/luban-notepad.ico` 编译进可执行文件。Windows 任务栏和窗口
 图标直接来自该资源，无需额外的打包步骤。
 
-需要便携压缩包时，在 PowerShell 中运行：
+`scripts/package-windows.ps1` 生成安装版和便携版两种产物：
 
 ```powershell
 scripts/package-windows.ps1
+
+# 只生成便携版（无需安装 Inno Setup）
+scripts/package-windows.ps1 -SkipInstaller
+
+# 只生成安装版
+scripts/package-windows.ps1 -SkipPortable
+
+# 复用已构建的 target\release\luban-notepad.exe
+scripts/package-windows.ps1 -SkipBuild
 ```
 
-产物为 `dist/luban-notepad-<版本>-windows-<架构>.zip` 及其 `.sha256` 校验文件。
+产物：
+
+- `dist/luban-notepad-<版本>-windows-<架构>-setup.exe`：Inno Setup 安装程序。
+  默认按当前用户安装到 `%LOCALAPPDATA%\Programs\Luban Notepad`，无需管理员
+  权限；安装向导也可选择为所有用户安装。包含开始菜单项、卸载程序、可选的
+  桌面快捷方式和“使用鲁班记事本打开”右键菜单，并在卸载时询问是否删除配置。
+- `dist/luban-notepad-<版本>-windows-<架构>-portable.zip`：解压即用的便携版。
+  压缩包内的 `luban-notepad.portable` 标记文件让应用把 `settings.json`、
+  `session.json` 和数据写入程序目录下的 `data/`。
+
+两种产物都会附带 `.sha256` 校验文件。安装版需要 Inno Setup 6
+（`winget install JRSoftware.InnoSetup`）；脚本会自动查找 `ISCC.exe`，也可用
+`INNO_SETUP_ISCC` 环境变量或 `-InnoSetupPath` 指定。若编译器带有
+`ChineseSimplified.isl`（官方编译器放在 `Languages\Unofficial`），安装向导会
+自动提供简体中文，否则使用英文。
 
 平台图标由 `scripts/generate-platform-icons.py` 从 Linux hicolor PNG 集生成：
 Windows 使用多尺寸 `.ico`，macOS 使用 `.icns`。
@@ -79,8 +102,8 @@ git push origin v0.2.0
 ```
 
 工作流会校验标签与 `Cargo.toml` 版本一致，构建 Linux（`.tar.gz`、`.deb`）、
-Windows（`.zip`）以及 macOS arm64/x86_64（`.zip`），然后创建 GitHub Release，
-自动生成发布说明并附带各产物的 SHA-256 校验文件。
+Windows（安装版 `.exe`、便携版 `.zip`）以及 macOS arm64/x86_64（`.zip`），
+然后创建 GitHub Release，自动生成发布说明并附带各产物的 SHA-256 校验文件。
 
 也可以在 Actions 页面手动运行 `Release` 工作流，输入一个已经存在的标签。
 
@@ -184,9 +207,13 @@ xvfb-run -a -s "-screen 0 1440x900x24" \
 `LUBAN_NOTEPAD_CONFIG_DIR` 可重定向 `settings.json` 和 `session.json`。
 它适用于：
 
-- 便携安装，
 - 集成测试，
-- 运行多个相互独立的配置档案。
+- 运行多个相互独立的配置档案，
+- 由外部启动器指定配置目录。
+
+Windows 便携版通常不需要设置该环境变量：只要可执行文件旁边存在
+`luban-notepad.portable` 标记文件，应用就会把配置写入同目录的 `data/`。
+安装版不包含该标记文件，因此使用常规的 `%APPDATA%\luban-notepad`。
 
 ## 字体
 

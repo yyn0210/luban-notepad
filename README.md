@@ -126,8 +126,22 @@ scripts/package-linux.sh   # dist/*.tar.gz, dist/*.deb
 scripts/package-macos.sh   # dist/Luban Notepad.app, dist/*.zip
 ```
 
-Windows 上运行 `scripts/package-windows.ps1` 可生成便携 zip；release 可执行文件
-也会通过构建脚本自动嵌入 `.ico` 图标资源。
+Windows 同时提供安装版和便携版：
+
+```powershell
+scripts/package-windows.ps1
+# dist/luban-notepad-<版本>-windows-<架构>-setup.exe    安装版
+# dist/luban-notepad-<版本>-windows-<架构>-portable.zip 便携版
+```
+
+安装版由 Inno Setup 6 编译：默认安装到当前用户目录，不需要管理员权限，也可以
+在安装向导中选择为所有用户安装；安装程序会创建开始菜单项和卸载程序，并可勾选
+桌面快捷方式与“使用鲁班记事本打开”右键菜单。便携版解压即用，配置、会话和
+最近文件记录保存在程序目录下的 `data` 文件夹，不会写入 `%APPDATA%`。
+
+打包脚本需要本机已安装 Inno Setup 6（`winget install JRSoftware.InnoSetup`），
+或通过 `-SkipInstaller` 只生成便携版；已构建过 release 二进制时可加 `-SkipBuild`
+复用现有产物。
 
 产物写入 `dist/`。各平台的详细说明与故障排查：[docs/BUILD.md](docs/BUILD.md)。
 
