@@ -13,6 +13,7 @@ use gpui_kit::component::input::{
     SelectAll, TabSize, Undo,
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
 use gpui_kit::component::{Selectable as _, TitleBar};
@@ -28,11 +29,13 @@ use luban_core::session::{Session, SessionTab};
 use luban_core::settings::{Settings, ThemeChoice};
 use luban_core::text as textutil;
 use luban_core::undo::EditKind;
-use luban_core::workspace::{list_directory, FileMatch, FindInFilesOptions, FindInFilesOutcome};
+use luban_core::workspace::{
+    list_directory, FileEntry, FileMatch, FindInFilesOptions, FindInFilesOutcome,
+};
 
 use crate::dialogs::{
-    CloseIntent, ConfirmState, FileDialogMode, FileDialogPurpose, FileDialogState, GoToLineState,
-    LanguagePickerState, SaveAsRequest, SaveThen,
+    next_listing_generation, CloseIntent, ConfirmState, FileDialogMode, FileDialogPurpose,
+    FileDialogState, FileFilter, GoToLineState, LanguagePickerState, SaveAsRequest, SaveThen,
 };
 use crate::explorer::ExplorerState;
 use crate::find::{FindInFilesPanel, FindPanel};
@@ -1315,8 +1318,10 @@ impl LubanApp {
         cx: &mut Context<Self>,
     ) {
         let dir = util::absolutize(&dir);
-        let entries = list_directory(&dir, self.settings.show_hidden_files).unwrap_or_default();
-        self.file_dialog = Some(FileDialogState::new(mode, purpose, dir.clone(), entries));
+        self.file_dialog = Some(
+            FileDialogState::new(mode, purpose, dir.clone(), Vec::new())
+                .with_list_focus(cx.focus_handle().tab_stop(true)),
+        );
         let path_value = dir.display().to_string();
         self.file_path_input
             .update(cx, |input, cx| input.set_value(path_value, window, cx));
@@ -1332,6 +1337,72 @@ impl LubanApp {
                     .update(cx, |input, cx| input.focus(window, cx));
             }
         }
+        self.start_file_dialog_listing(dir, window, cx);
+    }
+
+    /// List a directory on the background executor. Every listing takes a new
+    /// process-wide generation so a stale task from a closed dialog cannot
+    /// match a reopened dialog listing the same directory.
+    fn start_file_dialog_listing(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = &mut self.file_dialog else {
+            return;
+        };
+        dialog.dir = dir.clone();
+        dialog.generation = next_listing_generation();
+        let generation = dialog.generation;
+        dialog.loading = true;
+        dialog.entries.clear();
+        dialog.selected.clear();
+        dialog.active = None;
+        dialog.anchor = None;
+        dialog.error = None;
+        dialog.list_scroll.set_offset(point(px(0.), px(0.)));
+
+        let show_hidden = self.settings.show_hidden_files;
+        let task_dir = dir.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { list_directory(&task_dir, show_hidden) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, _window, cx| {
+                app.finish_file_dialog_listing(dir, generation, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_file_dialog_listing(
+        &mut self,
+        dir: PathBuf,
+        generation: u64,
+        result: luban_core::Result<Vec<FileEntry>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = &mut self.file_dialog else {
+            return;
+        };
+        if !dialog.accepts_listing(generation, &dir) {
+            return;
+        }
+        dialog.loading = false;
+        match result {
+            Ok(entries) => {
+                dialog.entries = entries;
+                dialog.error = None;
+            }
+            Err(err) => {
+                dialog.entries.clear();
+                dialog.error = Some(tr_args("dialog.list_failed", &[("error", err.to_string())]));
+            }
+        }
+        dialog.prune_selection();
         cx.notify();
     }
 
@@ -1347,17 +1418,13 @@ impl LubanApp {
             cx.notify();
             return;
         }
-        let entries = list_directory(&path, self.settings.show_hidden_files).unwrap_or_default();
-        if let Some(dialog) = &mut self.file_dialog {
-            dialog.dir = path.clone();
-            dialog.entries = entries;
-            dialog.selected = None;
-            dialog.error = None;
+        if self.file_dialog.is_none() {
+            return;
         }
         let value = path.display().to_string();
         self.file_path_input
             .update(cx, |input, cx| input.set_value(value, window, cx));
-        cx.notify();
+        self.start_file_dialog_listing(path, window, cx);
     }
 
     fn file_dialog_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1370,16 +1437,62 @@ impl LubanApp {
         }
     }
 
-    fn file_dialog_select(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn file_dialog_set_filter(&mut self, filter: FileFilter, cx: &mut Context<Self>) {
         if let Some(dialog) = &mut self.file_dialog {
-            dialog.selected = Some(path.clone());
+            dialog.set_filter(filter);
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.file_name_input
-            .update(cx, |input, cx| input.set_value(name, window, cx));
+        cx.notify();
+    }
+
+    fn file_dialog_click(
+        &mut self,
+        row: usize,
+        path: PathBuf,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (fill_name, focus) = {
+            let Some(dialog) = &mut self.file_dialog else {
+                return;
+            };
+            let command = modifiers.secondary() || modifiers.control;
+            match dialog.mode {
+                FileDialogMode::Open => {
+                    if modifiers.shift {
+                        dialog.extend_selection_to(row);
+                    } else if command {
+                        dialog.toggle_selection(&path);
+                        dialog.set_active(row);
+                        dialog.anchor = Some(row);
+                    } else {
+                        dialog.select_row(row);
+                    }
+                }
+                FileDialogMode::Save | FileDialogMode::Folder => {
+                    dialog.select_only(&path);
+                    dialog.set_active(row);
+                    dialog.anchor = Some(row);
+                }
+            }
+            let fill_name = dialog.mode != FileDialogMode::Open;
+            let focus = dialog.list_focus.clone();
+            let active_row = dialog.active.unwrap_or(row);
+            dialog.list_scroll.scroll_to_item(active_row);
+            (fill_name, focus)
+        };
+
+        if fill_name {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.file_name_input
+                .update(cx, |input, cx| input.set_value(name, window, cx));
+        }
+        if let Some(focus) = focus {
+            window.focus(&focus, cx);
+        }
         cx.notify();
     }
 
@@ -1388,6 +1501,96 @@ impl LubanApp {
             dialog.error = Some(message.into());
         }
         cx.notify();
+    }
+
+    fn file_dialog_list_focused(&self, window: &Window) -> bool {
+        self.file_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.list_focus.as_ref())
+            .is_some_and(|focus| focus.is_focused(window))
+    }
+
+    fn focus_file_dialog_list(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = if let Some(dialog) = &mut self.file_dialog {
+            dialog.set_active(row);
+            dialog
+                .list_scroll
+                .scroll_to_item(dialog.active.unwrap_or(row));
+            dialog.list_focus.clone()
+        } else {
+            None
+        };
+        if let Some(focus) = focus {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn file_dialog_list_key(
+        &mut self,
+        key: &str,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (row_count, current, page) = {
+            let Some(dialog) = &self.file_dialog else {
+                return false;
+            };
+            let page = (f32::from(dialog.list_scroll.bounds().size.height) / 26.0).floor() as usize;
+            (
+                dialog.visible_row_count(),
+                dialog.active.unwrap_or(0),
+                page.max(1),
+            )
+        };
+        let command = modifiers.secondary() || modifiers.control;
+
+        if key == "space" && !command {
+            if let Some(dialog) = &mut self.file_dialog {
+                dialog.toggle_active();
+                let row = dialog.active.unwrap_or(0);
+                dialog.list_scroll.scroll_to_item(row);
+            }
+            cx.notify();
+            return true;
+        }
+        if key == "a" && command {
+            if let Some(dialog) = &mut self.file_dialog {
+                dialog.select_all_visible();
+            }
+            cx.notify();
+            return true;
+        }
+        if key == "enter" {
+            self.file_dialog_confirm(window, cx);
+            return true;
+        }
+
+        let target = match key {
+            "up" => Some(current.saturating_sub(1)),
+            "down" => Some((current + 1).min(row_count - 1)),
+            "home" => Some(0),
+            "end" => Some(row_count - 1),
+            "pageup" => Some(current.saturating_sub(page)),
+            "pagedown" => Some((current + page).min(row_count - 1)),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        if let Some(dialog) = &mut self.file_dialog {
+            if modifiers.shift {
+                dialog.extend_selection_to(target);
+            } else if command {
+                dialog.set_active(target);
+            } else {
+                dialog.select_row(target);
+            }
+            dialog.list_scroll.scroll_to_item(target);
+        }
+        cx.notify();
+        true
     }
 
     fn file_dialog_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1401,11 +1604,43 @@ impl LubanApp {
 
         match dialog.mode {
             FileDialogMode::Open => {
+                let selected = dialog.selected_in_visible_order();
+                if !selected.is_empty() {
+                    let total = selected.len();
+                    let mut opened = 0usize;
+                    let mut failed = 0usize;
+                    for path in selected {
+                        if self.open_path(&path, window, cx) {
+                            opened += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    if total > 1 {
+                        if failed == 0 {
+                            self.set_status(
+                                tr_args("status.batch_opened", &[("count", opened.to_string())]),
+                                cx,
+                            );
+                        } else {
+                            self.set_status(
+                                tr_args(
+                                    "status.batch_open_partial",
+                                    &[
+                                        ("opened", opened.to_string()),
+                                        ("failed", failed.to_string()),
+                                    ],
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 let dir_text = dialog.dir.display().to_string();
                 let candidate = if !typed.is_empty() && typed != dir_text {
                     PathBuf::from(&typed)
-                } else if let Some(selected) = dialog.selected.clone() {
-                    selected
                 } else {
                     dialog.dir.clone()
                 };
@@ -1427,6 +1662,11 @@ impl LubanApp {
                 }
             }
             FileDialogMode::Save => {
+                let name = if name.is_empty() {
+                    name
+                } else {
+                    dialog.with_default_extension(&name)
+                };
                 let mut candidate = if !name.is_empty() {
                     PathBuf::from(&name)
                 } else if !typed.is_empty() {
@@ -1464,7 +1704,9 @@ impl LubanApp {
                 } else {
                     dialog
                         .selected
-                        .clone()
+                        .iter()
+                        .next()
+                        .cloned()
                         .unwrap_or_else(|| dialog.dir.clone())
                 };
                 if !candidate.is_absolute() {
@@ -2776,6 +3018,23 @@ impl LubanApp {
                 return true;
             }
             return false;
+        }
+
+        if self.file_dialog.is_some() {
+            if self.file_dialog_list_focused(window) {
+                if self.file_dialog_list_key(&key, modifiers, window, cx) {
+                    return true;
+                }
+            } else if key == "down"
+                && self
+                    .file_path_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            {
+                self.focus_file_dialog_list(0, window, cx);
+                return true;
+            }
         }
 
         if key == "f3" {
@@ -4388,16 +4647,29 @@ impl LubanApp {
     }
 
     fn render_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(dialog) = &self.file_dialog else {
+        let Some(dialog) = self.file_dialog.as_ref() else {
             return div().into_any_element();
         };
         let mode = dialog.mode;
         let title = dialog.title();
+        let list_title = title.clone();
         let confirm_label = dialog.confirm_label();
         let dir = dialog.dir.clone();
-        let entries = dialog.entries.clone();
-        let selected = dialog.selected.clone();
+        let filter = dialog.filter;
+        let loading = dialog.loading;
         let error = dialog.error.clone();
+        let active = dialog.active;
+        let selected_count = dialog.selected_count();
+        let list_focus = dialog.list_focus.clone();
+        let list_scroll = dialog.list_scroll.clone();
+        let list_focused = list_focus
+            .as_ref()
+            .is_some_and(|focus| focus.is_focused(window));
+        let list_border = if list_focused {
+            cx.theme().colors.ring
+        } else {
+            cx.theme().colors.border
+        };
         let path_input = self.file_path_input.clone();
         let name_input = self.file_name_input.clone();
         let weak = cx.weak_entity();
@@ -4407,8 +4679,11 @@ impl LubanApp {
         let weak_close = weak.clone();
         let weak_confirm = weak.clone();
         let weak_parent = weak.clone();
+        let weak_filter_all = weak.clone();
+        let weak_filter_text = weak.clone();
 
         let mut rows: Vec<AnyElement> = Vec::new();
+        let parent_active = active == Some(0);
         rows.push(
             div()
                 .id("file-dialog-parent")
@@ -4419,72 +4694,179 @@ impl LubanApp {
                 .py_1()
                 .text_sm()
                 .cursor_pointer()
+                .when(parent_active, |this| {
+                    this.bg(cx.theme().colors.secondary_hover)
+                })
                 .hover(|this| this.bg(cx.theme().colors.secondary))
+                .role(Role::ListBoxOption)
+                .aria_label("..")
+                .aria_selected(false)
+                .when(parent_active, |this| this.aria_active_descendant())
                 .child("↰")
                 .child("..")
                 .on_click(move |_, window, cx| {
-                    let _ = weak_parent.update(cx, |this, cx| this.file_dialog_up(window, cx));
+                    let _ = weak_parent.update(cx, |this, cx| {
+                        this.file_dialog_up(window, cx);
+                        this.focus_file_dialog_list(0, window, cx);
+                    });
                 })
                 .into_any_element(),
         );
-        for entry in entries {
-            let path = entry.path.clone();
-            let name = entry.name.clone();
-            let is_dir = entry.is_dir;
-            let is_selected = selected
-                .as_ref()
-                .is_some_and(|selected| util::same_path(selected, &path));
-            if is_dir {
-                let weak_dir = weak.clone();
-                rows.push(
-                    div()
-                        .id(format!("file-dialog-dir:{}", path.display()))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(cx.theme().colors.secondary))
-                        .child("▸")
-                        .child(name)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak_dir.update(cx, |this, cx| {
-                                this.file_dialog_navigate(path.clone(), window, cx)
-                            });
-                        })
-                        .into_any_element(),
-                );
-            } else {
-                let weak_file = weak.clone();
-                rows.push(
-                    div()
-                        .id(format!("file-dialog-file:{}", path.display()))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .cursor_pointer()
-                        .when(is_selected, |this| this.bg(cx.theme().colors.secondary))
-                        .hover(|this| this.bg(cx.theme().colors.secondary_hover))
-                        .child(" ")
-                        .child(name)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak_file.update(cx, |this, cx| {
-                                this.file_dialog_select(path.clone(), window, cx)
-                            });
-                        })
-                        .into_any_element(),
-                );
+        {
+            let dialog = self.file_dialog.as_ref().expect("dialog checked above");
+            for (index, entry) in dialog
+                .entries
+                .iter()
+                .filter(|entry| dialog.entry_is_visible(entry))
+                .enumerate()
+            {
+                let row = index + 1;
+                let path = entry.path.clone();
+                let name = entry.name.clone();
+                let is_dir = entry.is_dir;
+                let is_selected = dialog.selected.contains(&path);
+                let is_active = active == Some(row);
+                if is_dir {
+                    let weak_dir = weak.clone();
+                    rows.push(
+                        div()
+                            .id(format!("file-dialog-dir:{}", path.display()))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(is_active, |this| this.bg(cx.theme().colors.secondary_hover))
+                            .hover(|this| this.bg(cx.theme().colors.secondary))
+                            .role(Role::ListBoxOption)
+                            .aria_label(name.clone())
+                            .aria_selected(false)
+                            .when(is_active, |this| this.aria_active_descendant())
+                            .child("▸")
+                            .child(name)
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_dir.update(cx, |this, cx| {
+                                    this.file_dialog_navigate(path.clone(), window, cx);
+                                    this.focus_file_dialog_list(0, window, cx);
+                                });
+                            })
+                            .into_any_element(),
+                    );
+                } else {
+                    let weak_file = weak.clone();
+                    rows.push(
+                        div()
+                            .id(format!("file-dialog-file:{}", path.display()))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(is_active, |this| this.bg(cx.theme().colors.secondary_hover))
+                            .when(is_selected, |this| this.bg(cx.theme().colors.secondary))
+                            .hover(|this| this.bg(cx.theme().colors.secondary_hover))
+                            .role(Role::ListBoxOption)
+                            .aria_label(name.clone())
+                            .aria_selected(is_selected)
+                            .when(is_active, |this| this.aria_active_descendant())
+                            .child(if is_selected { "✓" } else { " " })
+                            .child(name)
+                            .on_click(move |event, window, cx| {
+                                let modifiers = event.modifiers();
+                                let _ = weak_file.update(cx, |this, cx| {
+                                    this.file_dialog_click(row, path.clone(), modifiers, window, cx)
+                                });
+                            })
+                            .into_any_element(),
+                    );
+                }
             }
         }
+        if loading {
+            rows.push(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(tr("dialog.loading"))
+                    .into_any_element(),
+            );
+        }
+
+        let filter_row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("file-dialog-filter-all")
+                    .label(tr("dialog.filter_all"))
+                    .compact()
+                    .toggled(filter == FileFilter::All)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_filter_all.update(cx, |this, cx| {
+                            this.file_dialog_set_filter(FileFilter::All, cx);
+                        });
+                    }),
+            )
+            .child(
+                Button::new("file-dialog-filter-text")
+                    .label(tr("dialog.filter_text"))
+                    .compact()
+                    .toggled(filter == FileFilter::Text)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_filter_text.update(cx, |this, cx| {
+                            this.file_dialog_set_filter(FileFilter::Text, cx);
+                        });
+                    }),
+            )
+            .child(div().flex_1())
+            .when(mode == FileDialogMode::Open && selected_count > 0, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(tr_args(
+                            "dialog.selected_count",
+                            &[("count", selected_count.to_string())],
+                        )),
+                )
+            });
+
+        let scroll_area = div()
+            .id("file-dialog-list")
+            .size_full()
+            .flex()
+            .flex_col()
+            .pr(px(16.))
+            .track_scroll(&list_scroll)
+            .when_some(list_focus, |this, focus| this.track_focus(&focus))
+            .role(Role::ListBox)
+            .aria_label(list_title)
+            .overflow_y_scroll()
+            .border_1()
+            .border_color(list_border)
+            .rounded_md()
+            .children(rows);
+        let list_area = div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .child(scroll_area)
+            .child(
+                Scrollbar::vertical(&list_scroll)
+                    .id("file-dialog-scrollbar")
+                    .mode(ScrollbarMode::Always),
+            );
 
         let mut body = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .gap_2()
             .p_4()
             .child(
@@ -4542,19 +4924,10 @@ impl LubanApp {
                             }),
                     ),
             )
-            .child(
-                div()
-                    .id("file-dialog-list")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .border_1()
-                    .border_color(cx.theme().colors.border)
-                    .rounded_md()
-                    .children(rows),
-            );
+            .when(mode != FileDialogMode::Folder, |this| {
+                this.child(filter_row)
+            })
+            .child(list_area);
         if mode == FileDialogMode::Save {
             body = body.child(
                 div()
@@ -4668,6 +5041,7 @@ impl LubanApp {
                     .when_some(height, |this, height| this.h(px(height)))
                     .flex()
                     .flex_col()
+                    .overflow_hidden()
                     .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().colors.border)

@@ -465,6 +465,21 @@ dialog.target_is_folder:
 dialog.not_a_folder:
   en: "Not a folder: %{path}"
   zh-CN: "不是文件夹：%{path}"
+dialog.filter_all:
+  en: "All files"
+  zh-CN: "所有文件"
+dialog.filter_text:
+  en: "Text files"
+  zh-CN: "文本文件"
+dialog.selected_count:
+  en: "%{count} selected"
+  zh-CN: "已选 %{count} 个"
+dialog.loading:
+  en: "Loading…"
+  zh-CN: "加载中…"
+dialog.list_failed:
+  en: "Could not read this folder: %{error}"
+  zh-CN: "无法读取此文件夹：%{error}"
 
 confirm.save_changes_title:
   en: "Save changes to “%{name}”?"
@@ -635,6 +650,12 @@ prefs.language_chinese:
 status.opened:
   en: "Opened %{path}"
   zh-CN: "已打开 %{path}"
+status.batch_opened:
+  en: "Opened %{count} files"
+  zh-CN: "已打开 %{count} 个文件"
+status.batch_open_partial:
+  en: "Opened %{opened} files, %{failed} failed"
+  zh-CN: "已打开 %{opened} 个文件，%{failed} 个失败"
 status.opening:
   en: "Opening %{path}…"
   zh-CN: "正在打开 %{path}…"

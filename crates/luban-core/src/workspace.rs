@@ -259,8 +259,9 @@ impl Masks {
     }
 }
 
-/// Minimal glob matcher supporting `*` and `?`.
-fn wildcard_match(pattern: &str, text: &str) -> bool {
+/// Minimal glob matcher supporting `*` and `?`, re-used by the file dialog's
+/// extension filters.
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
