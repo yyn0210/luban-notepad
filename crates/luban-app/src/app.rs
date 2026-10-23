@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{
@@ -12,7 +13,8 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::theme::ActiveTheme as _;
-use gpui_kit::component::TitleBar;
+use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
+use gpui_kit::component::{Selectable as _, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use luban_core::document::Document;
@@ -2907,97 +2909,109 @@ impl LubanApp {
 
     fn render_toolbar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
-        let mut row = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().colors.border)
-            .bg(cx.theme().colors.background);
+        let wrap_enabled = self.settings.word_wrap;
+        let (theme_icon, theme_label) = if self.settings.theme == ThemeChoice::Light {
+            (IconName::Moon, tr("menu.view.dark_theme"))
+        } else {
+            (IconName::Sun, tr("menu.view.light_theme"))
+        };
+
+        let mut file_group = ToolbarGroup::new("tb-file");
+        let mut history_group = ToolbarGroup::new("tb-history");
+        let mut search_group = ToolbarGroup::new("tb-search");
+        let mut view_group = ToolbarGroup::new("tb-view");
         macro_rules! tool {
-            ($id:literal, $label:expr, $action:expr) => {{
+            ($group:ident, $id:literal, $icon:expr, $label:expr, $action:expr) => {{
                 let weak = weak.clone();
-                row = row.child(Button::new($id).label($label).ghost().compact().on_click(
-                    move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| $action(this, window, cx));
-                    },
-                ));
+                let label = $label;
+                $group = $group.child(
+                    Button::new($id)
+                        .icon($icon)
+                        .tooltip(label.clone())
+                        .accessibility_label(label)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| $action(this, window, cx));
+                        }),
+                );
             }};
         }
         tool!(
+            file_group,
             "tb-new",
+            IconName::FilePlus,
             tr("toolbar.new"),
             |this: &mut Self, window, cx| this.new_file(window, cx)
         );
         tool!(
+            file_group,
             "tb-open",
+            IconName::FolderOpen,
             tr("toolbar.open"),
             |this: &mut Self, window, cx| this.open_file_dialog(window, cx)
         );
         tool!(
+            file_group,
             "tb-save",
+            IconName::Save,
             tr("toolbar.save"),
             |this: &mut Self, window, cx| this.save_active(window, cx)
         );
-        row = row.child(
-            div()
-                .w(px(1.))
-                .h(px(20.))
-                .bg(cx.theme().colors.border)
-                .mx_1(),
-        );
         tool!(
+            history_group,
             "tb-undo",
+            IconName::Undo,
             tr("toolbar.undo"),
             |this: &mut Self, window, cx| this.editor_action(Box::new(Undo), window, cx)
         );
         tool!(
+            history_group,
             "tb-redo",
+            IconName::Redo,
             tr("toolbar.redo"),
             |this: &mut Self, window, cx| this.editor_action(Box::new(Redo), window, cx)
         );
-        row = row.child(
-            div()
-                .w(px(1.))
-                .h(px(20.))
-                .bg(cx.theme().colors.border)
-                .mx_1(),
-        );
         tool!(
+            search_group,
             "tb-find",
+            IconName::Search,
             tr("toolbar.find"),
             |this: &mut Self, window, cx| this.open_find(false, window, cx)
         );
         tool!(
+            search_group,
             "tb-replace",
+            IconName::Replace,
             tr("toolbar.replace"),
             |this: &mut Self, window, cx| this.open_find(true, window, cx)
         );
         tool!(
+            search_group,
             "tb-findfiles",
+            IconName::FolderSearch,
             tr("toolbar.find_in_files"),
             |this: &mut Self, window, cx| this.open_find_in_files(window, cx)
         );
-        row = row.child(
-            div()
-                .w(px(1.))
-                .h(px(20.))
-                .bg(cx.theme().colors.border)
-                .mx_1(),
+        let weak_wrap = weak.clone();
+        let wrap_label = tr("toolbar.wrap");
+        view_group = view_group.child(
+            Button::new("tb-wrap")
+                .icon(IconName::TextWrap)
+                .selected(wrap_enabled)
+                .toggled(wrap_enabled)
+                .tooltip(wrap_label.clone())
+                .accessibility_label(wrap_label)
+                .on_click(move |_, window, cx| {
+                    let _ = weak_wrap.update(cx, |this, cx| {
+                        this.settings.word_wrap = !this.settings.word_wrap;
+                        this.apply_settings(window, cx);
+                    });
+                }),
         );
         tool!(
-            "tb-wrap",
-            tr("toolbar.wrap"),
-            |this: &mut Self, window, cx| {
-                this.settings.word_wrap = !this.settings.word_wrap;
-                this.apply_settings(window, cx);
-            }
-        );
-        tool!(
+            view_group,
             "tb-theme",
-            tr("toolbar.theme"),
+            theme_icon,
+            theme_label,
             |this: &mut Self, window, cx| {
                 this.settings.theme = if this.settings.theme == ThemeChoice::Dark {
                     ThemeChoice::Light
@@ -3007,7 +3021,30 @@ impl LubanApp {
                 this.apply_settings(window, cx);
             }
         );
-        row.into_any_element()
+
+        let border = cx.theme().colors.border;
+        let background = cx.theme().colors.background;
+        let separator = || {
+            div()
+                .w(px(1.))
+                .h(px(20.))
+                .bg(border)
+                .mx_1()
+                .into_any_element()
+        };
+        Toolbar::new("app-toolbar")
+            .child(file_group)
+            .content(separator())
+            .child(history_group)
+            .content(separator())
+            .child(search_group)
+            .content(separator())
+            .child(view_group)
+            .border_b_1()
+            .border_color(border)
+            .bg(background)
+            .px_2()
+            .into_any_element()
     }
 
     fn render_tabs(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

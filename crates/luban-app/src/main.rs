@@ -10,6 +10,7 @@ mod dialogs;
 mod explorer;
 mod find;
 mod i18n;
+mod icons;
 mod preferences;
 mod theme;
 mod util;
@@ -87,7 +88,7 @@ fn main() {
     let options = parse_args();
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(icons::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
