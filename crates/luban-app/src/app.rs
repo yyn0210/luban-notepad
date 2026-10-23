@@ -2863,10 +2863,10 @@ impl LubanApp {
             .into_any_element()
     }
 
-    /// The application title bar owns the window chrome: document title,
-    /// menus, and (on Windows/Linux) the window control buttons.
+    /// The application title bar owns the window chrome: application name,
+    /// menus, and (on Windows/Linux) the window control buttons. The document
+    /// name stays in the tab bar; the native window title is set separately.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let title = self.window_title.clone();
         let menus = self.render_menu_buttons(cx);
         let weak = cx.weak_entity();
 
@@ -2880,12 +2880,10 @@ impl LubanApp {
                     .gap_2()
                     .child(
                         div()
-                            .min_w(px(0.))
-                            .max_w(px(320.))
-                            .truncate()
+                            .flex_shrink_0()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(title),
+                            .child("Luban Notepad"),
                     )
                     .child(div().flex_shrink_0().child(menus)),
             )
