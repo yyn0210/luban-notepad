@@ -126,6 +126,10 @@ scripts/package-linux.sh   # dist/*.tar.gz, dist/*.deb
 scripts/package-macos.sh   # dist/Luban Notepad.app, dist/*.zip
 ```
 
+Linux 包以 glibc 2.35（Ubuntu 22.04 / Debian 12 / Deepin 23 及以上）为基线。
+发布工作流固定在 Ubuntu 22.04 上构建，避免更新的 glibc 把可选弱符号绑定到
+`GLIBC_2.39`，从而生成无法在旧发行版安装的 deb。
+
 Windows 同时提供安装版和便携版：
 
 ```powershell

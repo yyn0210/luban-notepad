@@ -112,6 +112,25 @@ EOF
         computed="libc6, libgcc-s1, libx11-6, libxcb1, libxcb-xkb1, libxkbcommon0, libwayland-client0, libfontconfig1, libfreetype6, libbz2-1.0, libpng16-16, libbrotli1, libffi8, zlib1g, libexpat1, libuuid1, libxcursor1, libxrandr2, libxi6"
     fi
 
+    # dpkg-shlibdeps also counts weak undefined symbols. Rust's optional
+    # pidfd_spawnp/pidfd_getpid references are bound to GLIBC_2.39 when linking
+    # on Ubuntu 24.04, so the package claims libc6 (>= 2.39) even though every
+    # non-weak libc symbol is available since 2.35. Lower the floor to the
+    # newest non-weak requirement so packages built on newer hosts stay
+    # installable on older distributions.
+    strong_libc=$(LC_ALL=C readelf --dyn-syms --wide "$binary" 2>/dev/null |
+        awk '$7 == "UND" && $5 != "WEAK" && $8 ~ /@GLIBC_[0-9]/ {
+            sub(/.*@GLIBC_/, "", $8)
+            print $8
+        }' | sort -Vu | tail -n 1) || strong_libc=""
+    current_libc=$(printf '%s\n' "$computed" |
+        sed -n 's/.*libc6 (>= \([^)]*\)).*/\1/p')
+    if [ -n "$strong_libc" ] && [ -n "$current_libc" ] &&
+        dpkg --compare-versions "$current_libc" gt "$strong_libc"; then
+        computed=$(printf '%s\n' "$computed" |
+            sed -E "s/libc6 \(>= [^)]*\)/libc6 (>= $strong_libc)/")
+    fi
+
     cat >"$deb_root/DEBIAN/control" <<EOF
 Package: luban-notepad
 Version: $version

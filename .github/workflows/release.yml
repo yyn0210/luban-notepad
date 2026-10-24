@@ -49,7 +49,12 @@ jobs:
   linux:
     name: Linux x86_64
     needs: validate
-    runs-on: ubuntu-24.04
+    # Linux packages target glibc 2.35. Building on a newer runner makes
+    # dpkg-shlibdeps bind optional weak symbols to newer versions, which
+    # produces packages that refuse to install on Debian 12 / Deepin / Ubuntu 22.04.
+    runs-on: ubuntu-22.04
+    env:
+      LIBC_BASELINE: "2.35"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,6 +83,25 @@ jobs:
 
       - name: Build packages
         run: scripts/package-linux.sh --skip-build
+
+      - name: Verify Debian dependencies
+        run: |
+          deb=$(find dist -maxdepth 1 -name 'luban-notepad_*.deb' -print -quit)
+          if [ -z "$deb" ]; then
+            echo "::error::no Debian package was produced"
+            exit 1
+          fi
+          depends=$(dpkg-deb -f "$deb" Depends)
+          echo "Depends: $depends"
+          libc=$(printf '%s\n' "$depends" | sed -n 's/.*libc6 (>= \([^)]*\)).*/\1/p')
+          if [ -z "$libc" ]; then
+            echo "::error::deb has no versioned libc6 dependency"
+            exit 1
+          fi
+          if dpkg --compare-versions "$libc" gt "$LIBC_BASELINE"; then
+            echo "::error::deb requires libc6 >= $libc, above the $LIBC_BASELINE baseline"
+            exit 1
+          fi
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
