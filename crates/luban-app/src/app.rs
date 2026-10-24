@@ -92,7 +92,13 @@ impl RestoreSpec {
             match Document::open_with_limit(path, max_size) {
                 Ok(mut doc) => {
                     if let Some(text) = &self.text {
-                        doc.attach_text(eol::to_lf(text));
+                        // Ordinary buffers are stored LF-normalized; non-text
+                        // buffers are stored raw and must keep their bytes.
+                        doc.attach_text(if doc.is_non_text() {
+                            text.clone()
+                        } else {
+                            eol::to_lf(text)
+                        });
                         doc.encoding = self.encoding;
                         doc.eol = self.eol;
                         doc.language = self.language.clone();
@@ -653,13 +659,19 @@ impl LubanApp {
         }
         match Document::open_with_limit(&path, max_size) {
             Ok(doc) => {
+                let non_text = doc.is_non_text();
                 self.settings.add_recent(path.clone());
                 let _ = self.settings.save();
                 self.add_document(doc, window, cx);
-                self.set_status(
-                    tr_args("status.opened", &[("path", path.display().to_string())]),
-                    cx,
-                );
+                let status = if non_text {
+                    tr_args(
+                        "status.opened_non_text",
+                        &[("path", path.display().to_string())],
+                    )
+                } else {
+                    tr_args("status.opened", &[("path", path.display().to_string())])
+                };
+                self.set_status(status, cx);
                 true
             }
             Err(err) => {
@@ -762,13 +774,19 @@ impl LubanApp {
             .retain(|pending| !util::same_path(pending, &path));
         match result {
             Ok(doc) => {
+                let non_text = doc.is_non_text();
                 self.settings.add_recent(path.clone());
                 let _ = self.settings.save();
                 self.add_document(doc, window, cx);
-                self.set_status(
-                    tr_args("status.opened", &[("path", path.display().to_string())]),
-                    cx,
-                );
+                let status = if non_text {
+                    tr_args(
+                        "status.opened_non_text",
+                        &[("path", path.display().to_string())],
+                    )
+                } else {
+                    tr_args("status.opened", &[("path", path.display().to_string())])
+                };
+                self.set_status(status, cx);
                 let pending_at = self
                     .pending_open_at
                     .as_ref()
@@ -1009,7 +1027,10 @@ impl LubanApp {
             )
         };
         let had_cr = raw.contains('\r');
-        let normalized = if had_cr { eol::to_lf(&raw) } else { raw };
+        // Non-text buffers keep their original line-ending bytes; rewriting
+        // CR as LF here would break the byte-preserving save guarantee.
+        let normalize_cr = had_cr && !tab.doc.is_non_text();
+        let normalized = if normalize_cr { eol::to_lf(&raw) } else { raw };
         let char_count = textutil::char_count(&normalized);
         let cursor = textutil::byte_to_char(&normalized, cursor_byte.min(normalized.len()));
         let start =
@@ -1036,7 +1057,7 @@ impl LubanApp {
             self.find.dirty = true;
         }
 
-        if had_cr {
+        if normalize_cr {
             let b0 = textutil::char_to_byte(&normalized, start);
             let b1 = textutil::char_to_byte(&normalized, end);
             let editor = tab.editor.clone();
@@ -1234,7 +1255,8 @@ impl LubanApp {
             return;
         }
         let large_file = self.tabs[index].large_file;
-        if self.settings.trim_trailing_whitespace_on_save && !large_file {
+        let non_text = self.tabs[index].doc.is_non_text();
+        if self.settings.trim_trailing_whitespace_on_save && !large_file && !non_text {
             let tab = &self.tabs[index];
             let trimmed = textutil::trim_trailing_whitespace(&tab.doc.text);
             if trimmed != tab.doc.text {
@@ -2375,6 +2397,10 @@ impl LubanApp {
     }
 
     pub fn convert_eol(&mut self, new_eol: Eol, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(Document::is_non_text) {
+            self.set_status(tr("status.eol_non_text"), cx);
+            return;
+        }
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
@@ -4254,6 +4280,7 @@ impl LubanApp {
         let language = language_display_name(&language);
         let zoom = (self.settings.font_size / 14.0 * 100.0).round() as i32;
         let modified = self.active_doc().is_some_and(Document::is_modified);
+        let non_text = self.active_doc().is_some_and(Document::is_non_text);
         let line_col = tr_args(
             "status.line_col",
             &[("line", line.to_string()), ("column", column.to_string())],
@@ -4294,6 +4321,11 @@ impl LubanApp {
                 div().child(lines_label),
                 div().child(if large_file {
                     tr("status.large_file")
+                } else {
+                    String::new()
+                }),
+                div().child(if non_text {
+                    tr("status.non_text")
                 } else {
                     String::new()
                 }),
@@ -6225,5 +6257,34 @@ mod menu_label_tests {
     #[test]
     fn zero_budget_yields_nothing() {
         assert_eq!(truncate_middle("abc", 0), "");
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::RestoreSpec;
+    use luban_core::encoding::TextEncoding;
+    use luban_core::eol::Eol;
+
+    #[test]
+    fn non_text_restore_keeps_raw_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        std::fs::write(&path, [0u8, b'\r', b'\n', 1]).unwrap();
+        let spec = RestoreSpec {
+            path: Some(path),
+            text: Some("x\r\ny".to_string()),
+            encoding: TextEncoding::Windows1252,
+            eol: Eol::CrLf,
+            language: "Plain Text".to_string(),
+            cursor: 0,
+            anchor: 0,
+            modified: true,
+            fallback_name: "bin.dat".to_string(),
+        };
+        let doc = spec.load(1024);
+        assert!(doc.is_non_text());
+        assert_eq!(doc.text, "x\r\ny");
+        assert!(doc.is_modified());
     }
 }

@@ -647,6 +647,15 @@ prefs.language_chinese:
 status.opened:
   en: "Opened %{path}"
   zh-CN: "已打开 %{path}"
+status.opened_non_text:
+  en: "Opened %{path} as text (non-text file)"
+  zh-CN: "已按文本方式打开非文本文件：%{path}"
+status.non_text:
+  en: "Non-text"
+  zh-CN: "非文本"
+status.eol_non_text:
+  en: "Line-ending conversion is not available for non-text files"
+  zh-CN: "非文本文件不支持转换换行符"
 status.batch_opened:
   en: "Opened %{count} files"
   zh-CN: "已打开 %{count} 个文件"

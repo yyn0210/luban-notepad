@@ -9,9 +9,6 @@ core.error.invalid_path:
 core.error.file_too_large:
   en: "file is too large to open (%{size} bytes, limit is %{limit} bytes)"
   zh-CN: "文件过大，无法打开（%{size} 字节，上限 %{limit} 字节）"
-core.error.binary_file:
-  en: "binary file detected: %{path}"
-  zh-CN: "检测到二进制文件：%{path}"
 core.error.encoding:
   en: "encoding error: %{error}"
   zh-CN: "编码错误：%{error}"

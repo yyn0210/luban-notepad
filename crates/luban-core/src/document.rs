@@ -36,6 +36,10 @@ pub struct Document {
     pub last_modified: Option<SystemTime>,
     pub file_size: u64,
     pub untitled_name: String,
+    /// The file was opened although its content looks binary. Its buffer keeps
+    /// the original bytes (via a reversible decoding) and is written back
+    /// without line-ending conversion.
+    non_text: bool,
     revision: u64,
     saved_revision: u64,
     /// The text buffer lives only in the editor while this is set. Operations
@@ -62,6 +66,7 @@ impl Document {
             last_modified: None,
             file_size: 0,
             untitled_name: name.into(),
+            non_text: false,
             revision: 0,
             saved_revision: 0,
             text_detached: false,
@@ -108,17 +113,27 @@ impl Document {
             });
         }
         let bytes = fs::read(path)?;
-        if encoding::looks_binary(&bytes) {
-            return Err(Error::BinaryFile(path.to_path_buf()));
-        }
-        let decoded = encoding::decode_owned(bytes);
+        // Notepad++ opens binary content as text instead of refusing it. The
+        // flag changes how the buffer is decoded and saved, not whether the
+        // file can be opened.
+        let non_text = encoding::looks_binary(&bytes);
+        let decoded = if non_text {
+            encoding::decode_lossless(bytes)
+        } else {
+            encoding::decode_owned(bytes)
+        };
         let detected_eol = eol::detect(&decoded.text);
         let language_name = language::detect_from_path(path);
         let mut doc = Self::new_untitled("new 1");
         doc.path = Some(path.to_path_buf());
         // The editing buffer is always LF; the file's convention lives in
-        // `doc.eol` and is restored when saving.
-        doc.text = eol::to_lf_owned(decoded.text);
+        // `doc.eol` and is restored when saving. Non-text buffers keep the
+        // original line endings so that saving does not rewrite bytes.
+        doc.text = if non_text {
+            decoded.text
+        } else {
+            eol::to_lf_owned(decoded.text)
+        };
         doc.cached_chars = Some(text::char_count(&doc.text));
         doc.encoding = decoded.encoding;
         doc.eol = detected_eol;
@@ -126,6 +141,7 @@ impl Document {
         doc.file_size = metadata.len();
         doc.last_modified = metadata.modified().ok();
         doc.read_only = metadata.permissions().readonly();
+        doc.non_text = non_text;
         doc.revision = 1;
         doc.saved_revision = 1;
         Ok(doc)
@@ -147,6 +163,13 @@ impl Document {
     /// Whether the document's buffer currently lives only in the editor.
     pub fn is_text_detached(&self) -> bool {
         self.text_detached
+    }
+
+    /// Whether this document was opened from content that looks binary. Such
+    /// documents keep their original line endings and are saved without
+    /// re-encoding untouched bytes.
+    pub fn is_non_text(&self) -> bool {
+        self.non_text
     }
 
     /// Move the buffer out for the editor and release the document's copy.
@@ -439,7 +462,9 @@ impl Document {
     /// intentionally not part of the text undo history. It does mark the
     /// document dirty, because the bytes written to disk will change.
     pub fn convert_eol(&mut self, new_eol: Eol) -> bool {
-        if self.eol == new_eol {
+        // Converting line endings would rewrite arbitrary bytes in a non-text
+        // file and break the byte-preserving save guarantee.
+        if self.non_text || self.eol == new_eol {
             return false;
         }
         self.eol = new_eol;
@@ -500,7 +525,14 @@ impl Document {
             return Err(Error::Other("document text is not materialized".into()));
         }
         let mut file = fs::File::create(path)?;
-        let lossy = if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom)
+        let lossy = if self.non_text {
+            // Non-text buffers were decoded reversibly and keep their original
+            // line endings; write them back without normalization so untouched
+            // bytes stay identical.
+            let (bytes, lossy) = encoding::encode(&self.text, self.encoding);
+            file.write_all(&bytes)?;
+            lossy
+        } else if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom)
             && self.eol == Eol::Lf
             && !self.text.as_bytes().contains(&b'\r')
         {
@@ -546,6 +578,7 @@ impl Document {
         self.last_modified = replacement.last_modified;
         self.file_size = replacement.file_size;
         self.read_only = replacement.read_only;
+        self.non_text = replacement.non_text;
         self.undo.clear();
         self.cursor = self.cursor.min(self.char_count());
         self.anchor = self.anchor.min(self.char_count());
@@ -744,10 +777,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_binary_files() {
-        let (_dir, path) = temp_file("bin.dat", &[0, 1, 2, 3, 0, 5]);
-        let err = Document::open(&path).unwrap_err();
-        assert!(matches!(err, Error::BinaryFile(_)));
+    fn opens_binary_files_losslessly() {
+        let original = vec![0x00, 0x01, 0xE9, 0xFF, b'\r', b'\n', 0x00, 0x7F];
+        let (_dir, path) = temp_file("bin.dat", &original);
+        let mut doc = Document::open(&path).unwrap();
+        assert!(doc.is_non_text());
+        assert_eq!(doc.encoding, TextEncoding::Windows1252);
+        assert_eq!(doc.eol, Eol::CrLf);
+        doc.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!doc.is_modified());
+    }
+
+    #[test]
+    fn opens_utf8_non_text_files_losslessly() {
+        let original = b"ab\0cd\xE4\xB8\x96\n".to_vec();
+        let (_dir, path) = temp_file("utf8-nul.txt", &original);
+        let mut doc = Document::open(&path).unwrap();
+        assert!(doc.is_non_text());
+        assert_eq!(doc.encoding, TextEncoding::Utf8);
+        doc.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn non_text_edits_only_change_the_edited_bytes() {
+        let original = vec![0x00, 0x01, 0x02, 0x03, 0x00];
+        let (_dir, path) = temp_file("edit.dat", &original);
+        let mut doc = Document::open(&path).unwrap();
+        assert!(doc.apply_edit(1, 1, "X", EditKind::Typing, 2, 2));
+        doc.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), vec![0x00, b'X', 0x02, 0x03, 0x00]);
+    }
+
+    #[test]
+    fn non_text_documents_reject_eol_conversion() {
+        let (_dir, path) = temp_file("eol.dat", &[0, 1, b'\n', 2]);
+        let mut doc = Document::open(&path).unwrap();
+        assert!(doc.is_non_text());
+        assert!(!doc.convert_eol(Eol::CrLf));
+        assert!(!doc.is_modified());
     }
 
     #[test]

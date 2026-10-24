@@ -12,8 +12,6 @@ pub enum Error {
 
     FileTooLarge { size: u64, limit: u64 },
 
-    BinaryFile(PathBuf),
-
     Encoding(String),
 
     Serialization(serde_json::Error),
@@ -34,10 +32,6 @@ impl fmt::Display for Error {
             Self::FileTooLarge { size, limit } => f.write_str(&tr_args(
                 "core.error.file_too_large",
                 &[("size", size.to_string()), ("limit", limit.to_string())],
-            )),
-            Self::BinaryFile(path) => f.write_str(&tr_args(
-                "core.error.binary_file",
-                &[("path", path.display().to_string())],
             )),
             Self::Encoding(error) => {
                 f.write_str(&tr_args("core.error.encoding", &[("error", error.clone())]))

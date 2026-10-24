@@ -331,6 +331,26 @@ pub fn decode_with(bytes: &[u8], encoding: TextEncoding) -> String {
     text.into_owned()
 }
 
+/// Decode bytes that were classified as non-text.
+///
+/// The result must round-trip every untouched byte: valid UTF-8 (with or
+/// without BOM) is decoded as UTF-8, and every other byte sequence uses
+/// windows-1252, whose codec maps all 256 byte values one-to-one. This keeps
+/// saving an unedited non-text document byte-identical to the file on disk.
+pub fn decode_lossless(bytes: Vec<u8>) -> DecodedText {
+    let body = bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF][..])
+        .unwrap_or(&bytes);
+    if std::str::from_utf8(body).is_ok() {
+        return decode_owned(bytes);
+    }
+    DecodedText {
+        text: WINDOWS_1252.decode(&bytes).0.into_owned(),
+        encoding: TextEncoding::Windows1252,
+        had_bom: false,
+    }
+}
+
 /// Heuristic binary test used before opening a file as text.
 pub fn looks_binary(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
@@ -467,6 +487,25 @@ mod tests {
         assert!(!looks_binary("plain text\n".as_bytes()));
         let utf16 = encode("hello\nworld", TextEncoding::Utf16Le).0;
         assert!(!looks_binary(&utf16));
+    }
+
+    #[test]
+    fn lossless_decode_round_trips_arbitrary_bytes() {
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        let decoded = decode_lossless(bytes.clone());
+        assert_eq!(decoded.encoding, TextEncoding::Windows1252);
+        let (encoded, lossy) = encode(&decoded.text, decoded.encoding);
+        assert!(!lossy);
+        assert_eq!(encoded, bytes);
+    }
+
+    #[test]
+    fn lossless_decode_uses_utf8_when_valid() {
+        let decoded = decode_lossless(b"ab\0cd".to_vec());
+        assert_eq!(decoded.encoding, TextEncoding::Utf8);
+        let (encoded, lossy) = encode(&decoded.text, decoded.encoding);
+        assert!(!lossy);
+        assert_eq!(encoded, b"ab\0cd");
     }
 
     #[test]
