@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "luban-app"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3715,7 +3715,7 @@ dependencies = [
 
 [[package]]
 name = "luban-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chardetng",
  "dirs 6.0.0",
