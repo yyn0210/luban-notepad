@@ -2,7 +2,7 @@ _version: 2
 
 cli.help:
   en: "Luban Notepad %{version}\n\nUsage: luban-notepad [--new] [--smoke-test] [FILE ...]\n\nA cross-platform Rust reimplementation of the Notepad++ editing experience."
-  zh-CN: "Luban Notepad %{version}\n\n用法：luban-notepad [--new] [--smoke-test] [文件 ...]\n\n使用 Rust 与 GPUI 跨平台重新实现 Notepad++ 的编辑体验。"
+  zh-CN: "鲁班编辑器 %{version}\n\n用法：luban-notepad [--new] [--smoke-test] [文件 ...]\n\n使用 Rust 与 GPUI 跨平台重新实现 Notepad++ 的编辑体验。"
 
 common.close:
   en: "Close"
@@ -191,7 +191,7 @@ menu.help.shortcuts:
   zh-CN: "键盘快捷键"
 menu.help.about:
   en: "About Luban Notepad"
-  zh-CN: "关于 Luban Notepad"
+  zh-CN: "关于鲁班编辑器"
 
 toolbar.new:
   en: "New"
@@ -633,7 +633,7 @@ prefs.hidden_files:
   zh-CN: "在文件浏览器中显示隐藏文件"
 prefs.footer:
   en: "Settings are applied immediately and stored in the Luban Notepad config directory."
-  zh-CN: "设置会立即应用，并保存在 Luban Notepad 配置目录中。"
+  zh-CN: "设置会立即应用，并保存在鲁班编辑器配置目录中。"
 prefs.pixels:
   en: "%{size} px"
   zh-CN: "%{size} px"

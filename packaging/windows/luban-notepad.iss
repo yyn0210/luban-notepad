@@ -86,8 +86,8 @@ Name: "chinesesimplified"; MessagesFile: "{#ChineseMessagesFile}"
 english.ContextMenu=Add "Open with Luban Notepad" to the context menu
 english.DeleteSettings=Delete Luban Notepad settings, session, and recent file history?
 #if ChineseLanguage
-chinesesimplified.ContextMenu=将“使用鲁班记事本打开”添加到右键菜单
-chinesesimplified.DeleteSettings=是否删除鲁班记事本的设置、会话和最近文件记录？
+chinesesimplified.ContextMenu=将“使用鲁班编辑器打开”添加到右键菜单
+chinesesimplified.DeleteSettings=是否删除鲁班编辑器的设置、会话和最近文件记录？
 #endif
 
 [Tasks]

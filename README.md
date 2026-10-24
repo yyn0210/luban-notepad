@@ -1,4 +1,4 @@
-# Luban Notepad（鲁班记事本）
+# Luban Notepad（鲁班编辑器）
 
 > 一个使用 Rust 重新实现、跨平台的 Notepad++ 编辑体验，
 > 基于 [GPUI Kit](https://gpui-kit.com) 构建。
@@ -140,7 +140,7 @@ scripts/package-windows.ps1
 
 安装版由 Inno Setup 6 编译：默认安装到当前用户目录，不需要管理员权限，也可以
 在安装向导中选择为所有用户安装；安装程序会创建开始菜单项和卸载程序，并可勾选
-桌面快捷方式与“使用鲁班记事本打开”右键菜单。便携版解压即用，配置、会话和
+桌面快捷方式与“使用鲁班编辑器打开”右键菜单。便携版解压即用，配置、会话和
 最近文件记录保存在程序目录下的 `data` 文件夹，不会写入 `%APPDATA%`。
 
 打包脚本需要本机已安装 Inno Setup 6（`winget install JRSoftware.InnoSetup`），

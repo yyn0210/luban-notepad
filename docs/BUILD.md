@@ -77,7 +77,7 @@ scripts/package-windows.ps1 -SkipBuild
 - `dist/luban-notepad-<版本>-windows-<架构>-setup.exe`：Inno Setup 安装程序。
   默认按当前用户安装到 `%LOCALAPPDATA%\Programs\Luban Notepad`，无需管理员
   权限；安装向导也可选择为所有用户安装。包含开始菜单项、卸载程序、可选的
-  桌面快捷方式和“使用鲁班记事本打开”右键菜单，并在卸载时询问是否删除配置。
+  桌面快捷方式和“使用鲁班编辑器打开”右键菜单，并在卸载时询问是否删除配置。
 - `dist/luban-notepad-<版本>-windows-<架构>-portable.zip`：解压即用的便携版。
   压缩包内的 `luban-notepad.portable` 标记文件让应用把 `settings.json`、
   `session.json` 和数据写入程序目录下的 `data/`。
