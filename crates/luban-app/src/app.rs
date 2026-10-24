@@ -12,7 +12,7 @@ use gpui_kit::component::input::{
     RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo, RopeExt, Search,
     SelectAll, TabSize, Undo,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
@@ -190,6 +190,131 @@ pub struct LubanApp {
     window_width: f32,
     window_height: f32,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Maximum width of a recent-file menu label, counted in display columns
+/// (one per half-width character, two per CJK or other wide character).
+///
+/// The popup menu caps its own width at 500px but does not clip item text, so
+/// a full path would otherwise paint past the menu background. Counting
+/// columns instead of chars keeps CJK-heavy paths within the same budget.
+const RECENT_PATH_COLUMNS: usize = 48;
+
+/// Elide the middle of a string that is wider than `max_columns`, keeping
+/// both ends readable. Paths benefit from the trailing component, so the
+/// second half of the budget goes to the tail.
+fn truncate_middle(text: &str, max_columns: usize) -> String {
+    if max_columns == 0 {
+        return String::new();
+    }
+    let total: usize = text.chars().map(char_columns).sum();
+    if total <= max_columns {
+        return text.to_string();
+    }
+
+    let budget = max_columns.saturating_sub(1); // room for the ellipsis
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+
+    let mut head = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = char_columns(ch);
+        if used + width > head_budget {
+            break;
+        }
+        used += width;
+        head.push(ch);
+    }
+
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let width = char_columns(ch);
+        if used + width > tail_budget {
+            break;
+        }
+        used += width;
+        tail.push(ch);
+    }
+    tail.reverse();
+
+    head.push('…');
+    head.extend(tail);
+    head
+}
+
+/// Approximate display width of a character in terminal-style columns.
+fn char_columns(ch: char) -> usize {
+    let code = ch as u32;
+    let wide = matches!(
+        code,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod menu_label_tests {
+    use super::{char_columns, truncate_middle};
+
+    fn columns(text: &str) -> usize {
+        text.chars().map(char_columns).sum()
+    }
+
+    #[test]
+    fn short_labels_are_left_alone() {
+        let text = "Recent: src/main.rs";
+        assert_eq!(truncate_middle(text, 48), text);
+        assert_eq!(truncate_middle("", 48), "");
+    }
+
+    #[test]
+    fn long_labels_keep_both_ends_and_fit_the_budget() {
+        let text = "/home/user/Documents/projects/very-long-file-name.txt";
+        let label = truncate_middle(text, 48);
+        assert!(label.starts_with("/home/"));
+        assert!(label.ends_with(".txt"));
+        assert_eq!(label.matches('…').count(), 1);
+        assert!(columns(&label) <= 48);
+    }
+
+    #[test]
+    fn wide_characters_consume_two_columns() {
+        assert_eq!(char_columns('a'), 1);
+        assert_eq!(char_columns('多'), 2);
+
+        let text = "多".repeat(40);
+        let label = truncate_middle(&text, 20);
+        assert!(columns(&label) <= 20);
+        assert_eq!(label.matches('…').count(), 1);
+        assert!(label.starts_with('多'));
+        assert!(label.ends_with('多'));
+    }
+
+    #[test]
+    fn zero_budget_yields_nothing() {
+        assert_eq!(truncate_middle("abc", 0), "");
+    }
 }
 
 impl LubanApp {
@@ -3179,6 +3304,17 @@ impl LubanApp {
         })
     }
 
+    /// Bound a menu to the height that fits below the menu row and let the
+    /// rest scroll. Without a cap, a menu taller than the window is clamped to
+    /// the top edge, covering the menu bar, while its last entries still run
+    /// past the bottom edge and become unreachable.
+    fn fit_menu(menu: PopupMenu, window: &Window) -> PopupMenu {
+        // Title bar/menu row (~40px), dropdown offset (6px) and the positioner's
+        // viewport margin (8px), rounded up.
+        let available = (window.viewport_size().height - px(64.)).max(px(120.));
+        menu.scrollable(true).max_h(available)
+    }
+
     fn render_menu_buttons(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         let settings = self.settings.clone();
@@ -3207,7 +3343,7 @@ impl LubanApp {
             .label(tr("menu.file"))
             .ghost()
             .compact()
-            .dropdown_menu(move |mut menu, _window, _cx| {
+            .dropdown_menu(move |mut menu, window, _cx| {
                 menu = menu
                     .item(Self::menu_item(
                         &weak_file,
@@ -3248,8 +3384,13 @@ impl LubanApp {
                 } else {
                     for path in &recent_items {
                         let path = path.clone();
-                        let label =
-                            tr_args("menu.file.recent", &[("path", path.display().to_string())]);
+                        let label = tr_args(
+                            "menu.file.recent",
+                            &[(
+                                "path",
+                                truncate_middle(&path.display().to_string(), RECENT_PATH_COLUMNS),
+                            )],
+                        );
                         menu = menu.item(Self::menu_item(
                             &weak_file,
                             label,
@@ -3261,7 +3402,8 @@ impl LubanApp {
                         ));
                     }
                 }
-                menu.separator()
+                menu = menu
+                    .separator()
                     .item(Self::menu_item(
                         &weak_file,
                         tr("menu.file.save"),
@@ -3326,14 +3468,15 @@ impl LubanApp {
                         |this, window, cx| {
                             this.request_exit(window, cx);
                         },
-                    ))
+                    ));
+                Self::fit_menu(menu, window)
             });
 
         let edit_menu = Button::new("menu-edit")
             .label(tr("menu.edit"))
             .ghost()
             .compact()
-            .dropdown_menu(move |menu, _window, _cx| {
+            .dropdown_menu(move |menu, window, _cx| {
                 let mut menu = menu
                     .item(Self::menu_item(
                         &weak_edit,
@@ -3515,7 +3658,7 @@ impl LubanApp {
                         move |this, _, cx| this.set_encoding(encoding, cx),
                     ));
                 }
-                menu
+                Self::fit_menu(menu, window)
             });
 
         let search_menu = Button::new("menu-search")
@@ -3594,7 +3737,7 @@ impl LubanApp {
             .label(tr("menu.view"))
             .ghost()
             .compact()
-            .dropdown_menu(move |menu, _window, _cx| {
+            .dropdown_menu(move |menu, window, _cx| {
                 let mut menu = menu
                     .item(Self::menu_item(
                         &weak_view,
@@ -3717,7 +3860,7 @@ impl LubanApp {
                         move |this, window, cx| this.set_language(name.clone(), window, cx),
                     ));
                 }
-                menu
+                Self::fit_menu(menu, window)
             });
 
         let settings_menu = Button::new("menu-settings")
