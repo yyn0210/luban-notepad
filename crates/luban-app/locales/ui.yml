@@ -251,9 +251,6 @@ status.saved_state:
 status.zoom:
   en: "%{percent}%"
   zh-CN: "%{percent}%"
-header.unsaved:
-  en: "  ·  unsaved changes"
-  zh-CN: "  ·  有未保存的更改"
 untitled.name:
   en: "new %{number}"
   zh-CN: "新建 %{number}"

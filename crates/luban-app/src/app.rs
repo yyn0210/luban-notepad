@@ -4159,14 +4159,6 @@ impl LubanApp {
         let editor = tab.editor.clone();
         let font_size = self.settings.font_size;
         let font_family = self.settings.font_family.clone();
-        let modified = tab.doc.is_modified();
-        let name = tab.doc.display_name();
-        let language = language_display_name(&tab.doc.language);
-        let unsaved = if modified {
-            tr("header.unsaved")
-        } else {
-            String::new()
-        };
         let _ = weak;
 
         div()
@@ -4175,21 +4167,6 @@ impl LubanApp {
             .min_h(px(0.))
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .py_1()
-                    .bg(cx.theme().colors.background)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().colors.muted_foreground)
-                            .child(format!("{}  ·  {}{}", name, language, unsaved)),
-                    ),
-            )
             .child(
                 div().flex_1().min_h(px(0.)).p_1().child(
                     Editor::new(&editor)
