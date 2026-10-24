@@ -11,6 +11,7 @@ mod explorer;
 mod find;
 mod i18n;
 mod icons;
+mod large_file;
 mod preferences;
 mod theme;
 mod util;

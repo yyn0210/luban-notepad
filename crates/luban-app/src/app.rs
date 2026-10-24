@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_kit::component::slider::SliderEvent;
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
 use gpui_kit::component::{Selectable as _, TitleBar};
@@ -24,6 +25,7 @@ use luban_core::encoding::TextEncoding;
 use luban_core::eol::{self, Eol};
 use luban_core::i18n::language_display_name;
 use luban_core::language;
+use luban_core::large_file::{format_bytes, RangeMode, SizeUnit};
 use luban_core::search::Match;
 use luban_core::session::{Session, SessionTab};
 use luban_core::settings::{Settings, ThemeChoice};
@@ -40,6 +42,7 @@ use crate::dialogs::{
 use crate::explorer::ExplorerState;
 use crate::find::{FindInFilesPanel, FindPanel};
 use crate::i18n::{active_language_name, tr, tr_args};
+use crate::large_file::{LargeFilePanel, RangeField};
 use crate::preferences::PreferencesState;
 use crate::theme::apply_theme;
 use crate::util::{self, language_key};
@@ -73,6 +76,15 @@ struct PendingOpenAt {
     match_len: usize,
 }
 
+/// A background load started by the large-file controller.
+struct LargeLoadJob {
+    path: PathBuf,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    /// Tab that should be replaced after the load succeeds.
+    replace_tab: Option<u64>,
+}
+
 /// A session tab prepared for loading on the background executor.
 struct RestoreSpec {
     path: Option<PathBuf>,
@@ -84,28 +96,36 @@ struct RestoreSpec {
     anchor: usize,
     modified: bool,
     fallback_name: String,
+    range: Option<[u64; 2]>,
 }
 
 impl RestoreSpec {
     fn load(self, max_size: u64) -> Document {
         let mut doc = if let Some(path) = &self.path {
-            match Document::open_with_limit(path, max_size) {
+            let opened = Self::open_restored(path, self.range, max_size).or_else(|err| {
+                log::warn!("could not restore {}: {err}", path.display());
+                Document::open_with_limit(path, max_size)
+            });
+            match opened {
                 Ok(mut doc) => {
                     if let Some(text) = &self.text {
-                        // Ordinary buffers are stored LF-normalized; non-text
-                        // buffers are stored raw and must keep their bytes.
-                        doc.attach_text(if doc.is_non_text() {
-                            text.clone()
-                        } else {
-                            eol::to_lf(text)
-                        });
-                        doc.encoding = self.encoding;
-                        doc.eol = self.eol;
-                        doc.language = self.language.clone();
-                        if self.modified {
-                            doc.touch();
-                        } else {
-                            doc.mark_saved();
+                        if self.range.is_none() {
+                            // Ordinary buffers are stored LF-normalized;
+                            // non-text buffers are stored raw and must keep
+                            // their bytes.
+                            doc.attach_text(if doc.is_non_text() {
+                                text.clone()
+                            } else {
+                                eol::to_lf(text)
+                            });
+                            doc.encoding = self.encoding;
+                            doc.eol = self.eol;
+                            doc.language = self.language.clone();
+                            if self.modified {
+                                doc.touch();
+                            } else {
+                                doc.mark_saved();
+                            }
                         }
                     }
                     doc
@@ -136,6 +156,30 @@ impl RestoreSpec {
         doc.cursor = self.cursor.min(total);
         doc.anchor = self.anchor.min(total);
         doc
+    }
+
+    fn open_restored(
+        path: &Path,
+        range: Option<[u64; 2]>,
+        max_size: u64,
+    ) -> luban_core::Result<Document> {
+        let Some([from, to]) = range else {
+            return Document::open_with_limit(path, max_size);
+        };
+        let cancel = AtomicBool::new(false);
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let result = Document::open_range(path, from, to, max_size, &cancel, &progress);
+        if matches!(result, Err(luban_core::Error::InvalidRange { .. })) {
+            if let Ok(metadata) = fs::metadata(path) {
+                let size = metadata.len();
+                if size > 0 {
+                    let from = from.min(size - 1);
+                    let to = to.min(size).max(from + 1);
+                    return Document::open_range(path, from, to, max_size, &cancel, &progress);
+                }
+            }
+        }
+        result
     }
 
     fn untitled(
@@ -169,6 +213,9 @@ pub struct LubanApp {
     pub find: FindPanel,
     pub find_in_files: FindInFilesPanel,
     pub explorer: ExplorerState,
+    pub large_file: LargeFilePanel,
+    large_loads: Vec<LargeLoadJob>,
+    next_load_generation: u64,
     pub preferences: PreferencesState,
     pub file_dialog: Option<FileDialogState>,
     file_path_input: Entity<InputState>,
@@ -296,6 +343,9 @@ impl LubanApp {
             find: FindPanel::new(window, cx),
             find_in_files: FindInFilesPanel::new(window, cx),
             explorer: ExplorerState::new(),
+            large_file: LargeFilePanel::new(window, cx),
+            large_loads: Vec::new(),
+            next_load_generation: 1,
             preferences: PreferencesState::new(window, cx),
             file_dialog: None,
             file_path_input: cx
@@ -384,6 +434,33 @@ impl LubanApp {
                 }
             }),
         );
+
+        for (entity, field) in [
+            (app.large_file.from_input.clone(), RangeField::From),
+            (app.large_file.to_input.clone(), RangeField::To),
+            (app.large_file.size_input.clone(), RangeField::Size),
+        ] {
+            app._subscriptions
+                .push(cx.subscribe(&entity, move |this, _, event, cx| {
+                    let normalize =
+                        matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. });
+                    if normalize || matches!(event, InputEvent::Change) {
+                        this.large_file.queue_input(field, normalize);
+                        cx.notify();
+                    }
+                }));
+        }
+        for (entity, field) in [
+            (app.large_file.from_slider.clone(), RangeField::From),
+            (app.large_file.to_slider.clone(), RangeField::To),
+            (app.large_file.size_slider.clone(), RangeField::Size),
+        ] {
+            app._subscriptions
+                .push(cx.subscribe(&entity, move |this, _, _: &SliderEvent, cx| {
+                    this.large_file.queue_slider(field);
+                    cx.notify();
+                }));
+        }
 
         // Open command-line files first; they take precedence over the session.
         if !options.files.is_empty() {
@@ -636,7 +713,13 @@ impl LubanApp {
             );
             return false;
         }
+        let controller = self.settings.large_file_controller
+            && metadata.len() >= self.settings.large_file_controller_threshold_bytes();
         if metadata.len() > max_size {
+            if controller {
+                self.start_controller_open(path, metadata.len(), window, cx);
+                return true;
+            }
             let err = luban_core::Error::FileTooLarge {
                 size: metadata.len(),
                 limit: max_size,
@@ -652,6 +735,10 @@ impl LubanApp {
                 cx,
             );
             return false;
+        }
+        if controller {
+            self.start_controller_open(path, metadata.len(), window, cx);
+            return true;
         }
         if metadata.len() >= self.settings.large_file_threshold as u64 {
             self.start_background_open(path, max_size, window, cx);
@@ -794,14 +881,23 @@ impl LubanApp {
                 if pending_at {
                     if let Some(request) = self.pending_open_at.take() {
                         let index = self.active;
-                        let (start, end) = self.line_selection_in_tab(
-                            index,
-                            request.line,
-                            request.column,
-                            request.match_len,
-                            cx,
-                        );
-                        self.select_char_range(start, end, window, cx);
+                        let line_count = self
+                            .tabs
+                            .get(index)
+                            .map(|tab| tab.editor.read(cx).text().lines_len())
+                            .unwrap_or(0);
+                        if request.line > line_count {
+                            self.set_status(tr("status.line_outside_partial"), cx);
+                        } else {
+                            let (start, end) = self.line_selection_in_tab(
+                                index,
+                                request.line,
+                                request.column,
+                                request.match_len,
+                                cx,
+                            );
+                            self.select_char_range(start, end, window, cx);
+                        }
                     }
                 }
             }
@@ -827,6 +923,480 @@ impl LubanApp {
             }
         }
         cx.notify();
+    }
+
+    /// Start a controller-driven open. Files within the size limit load whole;
+    /// larger files load the beginning portion by default.
+    fn start_controller_open(
+        &mut self,
+        path: PathBuf,
+        size: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let max_size = self.settings.max_file_size_bytes();
+        let default_size = self.settings.large_file_partial_size_bytes();
+        let whole = size <= max_size;
+        self.large_file.open_for(
+            crate::large_file::PanelBinding {
+                path: path.clone(),
+                size,
+                tab_id: None,
+                default_size,
+                unit: self.settings.large_file_display_unit,
+                loaded: 0,
+                whole,
+            },
+            window,
+            cx,
+        );
+        let range = if whole {
+            None
+        } else {
+            Some((0, default_size.min(size)))
+        };
+        self.start_controller_load(path, range, None, window, cx);
+    }
+
+    fn start_controller_load(
+        &mut self,
+        path: PathBuf,
+        range: Option<(u64, u64)>,
+        replace_tab: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_controller_load_for_path(&path);
+        let generation = self.next_load_generation;
+        self.next_load_generation = self.next_load_generation.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        self.large_loads.push(LargeLoadJob {
+            path: path.clone(),
+            generation,
+            cancel: cancel.clone(),
+            replace_tab,
+        });
+        self.pending_opens.push(path.clone());
+        self.large_file
+            .begin_loading(progress.clone(), cancel.clone(), cx);
+        self.set_status(
+            tr_args("status.opening", &[("path", path.display().to_string())]),
+            cx,
+        );
+
+        let max_size = self.settings.max_file_size_bytes();
+        let task_path = path.clone();
+        let task_cancel = cancel.clone();
+        let task_progress = progress.clone();
+        let task = cx.background_executor().spawn(async move {
+            match range {
+                Some((from, to)) => Document::open_range(
+                    &task_path,
+                    from,
+                    to,
+                    max_size,
+                    &task_cancel,
+                    &task_progress,
+                ),
+                None => {
+                    Document::open_with_progress(&task_path, max_size, &task_cancel, &task_progress)
+                }
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_controller_load(generation, path, result, window, cx);
+            });
+        })
+        .detach();
+
+        // Repaint while the read is in flight so the "opened" byte count moves.
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            let keep = this
+                .update(cx, |app, cx| {
+                    if app.large_file.loading {
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn cancel_controller_load_for_path(&mut self, path: &Path) {
+        for job in &self.large_loads {
+            if util::same_path(&job.path, path) {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.large_loads
+            .retain(|job| !util::same_path(&job.path, path));
+        self.pending_opens
+            .retain(|pending| !util::same_path(pending, path));
+    }
+
+    fn finish_controller_load(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        result: luban_core::Result<Document>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .large_loads
+            .iter()
+            .position(|job| job.generation == generation)
+        else {
+            // A newer load replaced this one; ignore the stale result.
+            return;
+        };
+        let job = self.large_loads.remove(index);
+        let has_newer = self
+            .large_loads
+            .iter()
+            .any(|candidate| util::same_path(&candidate.path, &path));
+        if !has_newer {
+            self.pending_opens
+                .retain(|pending| !util::same_path(pending, &path));
+        }
+        let is_current_target = self
+            .large_file
+            .target
+            .as_ref()
+            .is_some_and(|target| util::same_path(&target.path, &path));
+        // A Stop that arrived just before the read completed must still win:
+        // discard the finished document instead of mounting it.
+        let result = if job.cancel.load(Ordering::Relaxed) {
+            Err(luban_core::Error::Cancelled)
+        } else {
+            result
+        };
+
+        match result {
+            Ok(doc) => {
+                if let Some(tab_id) = job.replace_tab {
+                    if let Some(index) = self.tab_index_by_id(tab_id) {
+                        if self.tabs[index].doc.is_modified() {
+                            if is_current_target {
+                                let loaded = self.large_file.loaded;
+                                self.large_file.error = Some(tr("lfc.error.target_modified"));
+                                self.large_file.finish_loading(loaded);
+                            }
+                            self.set_status(tr("lfc.error.target_modified"), cx);
+                            if self.tabs.is_empty() {
+                                self.new_file(window, cx);
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        self.tabs.remove(index);
+                        if self.tabs.is_empty() {
+                            self.active = 0;
+                        } else if self.active >= self.tabs.len() {
+                            self.active = self.tabs.len() - 1;
+                        } else if self.active > index {
+                            self.active -= 1;
+                        }
+                    }
+                }
+                let non_text = doc.is_non_text();
+                let total = doc.file_size;
+                let partial = doc.partial_range();
+                self.settings.add_recent(path.clone());
+                let _ = self.settings.save();
+                self.add_document(doc, window, cx);
+                let tab_id = self.active_tab().map(|tab| tab.id);
+                if is_current_target {
+                    self.large_file.clear_pin();
+                    self.large_file.bound_tab = tab_id;
+                    let loaded = partial
+                        .map(|range| range.end.saturating_sub(range.start))
+                        .unwrap_or(total);
+                    self.large_file.finish_loading(loaded);
+                    self.large_file.available_space =
+                        crate::large_file::available_space(&std::env::temp_dir());
+                    if let Some(target) = &mut self.large_file.target {
+                        target.size = total;
+                        target.tab_id = tab_id;
+                    }
+                }
+                let status = if let Some(range) = partial {
+                    let unit = self.settings.large_file_display_unit;
+                    tr_args(
+                        "status.partial_opened",
+                        &[
+                            ("path", path.display().to_string()),
+                            (
+                                "loaded",
+                                format_bytes(range.end.saturating_sub(range.start), unit),
+                            ),
+                            ("total", format_bytes(total, unit)),
+                            ("start", format_bytes(range.start, unit)),
+                        ],
+                    )
+                } else if non_text {
+                    tr_args(
+                        "status.opened_non_text",
+                        &[("path", path.display().to_string())],
+                    )
+                } else {
+                    tr_args("status.opened", &[("path", path.display().to_string())])
+                };
+                self.set_status(status, cx);
+
+                let pending_at = self
+                    .pending_open_at
+                    .as_ref()
+                    .is_some_and(|request| util::same_path(&request.path, &path));
+                if pending_at {
+                    if let Some(request) = self.pending_open_at.take() {
+                        let index = self.active;
+                        let line_count = self
+                            .tabs
+                            .get(index)
+                            .map(|tab| tab.editor.read(cx).text().lines_len())
+                            .unwrap_or(0);
+                        if request.line > line_count {
+                            self.set_status(tr("status.line_outside_partial"), cx);
+                        } else {
+                            let (start, end) = self.line_selection_in_tab(
+                                index,
+                                request.line,
+                                request.column,
+                                request.match_len,
+                                cx,
+                            );
+                            self.select_char_range(start, end, window, cx);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let cancelled = matches!(err, luban_core::Error::Cancelled);
+                if is_current_target && !has_newer {
+                    let loaded = self.large_file.loaded;
+                    self.large_file.finish_loading(loaded);
+                    if cancelled {
+                        self.large_file.status = Some(tr("lfc.stopped"));
+                    } else {
+                        self.large_file.error = Some(err.to_string());
+                    }
+                }
+                if cancelled {
+                    self.set_status(tr("lfc.stopped"), cx);
+                } else {
+                    let status = tr_args(
+                        "status.open_failed",
+                        &[
+                            ("path", path.display().to_string()),
+                            ("error", err.to_string()),
+                        ],
+                    );
+                    self.set_status(status, cx);
+                    if self.tabs.is_empty() {
+                        self.new_file(window, cx);
+                    }
+                }
+                if cancelled
+                    && is_current_target
+                    && !has_newer
+                    && !self.tabs.iter().any(|tab| {
+                        tab.doc
+                            .path
+                            .as_ref()
+                            .is_some_and(|open| util::same_path(open, &path))
+                    })
+                {
+                    let active = self.tabs.get(self.active).map(|tab| tab.id);
+                    self.large_file.pin_to_tab(active);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Apply the controller's current range, replacing an unmodified tab for
+    /// the same file when one exists.
+    pub(crate) fn apply_large_file_range(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.large_file.target.clone() else {
+            self.large_file.error = Some(tr("lfc.error.no_target"));
+            cx.notify();
+            return;
+        };
+        let raw_range = match self.large_file.current_range(cx) {
+            Ok(range) => range,
+            Err(message) => {
+                self.large_file.error = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        let whole = raw_range.is_none();
+        let max_size = self.settings.max_file_size_bytes();
+        let default_size = self.settings.large_file_partial_size_bytes();
+
+        let metadata = match fs::metadata(&target.path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.large_file.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        if metadata.is_dir() {
+            self.large_file.error =
+                Some(luban_core::Error::InvalidPath(target.path.clone()).to_string());
+            cx.notify();
+            return;
+        }
+        let size = metadata.len();
+        if size == 0 {
+            self.large_file.error = Some(tr("lfc.error.empty_file"));
+            cx.notify();
+            return;
+        }
+        if whole && size > max_size {
+            self.large_file.error = Some(tr_args(
+                "lfc.error.whole_too_large",
+                &[
+                    ("size", format_bytes(size, SizeUnit::Bytes)),
+                    ("limit", format_bytes(max_size, SizeUnit::Bytes)),
+                ],
+            ));
+            cx.notify();
+            return;
+        }
+
+        let (from, to) = match raw_range {
+            Some((from, to)) => {
+                let from = from.min(size - 1);
+                let to = to.min(size).max(from + 1);
+                (from, to)
+            }
+            None => (0, size),
+        };
+        if !whole {
+            if from >= to {
+                self.large_file.error = Some(tr("lfc.error.start_end"));
+                cx.notify();
+                return;
+            }
+            if to - from > max_size {
+                self.large_file.error = Some(
+                    luban_core::Error::FileTooLarge {
+                        size: to - from,
+                        limit: max_size,
+                    }
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        }
+        let mode = self.large_file.selection.mode();
+        let mut selection = luban_core::large_file::RangeSelection::new(size, default_size);
+        selection.set_mode(if whole { RangeMode::Whole } else { mode });
+        if !whole {
+            let _ = selection.set_range(from, to);
+        }
+
+        let mut replace_tab = None;
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.doc
+                .path
+                .as_ref()
+                .is_some_and(|path| util::same_path(path, &target.path))
+        }) {
+            if self.tabs[index].doc.is_modified() {
+                self.large_file.error = Some(tr("lfc.error.target_modified"));
+                cx.notify();
+                return;
+            }
+            replace_tab = Some(self.tabs[index].id);
+        }
+
+        self.large_file
+            .set_selection(selection.clone(), size, window, cx);
+        self.large_file.error = None;
+        let range = if whole {
+            None
+        } else {
+            Some((selection.from(), selection.to()))
+        };
+        self.start_controller_load(target.path, range, replace_tab, window, cx);
+    }
+
+    pub fn toggle_large_file_controller(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.large_file.open {
+            self.large_file.open = false;
+            self.large_file.bound_tab = None;
+        } else {
+            self.large_file.open = true;
+            self.large_file.bound_tab = None;
+            self.sync_large_file_panel(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Keep the controller pointed at the active tab when it is not loading.
+    fn sync_large_file_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.large_file.open || self.large_file.loading {
+            return;
+        }
+        let active_tab_id = self.tabs.get(self.active).map(|tab| tab.id);
+        if self.large_file.should_hold_target(active_tab_id) {
+            return;
+        }
+        self.large_file.clear_pin();
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let tab_id = tab.id;
+        let same_target = self.large_file.bound_tab == Some(tab_id)
+            && tab
+                .doc
+                .path
+                .as_ref()
+                .zip(self.large_file.target.as_ref().map(|target| &target.path))
+                .is_some_and(|(open, bound)| util::same_path(open, bound));
+        if same_target {
+            return;
+        }
+        let Some(path) = tab.doc.path.clone() else {
+            self.large_file.clear_target(Some(tab_id), window, cx);
+            return;
+        };
+        let size = tab.doc.source_size();
+        let loaded = tab
+            .doc
+            .partial_range()
+            .map(|range| range.end.saturating_sub(range.start))
+            .unwrap_or(size);
+        self.large_file.bind(
+            crate::large_file::PanelBinding {
+                path,
+                size,
+                tab_id: Some(tab_id),
+                default_size: self.settings.large_file_partial_size_bytes(),
+                unit: self.settings.large_file_display_unit,
+                loaded,
+                whole: size <= self.settings.max_file_size_bytes(),
+            },
+            window,
+            cx,
+        );
     }
 
     /// Character range for a 1-based line/column and match length, read from
@@ -872,7 +1442,11 @@ impl LubanApp {
                 .is_some_and(|open| util::same_path(open, &path))
         });
         let large = fs::metadata(&path)
-            .map(|metadata| metadata.len() >= self.settings.large_file_threshold as u64)
+            .map(|metadata| {
+                metadata.len() >= self.settings.large_file_threshold as u64
+                    || (self.settings.large_file_controller
+                        && metadata.len() >= self.settings.large_file_controller_threshold_bytes())
+            })
             .unwrap_or(false);
         if !self.open_path(&path, window, cx) {
             return;
@@ -952,6 +1526,7 @@ impl LubanApp {
                 anchor: tab.anchor,
                 modified: tab.modified,
                 fallback_name,
+                range: tab.range,
             });
         }
 
@@ -1204,7 +1779,7 @@ impl LubanApp {
         cx.notify();
     }
 
-    fn set_status(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+    pub(crate) fn set_status(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.status = message.into();
         cx.notify();
     }
@@ -1239,7 +1814,7 @@ impl LubanApp {
     pub fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
         let Some(tab) = self.active_tab() else { return };
-        if tab.doc.path.is_none() {
+        if tab.doc.path.is_none() || tab.doc.is_partial() {
             self.save_active_as(window, cx);
             return;
         }
@@ -1249,6 +1824,10 @@ impl LubanApp {
 
     fn save_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[index].doc.is_partial() {
+            self.set_status(tr("status.save_partial_as"), cx);
             return;
         }
         if !self.ensure_tab_text(index, cx) {
@@ -1309,19 +1888,37 @@ impl LubanApp {
 
     pub fn save_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        let mut skipped_partial = false;
         for index in 0..self.tabs.len() {
-            if self.tabs[index].doc.is_modified() && self.tabs[index].doc.path.is_some() {
-                self.save_tab_at(index, window, cx);
+            if !self.tabs[index].doc.is_modified() || self.tabs[index].doc.path.is_none() {
+                continue;
             }
+            if self.tabs[index].doc.is_partial() {
+                skipped_partial = true;
+                continue;
+            }
+            self.save_tab_at(index, window, cx);
         }
-        self.set_status(tr("status.saved_modified"), cx);
+        if skipped_partial {
+            self.set_status(tr("status.save_partial_as"), cx);
+        } else {
+            self.set_status(tr("status.saved_modified"), cx);
+        }
     }
 
     pub fn save_active_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else { return };
         let tab_id = tab.id;
         let dir = util::default_save_directory(tab.doc.path.as_deref());
-        let suggested = tab.doc.display_name();
+        let suggested = if tab.doc.is_partial() {
+            tab.doc
+                .path
+                .as_deref()
+                .map(luban_core::large_file::partial_save_name)
+                .unwrap_or_else(|| tab.doc.display_name())
+        } else {
+            tab.doc.display_name()
+        };
         self.show_file_dialog(
             FileDialogMode::Save,
             FileDialogPurpose::SaveAs {
@@ -2095,10 +2692,16 @@ impl LubanApp {
             };
             let (dir, name) = {
                 let tab = &self.tabs[index];
-                (
-                    util::default_save_directory(tab.doc.path.as_deref()),
-                    tab.doc.display_name(),
-                )
+                let name = if tab.doc.is_partial() {
+                    tab.doc
+                        .path
+                        .as_deref()
+                        .map(luban_core::large_file::partial_save_name)
+                        .unwrap_or_else(|| tab.doc.display_name())
+                } else {
+                    tab.doc.display_name()
+                };
+                (util::default_save_directory(tab.doc.path.as_deref()), name)
             };
             self.show_file_dialog(
                 FileDialogMode::Save,
@@ -2121,7 +2724,7 @@ impl LubanApp {
                 let Some(index) = self.tab_index_by_id(id) else {
                     return;
                 };
-                if self.tabs[index].doc.path.is_some() {
+                if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
                     self.save_tab_at(index, window, cx);
                     if !self.tabs[index].doc.is_modified() {
                         self.close_tab_at(index, window, cx);
@@ -2129,10 +2732,16 @@ impl LubanApp {
                 } else {
                     let (dir, name) = {
                         let tab = &self.tabs[index];
-                        (
-                            util::default_save_directory(tab.doc.path.as_deref()),
-                            tab.doc.display_name(),
-                        )
+                        let name = if tab.doc.is_partial() {
+                            tab.doc
+                                .path
+                                .as_deref()
+                                .map(luban_core::large_file::partial_save_name)
+                                .unwrap_or_else(|| tab.doc.display_name())
+                        } else {
+                            tab.doc.display_name()
+                        };
+                        (util::default_save_directory(tab.doc.path.as_deref()), name)
                     };
                     self.show_file_dialog(
                         FileDialogMode::Save,
@@ -2153,7 +2762,7 @@ impl LubanApp {
                     let Some(index) = self.tab_index_by_id(id) else {
                         continue;
                     };
-                    if self.tabs[index].doc.path.is_some() {
+                    if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
                         self.save_tab_at(index, window, cx);
                     } else {
                         self.pending_close_saves.push(id);
@@ -2172,7 +2781,7 @@ impl LubanApp {
                     let Some(index) = self.tab_index_by_id(id) else {
                         continue;
                     };
-                    if self.tabs[index].doc.path.is_some() {
+                    if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
                         self.save_tab_at(index, window, cx);
                     } else {
                         self.pending_exit_saves.push(id);
@@ -2238,7 +2847,10 @@ impl LubanApp {
                 path: tab.doc.path.clone(),
                 // Large buffers are never written to the session: the file is
                 // restored from disk instead.
-                text: if !tab.large_file && (tab.doc.is_modified() || tab.doc.is_untitled()) {
+                text: if !tab.large_file
+                    && tab.doc.partial_range().is_none()
+                    && (tab.doc.is_modified() || tab.doc.is_untitled())
+                {
                     Some(tab.doc.text.clone())
                 } else {
                     None
@@ -2249,7 +2861,14 @@ impl LubanApp {
                 cursor: tab.doc.cursor,
                 anchor: tab.doc.anchor,
                 scroll_offset: 0.0,
-                modified: !tab.large_file && tab.doc.is_modified(),
+                modified: !tab.large_file
+                    && tab.doc.partial_range().is_none()
+                    && tab.doc.is_modified(),
+                range: tab
+                    .doc
+                    .partial_range()
+                    .map(|range| [range.start, range.end]),
+                source_size: tab.doc.partial_range().map(|range| range.total),
             })
             .collect();
         Session {
@@ -3368,6 +3987,7 @@ impl LubanApp {
         let weak = cx.weak_entity();
         let settings = self.settings.clone();
         let recent = self.settings.recent_files.clone();
+        let large_file_open = self.large_file.open;
         let tab_count = self.tabs.len();
         let has_doc = tab_count > 0;
         let encoded = self
@@ -3379,6 +3999,7 @@ impl LubanApp {
             .active_doc()
             .map(|d| d.language.clone())
             .unwrap_or_else(|| language::PLAIN_TEXT.to_string());
+        let active_partial = self.active_doc().is_some_and(Document::is_partial);
 
         let weak_file = weak.clone();
         let weak_edit = weak.clone();
@@ -3483,7 +4104,7 @@ impl LubanApp {
                     .item(Self::menu_item(
                         &weak_file,
                         tr("menu.file.reload"),
-                        !has_doc,
+                        !has_doc || active_partial,
                         None,
                         |this, window, cx| {
                             this.reload_active(window, cx);
@@ -3839,6 +4460,15 @@ impl LubanApp {
                             this.settings.show_file_explorer = !this.settings.show_file_explorer;
                             let _ = this.settings.save();
                             cx.notify();
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        tr("menu.view.large_file_controller"),
+                        !has_doc,
+                        Some(large_file_open),
+                        |this, window, cx| {
+                            this.toggle_large_file_controller(window, cx);
                         },
                     ))
                     .separator()
@@ -4281,6 +4911,24 @@ impl LubanApp {
         let zoom = (self.settings.font_size / 14.0 * 100.0).round() as i32;
         let modified = self.active_doc().is_some_and(Document::is_modified);
         let non_text = self.active_doc().is_some_and(Document::is_non_text);
+        let partial_label = self
+            .active_doc()
+            .and_then(Document::partial_range)
+            .map(|range| {
+                let unit = self.settings.large_file_display_unit;
+                tr_args(
+                    "status.partial_file",
+                    &[
+                        (
+                            "loaded",
+                            format_bytes(range.end.saturating_sub(range.start), unit),
+                        ),
+                        ("total", format_bytes(range.total, unit)),
+                        ("start", format_bytes(range.start, unit)),
+                    ],
+                )
+            })
+            .unwrap_or_default();
         let line_col = tr_args(
             "status.line_col",
             &[("line", line.to_string()), ("column", column.to_string())],
@@ -4324,6 +4972,7 @@ impl LubanApp {
                 } else {
                     String::new()
                 }),
+                div().child(partial_label),
                 div().child(if non_text {
                     tr("status.non_text")
                 } else {
@@ -6106,6 +6755,7 @@ impl Render for LubanApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_enter_actions(window, cx);
         self.sync_active(window, cx);
+        self.sync_large_file_panel(window, cx);
         self.autosave_session();
         self.refresh_find(cx);
         self.refresh_decorations(cx);
@@ -6163,6 +6813,12 @@ impl Render for LubanApp {
         } else {
             None
         };
+        let can_save_part = self.active_doc().is_some_and(Document::is_partial);
+        let large_file_panel = if self.large_file.open {
+            Some(self.large_file.render(can_save_part, window, cx))
+        } else {
+            None
+        };
         let weak_keys = cx.weak_entity();
         let key_listener = move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
             let _ = weak_keys.update(cx, |this, cx| {
@@ -6203,7 +6859,8 @@ impl Render for LubanApp {
                 .flex()
                 .flex_row()
                 .children(explorer)
-                .child(editor),
+                .child(editor)
+                .children(large_file_panel),
         );
         if let Some(find_bar) = find_bar {
             root = root.child(find_bar);
@@ -6281,10 +6938,37 @@ mod restore_tests {
             anchor: 0,
             modified: true,
             fallback_name: "bin.dat".to_string(),
+            range: None,
         };
         let doc = spec.load(1024);
         assert!(doc.is_non_text());
         assert_eq!(doc.text, "x\r\ny");
         assert!(doc.is_modified());
+    }
+
+    #[test]
+    fn restore_clamps_a_range_beyond_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, b"aaa\nbbb\n").unwrap();
+        let spec = RestoreSpec {
+            path: Some(path),
+            text: None,
+            encoding: TextEncoding::Utf8,
+            eol: Eol::Lf,
+            language: "Plain Text".to_string(),
+            cursor: 0,
+            anchor: 0,
+            modified: false,
+            fallback_name: "small.txt".to_string(),
+            range: Some([100, 200]),
+        };
+        let doc = spec.load(1024);
+        assert!(doc.is_partial());
+        let range = doc.partial_range().unwrap();
+        assert_eq!(range.total, 8);
+        assert!(range.start < 8);
+        assert!(range.end <= 8);
+        assert_eq!(doc.text, "bbb\n");
     }
 }

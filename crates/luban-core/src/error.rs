@@ -12,6 +12,10 @@ pub enum Error {
 
     FileTooLarge { size: u64, limit: u64 },
 
+    InvalidRange { start: u64, end: u64, size: u64 },
+
+    Cancelled,
+
     Encoding(String),
 
     Serialization(serde_json::Error),
@@ -33,6 +37,15 @@ impl fmt::Display for Error {
                 "core.error.file_too_large",
                 &[("size", size.to_string()), ("limit", limit.to_string())],
             )),
+            Self::InvalidRange { start, end, size } => f.write_str(&tr_args(
+                "core.error.invalid_range",
+                &[
+                    ("start", start.to_string()),
+                    ("end", end.to_string()),
+                    ("size", size.to_string()),
+                ],
+            )),
+            Self::Cancelled => f.write_str(&crate::i18n::tr("core.error.cancelled")),
             Self::Encoding(error) => {
                 f.write_str(&tr_args("core.error.encoding", &[("error", error.clone())]))
             }

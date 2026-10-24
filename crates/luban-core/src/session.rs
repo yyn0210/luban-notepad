@@ -25,6 +25,11 @@ pub struct SessionTab {
     pub anchor: usize,
     pub scroll_offset: f32,
     pub modified: bool,
+    /// Byte range of a partially opened file (`start`, `end`). `None` for
+    /// whole-file tabs and for tabs restored from older sessions.
+    pub range: Option<[u64; 2]>,
+    /// Total size of the source file when the range was recorded.
+    pub source_size: Option<u64>,
 }
 
 impl Default for SessionTab {
@@ -39,6 +44,8 @@ impl Default for SessionTab {
             anchor: 0,
             scroll_offset: 0.0,
             modified: false,
+            range: None,
+            source_size: None,
         }
     }
 }
@@ -146,6 +153,8 @@ mod tests {
                 anchor: 2,
                 scroll_offset: 12.5,
                 modified: true,
+                range: Some([100, 4096]),
+                source_size: Some(8192),
             }],
             active_tab: 0,
             workspace_root: Some(PathBuf::from("/tmp")),
@@ -157,6 +166,8 @@ mod tests {
         assert_eq!(loaded.tabs[0].text.as_deref(), Some("fn main() {}"));
         assert_eq!(loaded.tabs[0].cursor, 5);
         assert_eq!(loaded.tabs[0].language, "Rust");
+        assert_eq!(loaded.tabs[0].range, Some([100, 4096]));
+        assert_eq!(loaded.tabs[0].source_size, Some(8192));
         assert_eq!(loaded.workspace_root, Some(PathBuf::from("/tmp")));
     }
 

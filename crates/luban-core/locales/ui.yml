@@ -9,6 +9,12 @@ core.error.invalid_path:
 core.error.file_too_large:
   en: "file is too large to open (%{size} bytes, limit is %{limit} bytes)"
   zh-CN: "文件过大，无法打开（%{size} 字节，上限 %{limit} 字节）"
+core.error.invalid_range:
+  en: "invalid range: %{start}–%{end} of %{size} bytes"
+  zh-CN: "无效范围：%{start}–%{end}，文件共 %{size} 字节"
+core.error.cancelled:
+  en: "cancelled"
+  zh-CN: "已取消"
 core.error.encoding:
   en: "encoding error: %{error}"
   zh-CN: "编码错误：%{error}"
@@ -79,6 +85,15 @@ core.document.no_path:
 core.document.read_only:
   en: "document is read-only"
   zh-CN: "文档为只读"
+core.document.partial_save_as:
+  en: "this file was partially opened; use Save As to keep the opened portion"
+  zh-CN: "该文件是部分打开的，请使用“另存为”保存已打开的部分"
+core.document.partial_same_path:
+  en: "cannot save a partially opened file over its source; choose another name"
+  zh-CN: "不能把部分打开的内容写回源文件，请选择其他文件名"
+core.document.partial_reload:
+  en: "reload is not available for partially opened files"
+  zh-CN: "部分打开的文件不支持重新加载"
 
 core.search.empty_text:
   en: "search text is empty"

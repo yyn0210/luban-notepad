@@ -3700,6 +3700,7 @@ dependencies = [
  "env_logger",
  "gpui-kit",
  "image",
+ "libc",
  "log",
  "luban-core",
  "rust-i18n",
@@ -3708,6 +3709,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 

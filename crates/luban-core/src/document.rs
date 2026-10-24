@@ -17,6 +17,17 @@ use crate::undo::{Edit, EditKind, UndoStack};
 /// render while still protecting against accidental huge opens.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
+/// A document opened from a byte range rather than the whole file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartialRange {
+    /// First byte of the loaded range.
+    pub start: u64,
+    /// Exclusive end byte of the loaded range.
+    pub end: u64,
+    /// Size of the complete source file.
+    pub total: u64,
+}
+
 /// An open text document.
 #[derive(Debug)]
 pub struct Document {
@@ -40,6 +51,9 @@ pub struct Document {
     /// the original bytes (via a reversible decoding) and is written back
     /// without line-ending conversion.
     non_text: bool,
+    /// Set when only a portion of the source file is loaded. Such documents
+    /// can be edited but never saved over the source path.
+    partial: Option<PartialRange>,
     revision: u64,
     saved_revision: u64,
     /// The text buffer lives only in the editor while this is set. Operations
@@ -67,6 +81,7 @@ impl Document {
             file_size: 0,
             untitled_name: name.into(),
             non_text: false,
+            partial: None,
             revision: 0,
             saved_revision: 0,
             text_detached: false,
@@ -113,6 +128,81 @@ impl Document {
             });
         }
         let bytes = fs::read(path)?;
+        Self::from_file_bytes(
+            path,
+            bytes,
+            metadata.len(),
+            metadata.modified().ok(),
+            metadata.permissions().readonly(),
+        )
+    }
+
+    /// Open a whole file while reporting read progress and honoring a cancel
+    /// flag. Used by the large-file controller for files within the size limit.
+    pub fn open_with_progress(
+        path: impl AsRef<Path>,
+        max_size: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = fs::metadata(path)?;
+        if metadata.is_dir() {
+            return Err(Error::InvalidPath(path.to_path_buf()));
+        }
+        let bytes = crate::large_file::read_whole(path, max_size, cancel, progress)?;
+        Self::from_file_bytes(
+            path,
+            bytes,
+            metadata.len(),
+            metadata.modified().ok(),
+            metadata.permissions().readonly(),
+        )
+    }
+
+    /// Open only `from..to` of a file. The range is aligned to line boundaries
+    /// by [`crate::large_file::read_range`]. The resulting document is marked
+    /// partial and cannot be saved over its source path.
+    pub fn open_range(
+        path: impl AsRef<Path>,
+        from: u64,
+        to: u64,
+        max_len: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let content = crate::large_file::read_range(path, from, to, max_len, cancel, progress)?;
+        let mut doc = Self::new_untitled("new 1");
+        doc.path = Some(path.to_path_buf());
+        doc.text = content.text;
+        doc.cached_chars = Some(text::char_count(&doc.text));
+        doc.encoding = content.encoding;
+        doc.eol = content.eol;
+        doc.language = crate::large_file::language_for(path);
+        doc.file_size = content.total_size;
+        doc.last_modified = content.last_modified;
+        // The source is protected by `partial` rather than the permission
+        // flag, so a read-only source can still be saved as a new file.
+        doc.read_only = false;
+        doc.non_text = content.non_text;
+        doc.partial = Some(PartialRange {
+            start: content.start,
+            end: content.end,
+            total: content.total_size,
+        });
+        doc.revision = 1;
+        doc.saved_revision = 1;
+        Ok(doc)
+    }
+
+    fn from_file_bytes(
+        path: &Path,
+        bytes: Vec<u8>,
+        file_size: u64,
+        last_modified: Option<SystemTime>,
+        read_only: bool,
+    ) -> Result<Self> {
         // Notepad++ opens binary content as text instead of refusing it. The
         // flag changes how the buffer is decoded and saved, not whether the
         // file can be opened.
@@ -138,9 +228,9 @@ impl Document {
         doc.encoding = decoded.encoding;
         doc.eol = detected_eol;
         doc.language = language_name.to_string();
-        doc.file_size = metadata.len();
-        doc.last_modified = metadata.modified().ok();
-        doc.read_only = metadata.permissions().readonly();
+        doc.file_size = file_size;
+        doc.last_modified = last_modified;
+        doc.read_only = read_only;
         doc.non_text = non_text;
         doc.revision = 1;
         doc.saved_revision = 1;
@@ -170,6 +260,22 @@ impl Document {
     /// re-encoding untouched bytes.
     pub fn is_non_text(&self) -> bool {
         self.non_text
+    }
+
+    /// The byte range when only a portion of the source file is loaded.
+    pub fn partial_range(&self) -> Option<PartialRange> {
+        self.partial
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.partial.is_some()
+    }
+
+    /// Size of the complete source file, including unopened bytes.
+    pub fn source_size(&self) -> u64 {
+        self.partial
+            .map(|range| range.total)
+            .unwrap_or(self.file_size)
     }
 
     /// Move the buffer out for the editor and release the document's copy.
@@ -499,6 +605,11 @@ impl Document {
     /// Save to the current path. Returns `Ok(true)` when the selected encoding
     /// could not represent every character (the file was still written).
     pub fn save(&mut self) -> Result<bool> {
+        if self.partial.is_some() {
+            return Err(Error::Other(crate::i18n::tr(
+                "core.document.partial_save_as",
+            )));
+        }
         let path = self
             .path
             .clone()
@@ -508,9 +619,20 @@ impl Document {
 
     pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<bool> {
         let path = path.as_ref().to_path_buf();
+        if self.partial.is_some()
+            && self
+                .path
+                .as_ref()
+                .is_some_and(|source| same_document_path(source, &path))
+        {
+            return Err(Error::Other(crate::i18n::tr(
+                "core.document.partial_same_path",
+            )));
+        }
         let lossy = self.save_to_path(&path)?;
         let was_plain = self.language == language::PLAIN_TEXT;
         self.path = Some(path);
+        self.partial = None;
         if was_plain {
             self.auto_detect_language();
         }
@@ -565,6 +687,11 @@ impl Document {
 
     /// Reload the file from disk, discarding the undo history.
     pub fn reload(&mut self) -> Result<()> {
+        if self.partial.is_some() {
+            return Err(Error::Other(crate::i18n::tr(
+                "core.document.partial_reload",
+            )));
+        }
         let path = self
             .path
             .clone()
@@ -669,6 +796,34 @@ fn diff_chars(old: &str, new: &str) -> (usize, String, String) {
     let removed = old[prefix..old.len() - suffix].to_owned();
     let inserted = new[prefix..new.len() - suffix].to_owned();
     (start, removed, inserted)
+}
+
+fn same_document_path(a: &Path, b: &Path) -> bool {
+    // Resolve `.`/`..` and symlinks when both paths exist, so a Save As target
+    // that aliases the source cannot truncate it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+    }
+    if let (Ok(a), Ok(b)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        return if cfg!(windows) {
+            a.to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy())
+        } else {
+            a == b
+        };
+    }
+    if cfg!(windows) {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    }
 }
 
 #[cfg(test)]
@@ -921,5 +1076,64 @@ mod tests {
             assert_eq!(doc.text, "a\nb\n", "{eol:?}");
             assert_eq!(doc.char_count(), 4);
         }
+    }
+
+    #[test]
+    fn partial_documents_cannot_overwrite_their_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        fs::write(&path, b"aaa\nbbb\nccc\n").unwrap();
+        let mut doc = Document::open_range(
+            &path,
+            4,
+            12,
+            1024,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicU64::new(0),
+        )
+        .unwrap();
+        assert!(doc.is_partial());
+        assert_eq!(
+            doc.partial_range(),
+            Some(PartialRange {
+                start: 4,
+                end: 12,
+                total: 12
+            })
+        );
+        assert_eq!(doc.text, "bbb\nccc\n");
+        assert_eq!(doc.source_size(), 12);
+
+        doc.touch();
+        assert!(doc.save().is_err());
+        assert!(doc.save_as(&path).is_err());
+        let alias = dir.path().join(".").join("big.txt");
+        assert!(doc.save_as(&alias).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"aaa\nbbb\nccc\n");
+
+        let copy = dir.path().join("part.txt");
+        doc.save_as(&copy).unwrap();
+        assert!(!doc.is_partial());
+        assert_eq!(doc.path.as_deref(), Some(copy.as_path()));
+        assert_eq!(fs::read(&copy).unwrap(), b"bbb\nccc\n");
+        assert!(doc.reload().is_ok());
+    }
+
+    #[test]
+    fn partial_documents_cannot_reload_from_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        fs::write(&path, b"aaa\nbbb\nccc\n").unwrap();
+        let mut doc = Document::open_range(
+            &path,
+            0,
+            8,
+            1024,
+            &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicU64::new(0),
+        )
+        .unwrap();
+        assert!(doc.reload().is_err());
+        assert!(doc.is_partial());
     }
 }

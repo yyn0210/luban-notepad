@@ -155,6 +155,9 @@ menu.view.status_bar:
 menu.view.explorer:
   en: "File Explorer"
   zh-CN: "文件浏览器"
+menu.view.large_file_controller:
+  en: "Large File Controller"
+  zh-CN: "大文件控制器"
 menu.view.zoom_in:
   en: "Zoom In"
   zh-CN: "放大"
@@ -674,6 +677,18 @@ status.restoring_session:
 status.large_file:
   en: "Large file mode"
   zh-CN: "大文件模式"
+status.partial_file:
+  en: "Partial: %{loaded} of %{total} (from %{start})"
+  zh-CN: "部分打开：%{loaded} / %{total}（从 %{start}）"
+status.partial_opened:
+  en: "Partially opened %{path} (%{loaded} of %{total}, from %{start})"
+  zh-CN: "已部分打开 %{path}（%{loaded} / %{total}，从 %{start}）"
+status.save_partial_as:
+  en: "Partially opened files can only be saved with Save As"
+  zh-CN: "部分打开的文件只能使用“另存为”保存"
+status.line_outside_partial:
+  en: "The requested line is outside the loaded portion"
+  zh-CN: "请求的行不在已加载的部分中"
 status.open_failed:
   en: "Could not open %{path}: %{error}"
   zh-CN: "无法打开 %{path}：%{error}"
@@ -749,3 +764,97 @@ status.save_cancelled:
 status.save_cancelled_close:
   en: "Save cancelled; close aborted"
   zh-CN: "已取消保存；关闭操作已中止"
+
+lfc.title:
+  en: "Large File Controller"
+  zh-CN: "大文件控制器"
+lfc.file_size:
+  en: "File size:"
+  zh-CN: "文件大小："
+lfc.opened:
+  en: "Opened:"
+  zh-CN: "已打开："
+lfc.stop:
+  en: "Stop"
+  zh-CN: "停止"
+lfc.loading:
+  en: "Loading…"
+  zh-CN: "正在加载…"
+lfc.stopped:
+  en: "Loading stopped"
+  zh-CN: "已停止加载"
+lfc.no_target:
+  en: "Open a file to control how much of it is loaded."
+  zh-CN: "打开一个文件后即可控制加载范围。"
+lfc.mode.whole:
+  en: "Open the entire file"
+  zh-CN: "打开整个文件"
+lfc.mode.beginning:
+  en: "Open the beginning"
+  zh-CN: "打开文件开始部分"
+lfc.mode.end:
+  en: "Open the end"
+  zh-CN: "打开文件结尾部分"
+lfc.mode.middle:
+  en: "Open the middle"
+  zh-CN: "打开文件中间部分"
+lfc.from:
+  en: "From:"
+  zh-CN: "从："
+lfc.from_default:
+  en: "Default: 0"
+  zh-CN: "默认：0"
+lfc.to:
+  en: "To:"
+  zh-CN: "到："
+lfc.to_default:
+  en: "Default: unlimited"
+  zh-CN: "默认：无限"
+lfc.size:
+  en: "Size:"
+  zh-CN: "大小："
+lfc.apply:
+  en: "Apply"
+  zh-CN: "应用"
+lfc.available_temp:
+  en: "Available temporary folder space:"
+  zh-CN: "可用临时文件夹大小："
+lfc.unit:
+  en: "Unit:"
+  zh-CN: "单位："
+lfc.unit.bytes:
+  en: "Bytes"
+  zh-CN: "字节"
+lfc.unit.kib:
+  en: "KiB"
+  zh-CN: "KiB"
+lfc.unit.mib:
+  en: "MiB"
+  zh-CN: "MiB"
+lfc.unit.gib:
+  en: "GiB"
+  zh-CN: "GiB"
+lfc.save_part:
+  en: "Save the opened part as…"
+  zh-CN: "把打开的部分保存为…"
+lfc.error.no_target:
+  en: "No file is selected."
+  zh-CN: "尚未选择文件。"
+lfc.error.whole_too_large:
+  en: "The file is too large to open entirely (%{size}, limit %{limit}). Choose a partial range."
+  zh-CN: "文件过大，无法整篇打开（%{size}，上限 %{limit}）。请选择部分范围。"
+lfc.error.target_modified:
+  en: "The file is open in another tab with unsaved changes. Save or close it first."
+  zh-CN: "该文件已在另一个标签页中修改，请先保存或关闭该标签页。"
+lfc.error.invalid_number:
+  en: "Enter a byte count using digits and optional commas."
+  zh-CN: "请输入字节数，可使用数字和逗号分隔。"
+lfc.error.start_end:
+  en: "Start must be smaller than end."
+  zh-CN: "起点必须小于终点。"
+lfc.error.zero_size:
+  en: "Size must be greater than zero."
+  zh-CN: "大小必须大于 0。"
+lfc.error.empty_file:
+  en: "The file is empty."
+  zh-CN: "文件为空。"

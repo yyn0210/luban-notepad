@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::encoding::TextEncoding;
 use crate::eol::Eol;
+use crate::large_file::SizeUnit;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,6 +46,16 @@ pub struct Settings {
     pub max_recent_files: usize,
     pub recent_files: Vec<PathBuf>,
     pub large_file_threshold: usize,
+    /// Show the large-file controller automatically for files at or above the
+    /// controller threshold.
+    pub large_file_controller: bool,
+    /// Files at or above this size open through the controller. Independent of
+    /// `large_file_threshold`, which controls the reduced editor mode.
+    pub large_file_controller_threshold: usize,
+    /// Default length of a partial open when no size has been chosen.
+    pub large_file_partial_size: usize,
+    /// Unit used for byte counts in the controller.
+    pub large_file_display_unit: SizeUnit,
     pub max_file_size_mb: u64,
     pub default_encoding: TextEncoding,
     pub default_eol: Eol,
@@ -83,6 +94,10 @@ impl Default for Settings {
             max_recent_files: 20,
             recent_files: Vec::new(),
             large_file_threshold: 100 * 1024 * 1024,
+            large_file_controller: true,
+            large_file_controller_threshold: 200 * 1024 * 1024,
+            large_file_partial_size: 200 * 1024 * 1024,
+            large_file_display_unit: SizeUnit::Bytes,
             max_file_size_mb: 256,
             default_encoding: TextEncoding::Utf8,
             default_eol: Eol::native(),
@@ -140,6 +155,12 @@ impl Settings {
         self.large_file_threshold = self
             .large_file_threshold
             .clamp(64 * 1024, 512 * 1024 * 1024);
+        self.large_file_controller_threshold = self
+            .large_file_controller_threshold
+            .clamp(1024 * 1024, 4096 * 1024 * 1024);
+        self.large_file_partial_size = self
+            .large_file_partial_size
+            .clamp(1024 * 1024, 4096 * 1024 * 1024);
         self.max_file_size_mb = self.max_file_size_mb.clamp(1, 4096);
         if self.syntax_theme.is_empty() {
             self.syntax_theme = "InspiredGitHub".to_string();
@@ -175,6 +196,14 @@ impl Settings {
 
     pub fn max_file_size_bytes(&self) -> u64 {
         self.max_file_size_mb.saturating_mul(1024 * 1024)
+    }
+
+    pub fn large_file_controller_threshold_bytes(&self) -> u64 {
+        self.large_file_controller_threshold as u64
+    }
+
+    pub fn large_file_partial_size_bytes(&self) -> u64 {
+        (self.large_file_partial_size as u64).min(self.max_file_size_bytes())
     }
 }
 
@@ -233,6 +262,41 @@ mod tests {
         assert_eq!(s.default_encoding, TextEncoding::Utf8);
         assert_eq!(s.max_file_size_bytes(), 256 * 1024 * 1024);
         assert_eq!(s.large_file_threshold, 100 * 1024 * 1024);
+        assert!(s.large_file_controller);
+        assert_eq!(s.large_file_controller_threshold, 200 * 1024 * 1024);
+        assert_eq!(s.large_file_partial_size, 200 * 1024 * 1024);
+        assert_eq!(s.large_file_display_unit, SizeUnit::Bytes);
+    }
+
+    #[test]
+    fn controller_thresholds_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"large_file_controller_threshold": 0, "large_file_partial_size": 0}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.large_file_controller_threshold, 1024 * 1024);
+        assert_eq!(loaded.large_file_partial_size, 1024 * 1024);
+        fs::write(
+            &path,
+            r#"{"large_file_controller_threshold": 999999999999, "large_file_partial_size": 999999999999}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.large_file_controller_threshold, 4096 * 1024 * 1024);
+        assert_eq!(loaded.large_file_partial_size, 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn partial_default_is_capped_by_the_open_limit() {
+        let s = Settings {
+            max_file_size_mb: 50,
+            ..Settings::default()
+        };
+        assert_eq!(s.large_file_partial_size_bytes(), 50 * 1024 * 1024);
     }
 
     #[test]
