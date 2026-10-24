@@ -678,6 +678,52 @@ impl LubanApp {
         }
     }
 
+    /// Open files dropped from the desktop onto the window. Dropping a folder
+    /// is not "Open Folder": replacing the workspace root as a side effect of
+    /// a stray drop would be surprising, so directories are ignored.
+    fn open_dropped_paths(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let files: Vec<&PathBuf> = paths.iter().filter(|path| !path.is_dir()).collect();
+        if files.is_empty() {
+            self.set_status(tr("status.drop_no_files"), cx);
+            return;
+        }
+        let total = files.len();
+        let mut opened = 0;
+        let mut failed = 0;
+        for path in files {
+            if self.open_path(path, window, cx) {
+                opened += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        if total > 1 {
+            if failed == 0 {
+                self.set_status(
+                    tr_args("status.batch_opened", &[("count", opened.to_string())]),
+                    cx,
+                );
+            } else {
+                self.set_status(
+                    tr_args(
+                        "status.batch_open_partial",
+                        &[
+                            ("opened", opened.to_string()),
+                            ("failed", failed.to_string()),
+                        ],
+                    ),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// Read and decode a large file on the background executor, then mount it
     /// on the main thread. The window stays interactive while this runs.
     fn start_background_open(
@@ -1441,6 +1487,7 @@ impl LubanApp {
         dialog.selected.clear();
         dialog.active = None;
         dialog.anchor = None;
+        dialog.last_click = None;
         dialog.error = None;
         dialog.list_scroll.set_offset(point(px(0.), px(0.)));
 
@@ -1537,6 +1584,7 @@ impl LubanApp {
             let Some(dialog) = &mut self.file_dialog else {
                 return;
             };
+            dialog.last_click = Some(path.clone());
             let command = modifiers.secondary() || modifiers.control;
             match dialog.mode {
                 FileDialogMode::Open => {
@@ -1575,6 +1623,25 @@ impl LubanApp {
             window.focus(&focus, cx);
         }
         cx.notify();
+    }
+
+    /// The second click of a double click opens the file in the Open dialog.
+    /// Save and Folder dialogs keep their click behavior, and a click sequence
+    /// that moved to another row (for example after entering a directory) is
+    /// ignored instead of opening whatever now sits under the cursor.
+    fn file_dialog_double_click(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let opens = self
+            .file_dialog
+            .as_mut()
+            .is_some_and(|dialog| dialog.prepare_double_click_open(&path));
+        if opens {
+            self.file_dialog_confirm(window, cx);
+        }
     }
 
     fn file_dialog_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
@@ -4780,7 +4847,10 @@ impl LubanApp {
                 .when(parent_active, |this| this.aria_active_descendant())
                 .child("↰")
                 .child("..")
-                .on_click(move |_, window, cx| {
+                .on_click(move |event, window, cx| {
+                    if event.click_count() > 1 {
+                        return;
+                    }
                     let _ = weak_parent.update(cx, |this, cx| {
                         this.file_dialog_up(window, cx);
                         this.focus_file_dialog_list(0, window, cx);
@@ -4822,7 +4892,10 @@ impl LubanApp {
                             .when(is_active, |this| this.aria_active_descendant())
                             .child("▸")
                             .child(name)
-                            .on_click(move |_, window, cx| {
+                            .on_click(move |event, window, cx| {
+                                if event.click_count() > 1 {
+                                    return;
+                                }
                                 let _ = weak_dir.update(cx, |this, cx| {
                                     this.file_dialog_navigate(path.clone(), window, cx);
                                     this.focus_file_dialog_list(0, window, cx);
@@ -4853,8 +4926,19 @@ impl LubanApp {
                             .child(name)
                             .on_click(move |event, window, cx| {
                                 let modifiers = event.modifiers();
+                                let click_count = event.click_count();
                                 let _ = weak_file.update(cx, |this, cx| {
-                                    this.file_dialog_click(row, path.clone(), modifiers, window, cx)
+                                    if click_count > 1 {
+                                        this.file_dialog_double_click(path.clone(), window, cx);
+                                    } else {
+                                        this.file_dialog_click(
+                                            row,
+                                            path.clone(),
+                                            modifiers,
+                                            window,
+                                            cx,
+                                        );
+                                    }
                                 });
                             })
                             .into_any_element(),
@@ -6073,6 +6157,9 @@ impl Render for LubanApp {
                 }),
             )
             .capture_key_down(key_listener)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.open_dropped_paths(paths.paths(), window, cx);
+            }))
             .child(chrome);
         if let Some(toolbar) = toolbar {
             root = root.child(toolbar);

@@ -653,6 +653,9 @@ status.batch_opened:
 status.batch_open_partial:
   en: "Opened %{opened} files, %{failed} failed"
   zh-CN: "已打开 %{opened} 个文件，%{failed} 个失败"
+status.drop_no_files:
+  en: "No files to open in the dropped items"
+  zh-CN: "拖入的内容中没有可打开的文件"
 status.opening:
   en: "Opening %{path}…"
   zh-CN: "正在打开 %{path}…"

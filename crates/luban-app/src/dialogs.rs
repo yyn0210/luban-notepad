@@ -133,6 +133,11 @@ pub struct FileDialogState {
     pub active: Option<usize>,
     /// Row from which Shift-selection extends.
     pub anchor: Option<usize>,
+    /// Path clicked by the most recent single click. A double click only opens
+    /// a file when that click sequence started on the same path: after a
+    /// double click on a directory the first click already navigated, so the
+    /// second one lands on rows of the new listing.
+    pub last_click: Option<PathBuf>,
     pub filter: FileFilter,
     pub loading: bool,
     /// Incremented on every directory listing; stale results are discarded.
@@ -157,6 +162,7 @@ impl FileDialogState {
             selected: BTreeSet::new(),
             active: None,
             anchor: None,
+            last_click: None,
             filter: FileFilter::All,
             loading: false,
             generation: 0,
@@ -294,6 +300,25 @@ impl FileDialogState {
             }
             _ => self.selected.clear(),
         }
+    }
+
+    /// Select the file a double click should open and report whether the
+    /// dialog can open it. Only the Open dialog opens files, and both clicks
+    /// must have landed on the same visible file so the second click of a
+    /// directory double click cannot open an unrelated row.
+    pub fn prepare_double_click_open(&mut self, path: &Path) -> bool {
+        if self.mode != FileDialogMode::Open || self.last_click.as_deref() != Some(path) {
+            return false;
+        }
+        let visible = self
+            .entries
+            .iter()
+            .any(|entry| !entry.is_dir && entry.path == path && self.filter.matches(&entry.name));
+        if !visible {
+            return false;
+        }
+        self.select_only(path);
+        true
     }
 
     /// Add every file between the anchor row and `row` to the selection.
@@ -572,6 +597,36 @@ mod tests {
         dialog.select_row(0);
         assert_eq!(dialog.active, Some(0));
         assert_eq!(dialog.selected_count(), 0);
+    }
+
+    #[test]
+    fn double_click_opens_only_the_same_visible_file_in_open_mode() {
+        let mut dialog = state(vec![entry("dir", true), entry("notes.md", false)]);
+        let path = PathBuf::from("/tmp/notes.md");
+
+        // The first click of the sequence must have landed on the file.
+        assert!(!dialog.prepare_double_click_open(&path));
+        dialog.last_click = Some(path.clone());
+        assert!(dialog.prepare_double_click_open(&path));
+        assert_eq!(dialog.selected_in_visible_order(), vec![path.clone()]);
+
+        // The click sequence moved on to another row, e.g. because the first
+        // click entered a directory.
+        dialog.last_click = Some(PathBuf::from("/tmp/dir"));
+        assert!(!dialog.prepare_double_click_open(&path));
+
+        let mut save = FileDialogState::new(
+            FileDialogMode::Save,
+            FileDialogPurpose::SaveAs {
+                tab_id: 1,
+                then: SaveThen::Nothing,
+            },
+            PathBuf::from("/tmp"),
+            vec![entry("notes.md", false)],
+        );
+        save.last_click = Some(path.clone());
+        assert!(!save.prepare_double_click_open(&path));
+        assert_eq!(save.selected_count(), 0);
     }
 
     #[test]
