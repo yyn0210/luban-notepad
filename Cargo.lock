@@ -3708,6 +3708,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
+ "x11rb",
 ]
 
 [[package]]
