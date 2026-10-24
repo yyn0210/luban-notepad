@@ -273,50 +273,6 @@ fn char_columns(ch: char) -> usize {
     }
 }
 
-#[cfg(test)]
-mod menu_label_tests {
-    use super::{char_columns, truncate_middle};
-
-    fn columns(text: &str) -> usize {
-        text.chars().map(char_columns).sum()
-    }
-
-    #[test]
-    fn short_labels_are_left_alone() {
-        let text = "Recent: src/main.rs";
-        assert_eq!(truncate_middle(text, 48), text);
-        assert_eq!(truncate_middle("", 48), "");
-    }
-
-    #[test]
-    fn long_labels_keep_both_ends_and_fit_the_budget() {
-        let text = "/home/user/Documents/projects/very-long-file-name.txt";
-        let label = truncate_middle(text, 48);
-        assert!(label.starts_with("/home/"));
-        assert!(label.ends_with(".txt"));
-        assert_eq!(label.matches('…').count(), 1);
-        assert!(columns(&label) <= 48);
-    }
-
-    #[test]
-    fn wide_characters_consume_two_columns() {
-        assert_eq!(char_columns('a'), 1);
-        assert_eq!(char_columns('多'), 2);
-
-        let text = "多".repeat(40);
-        let label = truncate_middle(&text, 20);
-        assert!(columns(&label) <= 20);
-        assert_eq!(label.matches('…').count(), 1);
-        assert!(label.starts_with('多'));
-        assert!(label.ends_with('多'));
-    }
-
-    #[test]
-    fn zero_budget_yields_nothing() {
-        assert_eq!(truncate_middle("abc", 0), "");
-    }
-}
-
 impl LubanApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, options: LaunchOptions) -> Self {
         let settings = Settings::load();
@@ -6138,5 +6094,49 @@ impl Render for LubanApp {
         }
         root = root.children(overlays);
         root
+    }
+}
+
+#[cfg(test)]
+mod menu_label_tests {
+    use super::{char_columns, truncate_middle};
+
+    fn columns(text: &str) -> usize {
+        text.chars().map(char_columns).sum()
+    }
+
+    #[test]
+    fn short_labels_are_left_alone() {
+        let text = "Recent: src/main.rs";
+        assert_eq!(truncate_middle(text, 48), text);
+        assert_eq!(truncate_middle("", 48), "");
+    }
+
+    #[test]
+    fn long_labels_keep_both_ends_and_fit_the_budget() {
+        let text = "/home/user/Documents/projects/very-long-file-name.txt";
+        let label = truncate_middle(text, 48);
+        assert!(label.starts_with("/home/"));
+        assert!(label.ends_with(".txt"));
+        assert_eq!(label.matches('…').count(), 1);
+        assert!(columns(&label) <= 48);
+    }
+
+    #[test]
+    fn wide_characters_consume_two_columns() {
+        assert_eq!(char_columns('a'), 1);
+        assert_eq!(char_columns('多'), 2);
+
+        let text = "多".repeat(40);
+        let label = truncate_middle(&text, 20);
+        assert!(columns(&label) <= 20);
+        assert_eq!(label.matches('…').count(), 1);
+        assert!(label.starts_with('多'));
+        assert!(label.ends_with('多'));
+    }
+
+    #[test]
+    fn zero_budget_yields_nothing() {
+        assert_eq!(truncate_middle("abc", 0), "");
     }
 }
