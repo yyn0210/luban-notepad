@@ -30,6 +30,75 @@ pub enum RangeField {
     Size,
 }
 
+/// The sliders use a normalized `0..=1` track, so the default step of 1.0
+/// would collapse every drag to the two endpoints.
+const SLIDER_STEP: f32 = 0.001;
+
+fn new_slider_state() -> SliderState {
+    SliderState::new()
+        .min(0.0)
+        .max(1.0)
+        .step(SLIDER_STEP)
+        .default_value(0.0)
+}
+
+/// Map a slider position to the byte value of `field`.
+fn slider_value(field: RangeField, ratio: f32, selection: &RangeSelection) -> u64 {
+    let total = selection.total();
+    let from = selection.from();
+    let ratio = f64::from(ratio.clamp(0.0, 1.0));
+    match field {
+        RangeField::From => {
+            let span = total.saturating_sub(1);
+            (ratio * span as f64).round() as u64
+        }
+        RangeField::To => {
+            let start = (from + 1).min(total);
+            let span = total.saturating_sub(start);
+            start + (ratio * span as f64).round() as u64
+        }
+        RangeField::Size => {
+            let span = total.saturating_sub(from);
+            1 + (ratio * span.saturating_sub(1) as f64).round() as u64
+        }
+    }
+}
+
+/// The slider position that represents `field` in `selection`.
+fn slider_ratio(field: RangeField, selection: &RangeSelection) -> f32 {
+    let total = selection.total();
+    let from = selection.from();
+    let to = selection.to();
+    let size = selection.size();
+    let ratio = match field {
+        RangeField::From => {
+            if total > 1 {
+                from as f32 / (total - 1) as f32
+            } else {
+                0.0
+            }
+        }
+        RangeField::To => {
+            let start = (from + 1).min(total);
+            let span = total.saturating_sub(start);
+            if span > 0 {
+                to.saturating_sub(start) as f32 / span as f32
+            } else {
+                0.0
+            }
+        }
+        RangeField::Size => {
+            let span = total.saturating_sub(from);
+            if span > 1 {
+                size.saturating_sub(1) as f32 / (span - 1) as f32
+            } else {
+                0.0
+            }
+        }
+    };
+    ratio.clamp(0.0, 1.0)
+}
+
 /// A file the controller can load.
 #[derive(Clone, Debug)]
 pub struct LargeFileTarget {
@@ -80,9 +149,7 @@ impl LargeFilePanel {
         let from_input = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
         let to_input = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
         let size_input = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
-        let slider = |cx: &mut Context<LubanApp>| {
-            cx.new(|_| SliderState::new().min(0.0).max(1.0).default_value(0.0))
-        };
+        let slider = |cx: &mut Context<LubanApp>| cx.new(|_| new_slider_state());
         Self {
             open: false,
             target: None,
@@ -278,27 +345,13 @@ impl LargeFilePanel {
             RangeField::From => self.from_slider.read(cx).value().end(),
             RangeField::To => self.to_slider.read(cx).value().end(),
             RangeField::Size => self.size_slider.read(cx).value().end(),
-        }
-        .clamp(0.0, 1.0);
-        let from = self.selection.from();
-        match field {
-            RangeField::From => {
-                let span = total.saturating_sub(1);
-                let value = (f64::from(ratio) * span as f64).round() as u64;
-                let _ = self.selection.set_from(value);
-            }
-            RangeField::To => {
-                let start = (from + 1).min(total);
-                let span = total.saturating_sub(start);
-                let value = start + (f64::from(ratio) * span as f64).round() as u64;
-                let _ = self.selection.set_to(value);
-            }
-            RangeField::Size => {
-                let span = total.saturating_sub(from);
-                let value = 1 + (f64::from(ratio) * span.saturating_sub(1) as f64).round() as u64;
-                let _ = self.selection.set_size(value);
-            }
-        }
+        };
+        let value = slider_value(field, ratio, &self.selection);
+        let _ = match field {
+            RangeField::From => self.selection.set_from(value),
+            RangeField::To => self.selection.set_to(value),
+            RangeField::Size => self.selection.set_size(value),
+        };
         self.error = None;
         self.status = None;
         self.sync_inputs_except(None, window, cx);
@@ -419,36 +472,19 @@ impl LargeFilePanel {
         window: &mut Window,
         cx: &mut Context<LubanApp>,
     ) {
-        let total = self.selection.total();
-        let from = self.selection.from();
-        let to = self.selection.to();
-        let size = self.selection.size();
         let ratios = [
             (
                 RangeField::From,
-                if total > 1 {
-                    from as f32 / (total - 1) as f32
-                } else {
-                    0.0
-                },
+                slider_ratio(RangeField::From, &self.selection),
             ),
-            (RangeField::To, {
-                let start = (from + 1).min(total);
-                let span = total.saturating_sub(start);
-                if span > 0 {
-                    (to.saturating_sub(start)) as f32 / span as f32
-                } else {
-                    0.0
-                }
-            }),
-            (RangeField::Size, {
-                let span = total.saturating_sub(from);
-                if span > 1 {
-                    (size.saturating_sub(1)) as f32 / (span - 1) as f32
-                } else {
-                    0.0
-                }
-            }),
+            (
+                RangeField::To,
+                slider_ratio(RangeField::To, &self.selection),
+            ),
+            (
+                RangeField::Size,
+                slider_ratio(RangeField::Size, &self.selection),
+            ),
         ];
         for (field, ratio) in ratios {
             if Some(field) == except {
@@ -460,7 +496,7 @@ impl LargeFilePanel {
                 RangeField::Size => self.size_slider.clone(),
             };
             slider.update(cx, |state, cx| {
-                state.set_value(SliderValue::Single(ratio.clamp(0.0, 1.0)), window, cx)
+                state.set_value(SliderValue::Single(ratio), window, cx)
             });
         }
     }
@@ -876,5 +912,71 @@ pub fn available_space(path: &Path) -> Option<u64> {
     {
         let _ = path;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{new_slider_state, slider_ratio, slider_value, RangeField, SLIDER_STEP};
+    use luban_core::large_file::RangeSelection;
+
+    fn selection_value(field: RangeField, selection: &RangeSelection) -> u64 {
+        match field {
+            RangeField::From => selection.from(),
+            RangeField::To => selection.to(),
+            RangeField::Size => selection.size(),
+        }
+    }
+
+    #[test]
+    fn sliders_use_a_fine_step() {
+        let slider = new_slider_state();
+        assert_eq!(slider.min_value(), 0.0);
+        assert_eq!(slider.max_value(), 1.0);
+        assert!(slider.step_value() > 0.0);
+        assert!(
+            slider.step_value() <= SLIDER_STEP,
+            "a coarse step would squeeze every drag onto the track ends"
+        );
+    }
+
+    #[test]
+    fn slider_values_cover_the_whole_range() {
+        let selection = RangeSelection::new(1000, 100);
+        assert_eq!(slider_value(RangeField::From, 0.0, &selection), 0);
+        assert_eq!(slider_value(RangeField::From, 1.0, &selection), 999);
+        assert_eq!(slider_value(RangeField::To, 0.0, &selection), 1);
+        assert_eq!(slider_value(RangeField::To, 1.0, &selection), 1000);
+        assert_eq!(slider_value(RangeField::Size, 0.0, &selection), 1);
+        assert_eq!(slider_value(RangeField::Size, 1.0, &selection), 1000);
+    }
+
+    #[test]
+    fn slider_midpoints_produce_intermediate_values() {
+        let selection = RangeSelection::new(1000, 100);
+        assert_eq!(slider_value(RangeField::From, 0.5, &selection), 500);
+        assert_eq!(slider_value(RangeField::To, 0.5, &selection), 501);
+        assert_eq!(slider_value(RangeField::Size, 0.5, &selection), 501);
+    }
+
+    #[test]
+    fn slider_mapping_considers_the_current_start() {
+        let mut selection = RangeSelection::new(1000, 100);
+        selection.set_from(400).unwrap();
+        assert_eq!(slider_value(RangeField::To, 0.0, &selection), 401);
+        assert_eq!(slider_value(RangeField::Size, 0.0, &selection), 1);
+        assert_eq!(slider_value(RangeField::Size, 1.0, &selection), 600);
+    }
+
+    #[test]
+    fn slider_positions_round_trip() {
+        let mut selection = RangeSelection::new(1000, 100);
+        selection.set_from(250).unwrap();
+        selection.set_to(750).unwrap();
+        for field in [RangeField::From, RangeField::To, RangeField::Size] {
+            let ratio = slider_ratio(field, &selection);
+            let value = slider_value(field, ratio, &selection);
+            assert_eq!(value, selection_value(field, &selection));
+        }
     }
 }
