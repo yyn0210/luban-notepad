@@ -56,67 +56,92 @@ fn parse_args() -> LaunchOptions {
         files,
         new_window,
         smoke_test,
+        manual_window_chrome: manual_window_chrome(),
     }
 }
 
-/// Client-side decorations reserve a transparent margin around the window for
-/// the shadow. Only a compositor can blend that margin; without one it is
-/// painted black, so fall back to server-side decorations in that case.
-fn use_client_decorations() -> bool {
+/// Whether the application removes the window-manager titlebar itself.
+///
+/// On X11, gpui-component's root view reserves a 20px transparent margin for a
+/// client-side shadow. Only a compositor can blend that margin; without one it
+/// is painted black. The window is therefore created with server decorations
+/// (no shadow margin) and its titlebar is removed through `_MOTIF_WM_HINTS`
+/// after creation. Wayland always composites, so it keeps client decorations.
+fn manual_window_chrome() -> bool {
     #[cfg(target_os = "linux")]
     {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|display| !display.is_empty()) {
-            // Wayland always composites.
-            return true;
-        }
-        x11_compositor_present().unwrap_or(false)
+        std::env::var_os("WAYLAND_DISPLAY").is_none_or(|display| display.is_empty())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        true
+        false
     }
 }
 
-/// Whether a compositing manager owns the `_NET_WM_CM_Sn` selection. GPUI's
-/// own check also accepts `_NET_SUPPORTING_WM_CHECK`, which stays present when
-/// the window manager runs without compositing.
+/// Remove the window-manager titlebar and border from the undecorated X11
+/// window, leaving the client area to the application-drawn titlebar. Returns
+/// whether the hint had to be written.
 #[cfg(target_os = "linux")]
-fn x11_compositor_present() -> Option<bool> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+fn apply_borderless_hint(window: &Window) -> anyhow::Result<bool> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
 
-    let (connection, screen_index) = x11rb::connect(None).ok()?;
-    let root = connection.setup().roots.get(screen_index)?.root;
+    let xid = match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Xlib(handle)) => handle.window as u32,
+        Ok(RawWindowHandle::Xcb(handle)) => handle.window.get(),
+        Ok(other) => anyhow::bail!("cannot remove window decorations from {other:?}"),
+        Err(error) => anyhow::bail!("cannot read the X11 window handle: {error}"),
+    };
 
-    let selection = connection
-        .intern_atom(false, format!("_NET_WM_CM_S{screen_index}").as_bytes())
-        .ok()?
-        .reply()
-        .ok()?
+    let (connection, _) = x11rb::connect(None)?;
+    let motif = connection
+        .intern_atom(false, b"_MOTIF_WM_HINTS")?
+        .reply()?
         .atom;
-    let owner = connection
-        .get_selection_owner(selection)
-        .ok()?
-        .reply()
-        .ok()?
-        .owner;
-    if owner != x11rb::NONE {
-        return Some(true);
+    let current = connection
+        .get_property(false, xid, motif, AtomEnum::ANY, 0, 5)?
+        .reply()?;
+    let desired = [2u32, 0, 0, 0, 0];
+    if current
+        .value32()
+        .is_some_and(|values| values.take(5).collect::<Vec<_>>() == desired)
+    {
+        return Ok(false);
     }
 
-    // Some compositors only publish the owner property.
-    let property = connection
-        .intern_atom(false, b"_NET_WM_CM_OWNER")
-        .ok()?
-        .reply()
-        .ok()?
-        .atom;
-    let reply = connection
-        .get_property(false, root, property, AtomEnum::WINDOW, 0, 1)
-        .ok()?
-        .reply()
-        .ok()?;
-    Some(reply.value_len > 0)
+    // [flags, functions, decorations, input_mode, status]: remove the window
+    // manager decorations while leaving everything else alone.
+    let data: Vec<u8> = desired
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect();
+    connection.change_property(PropMode::REPLACE, xid, motif, motif, 32, 5, &data)?;
+    connection.flush()?;
+    Ok(true)
+}
+
+/// Remove the window-manager titlebar and keep it removed while the window
+/// manager finishes managing the freshly mapped window.
+#[cfg(target_os = "linux")]
+fn remove_window_decorations(handle: AnyWindowHandle, cx: &mut App) {
+    let _ = handle.update(cx, |_, window, _| match apply_borderless_hint(window) {
+        Ok(true) => log::info!("removed the window manager titlebar"),
+        Ok(false) => {}
+        Err(error) => log::warn!("failed to remove the window manager titlebar: {error:#}"),
+    });
+
+    cx.spawn(async move |cx| {
+        for delay in [120u64, 350, 800] {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(delay))
+                .await;
+            let _ = handle.update(cx, |_, window, _| {
+                let _ = apply_borderless_hint(window);
+            });
+        }
+    })
+    .detach();
 }
 
 /// Decode the icon embedded in the binary so the taskbar entry is correct even
@@ -153,32 +178,28 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-            let client_decorations = use_client_decorations();
-            log::info!(
-                "using {} window decorations",
-                if client_decorations {
-                    "client-side"
-                } else {
-                    "server-side (no compositor)"
-                }
-            );
+            let manual_chrome = options.manual_window_chrome;
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Luban Notepad".into()),
                     ..TitleBar::title_bar_options()
                 }),
-                // The application draws its own title bar on every desktop.
-                // Without a compositor the shadow margin cannot blend, so ask
-                // the window manager for server-side decorations instead.
-                window_decorations: Some(if client_decorations {
-                    WindowDecorations::Client
-                } else {
+                // X11 asks for server decorations and removes the titlebar
+                // itself, because client decorations add a transparent shadow
+                // margin that cannot blend without a compositor. Every other
+                // platform requests client decorations and lets the platform
+                // report whether it can honour them; the render path falls back
+                // to a standalone menu row when it cannot.
+                window_decorations: Some(if manual_chrome {
                     WindowDecorations::Server
+                } else {
+                    WindowDecorations::Client
                 }),
-                // Client-side decorations composite their shadow over the
-                // transparent margin; an opaque window would paint it black.
-                window_background: if cfg!(target_os = "linux") && client_decorations {
+                // A manually decorated window has no shadow margin and needs no
+                // compositor to blend its surface. Client decorations on Linux
+                // do use a transparent margin, so that path stays transparent.
+                window_background: if cfg!(target_os = "linux") && !manual_chrome {
                     WindowBackgroundAppearance::Transparent
                 } else {
                     WindowBackgroundAppearance::Opaque
@@ -190,13 +211,23 @@ fn main() {
                 ..TitleBar::window_options()
             };
             let result = gpui_kit::open_window(window_options, cx, |window, cx| {
+                log::info!("window decorations: {:?}", window.window_decorations());
                 cx.new(|cx| app::LubanApp::new(window, cx, options))
             });
-            if let Err(error) = result {
-                log::error!("failed to open Luban Notepad window: {error:#}");
-                cx.quit();
-                return;
+            let handle = match result {
+                Ok((handle, _)) => handle,
+                Err(error) => {
+                    log::error!("failed to open Luban Notepad window: {error:#}");
+                    cx.quit();
+                    return;
+                }
+            };
+            #[cfg(target_os = "linux")]
+            if manual_chrome {
+                remove_window_decorations(handle, cx);
             }
+            #[cfg(not(target_os = "linux"))]
+            let _ = handle;
             cx.activate(true);
         });
 }

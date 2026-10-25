@@ -26,6 +26,7 @@ serde_json.workspace = true
 walkdir.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
 x11rb = "0.13"
 
 [target.'cfg(unix)'.dependencies]

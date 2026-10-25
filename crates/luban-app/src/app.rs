@@ -51,6 +51,10 @@ pub struct LaunchOptions {
     pub files: Vec<PathBuf>,
     pub new_window: bool,
     pub smoke_test: bool,
+    /// The platform has no client-decorated shadow margin to blend against, so
+    /// the application removes the window manager titlebar itself and draws the
+    /// chrome for every window state.
+    pub manual_window_chrome: bool,
 }
 
 pub struct Tab {
@@ -232,6 +236,7 @@ pub struct LubanApp {
     allow_close: bool,
     focus_editor: bool,
     smoke_test: bool,
+    manual_window_chrome: bool,
     pending_exit_saves: Vec<u64>,
     pending_close_saves: Vec<u64>,
     pending_find_next: bool,
@@ -365,6 +370,7 @@ impl LubanApp {
             allow_close: false,
             focus_editor: true,
             smoke_test: options.smoke_test,
+            manual_window_chrome: options.manual_window_chrome,
             pending_exit_saves: Vec::new(),
             pending_close_saves: Vec::new(),
             pending_find_next: false,
@@ -4615,9 +4621,16 @@ impl LubanApp {
     /// The application title bar owns the window chrome: application name,
     /// menus, and (on Windows/Linux) the window control buttons. The document
     /// name stays in the tab bar; the native window title is set separately.
-    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_title_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let menus = self.render_menu_buttons(cx);
         let weak = cx.weak_entity();
+
+        #[cfg(target_os = "linux")]
+        let manual_controls = self
+            .manual_window_chrome
+            .then(|| Self::render_manual_window_controls(&weak, window, cx));
+        #[cfg(not(target_os = "linux"))]
+        let manual_controls: Option<AnyElement> = None;
 
         TitleBar::new()
             .child(
@@ -4636,6 +4649,9 @@ impl LubanApp {
                     )
                     .child(div().flex_shrink_0().child(menus)),
             )
+            .when_some(manual_controls, |title_bar, controls| {
+                title_bar.child(controls)
+            })
             // `on_close_window` only takes effect on Linux, where the custom
             // close button must go through the same unsaved-changes flow as
             // the window manager's close request.
@@ -4647,6 +4663,108 @@ impl LubanApp {
                     cx.quit();
                 }
             })
+            .into_any_element()
+    }
+
+    /// Window controls for the manually decorated X11 window. `TitleBar` omits
+    /// its own controls whenever the platform reports server decorations, which
+    /// is the state the window is created in to avoid the shadow margin, so the
+    /// application draws them with the same sizes and hover colours.
+    #[cfg(target_os = "linux")]
+    fn render_manual_window_controls(
+        weak: &gpui::WeakEntity<Self>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use gpui_kit::component::{
+            Icon, IconName as ComponentIcon, Sizable as _, TITLE_BAR_HEIGHT,
+        };
+
+        #[derive(Clone, Copy)]
+        enum Action {
+            Minimize,
+            Maximize,
+            Close,
+        }
+
+        let supported = window.window_controls();
+        let theme = cx.theme();
+        let foreground = theme.colors.foreground;
+
+        let control = |id: &'static str, icon: ComponentIcon, action: Action, close: bool| {
+            let weak = weak.clone();
+            let hover_bg = if close {
+                theme.danger
+            } else {
+                theme.colors.secondary_hover
+            };
+            let hover_fg = if close {
+                theme.danger_foreground
+            } else {
+                theme.colors.secondary_foreground
+            };
+
+            div()
+                .id(id)
+                .flex()
+                .w(TITLE_BAR_HEIGHT)
+                .h_full()
+                .flex_shrink_0()
+                .justify_center()
+                .items_center()
+                .text_color(foreground)
+                .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    match action {
+                        Action::Minimize => window.minimize_window(),
+                        Action::Maximize => window.zoom_window(),
+                        Action::Close => {
+                            let should_close = weak
+                                .update(cx, |this, cx| this.on_should_close(window, cx))
+                                .unwrap_or(true);
+                            if should_close {
+                                cx.quit();
+                            }
+                        }
+                    }
+                })
+                .child(Icon::new(icon).small())
+        };
+
+        let mut controls = div().flex().flex_shrink_0().items_center().h_full();
+        if supported.minimize {
+            controls = controls.child(control(
+                "window-control-minimize",
+                ComponentIcon::WindowMinimize,
+                Action::Minimize,
+                false,
+            ));
+        }
+        if supported.maximize {
+            let icon = if window.is_maximized() {
+                ComponentIcon::WindowRestore
+            } else {
+                ComponentIcon::WindowMaximize
+            };
+            controls = controls.child(control(
+                "window-control-maximize",
+                icon,
+                Action::Maximize,
+                false,
+            ));
+        }
+        controls
+            .child(control(
+                "window-control-close",
+                ComponentIcon::WindowClose,
+                Action::Close,
+                true,
+            ))
             .into_any_element()
     }
 
@@ -6781,13 +6899,14 @@ impl Render for LubanApp {
         let show_find = self.find.open;
         let overlays = self.render_overlays(window, cx);
 
-        // Draw our own title bar unless Linux fell back to server-side
+        // Draw our own title bar unless the platform really provides server-side
         // decorations; in that case the window manager already owns the title
         // bar, and the menus keep their own row.
-        let use_custom_title_bar = !cfg!(target_os = "linux")
+        let use_custom_title_bar = self.manual_window_chrome
+            || !cfg!(target_os = "linux")
             || matches!(window.window_decorations(), Decorations::Client { .. });
         let chrome = if use_custom_title_bar {
-            self.render_title_bar(cx)
+            self.render_title_bar(window, cx)
         } else {
             self.render_menu_bar(window, cx)
         };
@@ -6869,8 +6988,41 @@ impl Render for LubanApp {
             root = root.child(status_bar);
         }
         root = root.children(overlays);
-        root
+
+        // The titlebar is drawn by the application on X11 even though the
+        // platform reports server decorations: the titlebar was removed with
+        // `_MOTIF_WM_HINTS`, and server decorations keep the root view free of
+        // the transparent shadow margin that a compositor would have to blend.
+        #[cfg(target_os = "linux")]
+        if self.manual_window_chrome {
+            return client_decorated_frame(
+                root.into_any_element(),
+                cx.theme().colors.border,
+                window.is_maximized(),
+            );
+        }
+
+        root.into_any_element()
     }
+}
+
+/// Wrap a manually decorated Linux window in a hairline border. The window
+/// manager keeps its invisible resize border around the undecorated client, so
+/// the application only contributes the visible edge; a maximized window needs
+/// neither.
+#[cfg(target_os = "linux")]
+fn client_decorated_frame(root: AnyElement, border: Hsla, maximized: bool) -> AnyElement {
+    if maximized {
+        return root;
+    }
+
+    div()
+        .size_full()
+        .overflow_hidden()
+        .border_1()
+        .border_color(border)
+        .child(root)
+        .into_any_element()
 }
 
 #[cfg(test)]

@@ -3703,6 +3703,7 @@ dependencies = [
  "libc",
  "log",
  "luban-core",
+ "raw-window-handle",
  "rust-i18n",
  "serde",
  "serde-saphyr",
