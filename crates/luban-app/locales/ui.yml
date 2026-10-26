@@ -858,3 +858,103 @@ lfc.error.zero_size:
 lfc.error.empty_file:
   en: "The file is empty."
   zh-CN: "文件为空。"
+
+status.huge_file:
+  en: "Disk engine"
+  zh-CN: "磁盘引擎"
+status.huge_window:
+  en: "Window Ln %{start}–%{end} of %{total}"
+  zh-CN: "窗口 行 %{start}–%{end} / 共 %{total}"
+status.huge_indexing:
+  en: "Indexing… %{percent}%"
+  zh-CN: "正在建立索引… %{percent}%"
+status.huge_saving:
+  en: "Saving…"
+  zh-CN: "正在保存…"
+status.huge_saving_percent:
+  en: "Saving… %{percent}%"
+  zh-CN: "正在保存… %{percent}%"
+status.huge_no_space:
+  en: "Not enough disk space (need %{needed}, free %{free})."
+  zh-CN: "磁盘空间不足（需要 %{needed}，可用 %{free}）。"
+status.huge_busy:
+  en: "A save or search is running in this tab."
+  zh-CN: "该标签页正在保存或查找。"
+status.huge_op_unavailable:
+  en: "This command is unavailable in disk-engine mode."
+  zh-CN: "磁盘引擎模式下不支持此操作。"
+status.huge_undo:
+  en: "Undo"
+  zh-CN: "撤销"
+status.huge_redo:
+  en: "Redo"
+  zh-CN: "重做"
+status.huge_no_history:
+  en: "Nothing to undo or redo."
+  zh-CN: "没有可撤销或重做的操作。"
+status.huge_reloading:
+  en: "Reloading…"
+  zh-CN: "正在重新加载…"
+status.opened_huge:
+  en: "Opened %{path} with the disk engine."
+  zh-CN: "已用磁盘引擎打开 %{path}。"
+find.huge_searching:
+  en: "Searching the whole file…"
+  zh-CN: "正在搜索整个文件…"
+find.huge_match_at:
+  en: "Match at line %{line}"
+  zh-CN: "匹配位于第 %{line} 行"
+find.huge_replace_all_running:
+  en: "Replacing all matches…"
+  zh-CN: "正在全部替换…"
+find.stopped:
+  en: "Search stopped"
+  zh-CN: "搜索已停止"
+confirm.overwrite_external_title:
+  en: "File changed on disk: %{name}"
+  zh-CN: "文件已在磁盘上修改：%{name}"
+confirm.overwrite_external_detail:
+  en: "Saving overwrites the file on disk. Choose Overwrite to continue, or Cancel to stop and keep the original."
+  zh-CN: "继续保存会覆盖磁盘上的内容。选择“覆盖”继续，选择“取消”停止并保留原文件。"
+confirm.overwrite_yes:
+  en: "Overwrite"
+  zh-CN: "覆盖"
+confirm.overwrite_no:
+  en: "Cancel"
+  zh-CN: "取消"
+confirm.reload_title:
+  en: "Reload and discard unsaved changes?"
+  zh-CN: "重新加载并放弃未保存的修改？"
+confirm.reload_detail:
+  en: "The disk-engine document has unsaved edits. Save them first or discard them and reload from disk."
+  zh-CN: "磁盘引擎文档有未保存的修改。可以先保存，或放弃修改后从磁盘重新加载。"
+confirm.reload_save:
+  en: "Save and Reload"
+  zh-CN: "保存并重新加载"
+confirm.reload_discard:
+  en: "Discard and Reload"
+  zh-CN: "放弃修改并重新加载"
+lfc.engine:
+  en: "Mode:"
+  zh-CN: "方式："
+lfc.engine_value:
+  en: "Disk engine (windowed editing)"
+  zh-CN: "磁盘引擎（窗口化编辑）"
+lfc.mode.whole_engine:
+  en: "Open whole file (disk engine)"
+  zh-CN: "打开整个文件（磁盘引擎）"
+find.huge_searching_percent:
+  en: "Searching… %{percent}%"
+  zh-CN: "正在搜索… %{percent}%"
+status.huge_continuation:
+  en: " (starts mid-line)"
+  zh-CN: "（以续行开始）"
+find.find_all:
+  en: "Find All"
+  zh-CN: "查找全部"
+find.huge_result:
+  en: "Ln %{line}"
+  zh-CN: "行 %{line}"
+status.huge_history_trimmed:
+  en: "Undo history limit reached; the oldest edits can no longer be undone."
+  zh-CN: "撤销历史已达上限，最早的修改将无法撤销。"

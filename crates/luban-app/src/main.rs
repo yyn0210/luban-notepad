@@ -9,6 +9,7 @@ mod app;
 mod dialogs;
 mod explorer;
 mod find;
+mod huge_file;
 mod i18n;
 mod icons;
 mod large_file;
@@ -159,6 +160,9 @@ fn window_icon() -> Option<Arc<image::RgbaImage>> {
 }
 
 fn main() {
+    // Remove journals left behind by terminated instances. Only directories
+    // older than a day are touched so another running instance is unaffected.
+    let _ = luban_core::disk_engine::cleanup_stale(std::time::Duration::from_secs(24 * 3600));
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("luban_notepad=info,gpui=warn"),
     )

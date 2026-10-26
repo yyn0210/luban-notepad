@@ -32,6 +32,10 @@ pub struct FindPanel {
     /// can skip rebuilding on unrelated renders.
     pub generation: u64,
     pub status: String,
+    /// Global matches collected by an explicit Find All on a disk-engine tab.
+    pub huge_results: Vec<luban_core::disk_engine::SearchHit>,
+    pub huge_limit: usize,
+    pub huge_truncated: bool,
 }
 
 impl FindPanel {
@@ -58,6 +62,9 @@ impl FindPanel {
             highlighted_revision: u64::MAX,
             generation: 0,
             status: String::new(),
+            huge_results: Vec::new(),
+            huge_limit: 5000,
+            huge_truncated: false,
         }
     }
 
@@ -163,6 +170,8 @@ impl FindPanel {
 
     pub fn clear(&mut self) {
         self.matches.clear();
+        self.huge_results.clear();
+        self.huge_truncated = false;
         self.current = None;
         self.error = None;
         self.status.clear();

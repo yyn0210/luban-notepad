@@ -98,7 +98,7 @@ impl Default for Settings {
             large_file_controller_threshold: 200 * 1024 * 1024,
             large_file_partial_size: 200 * 1024 * 1024,
             large_file_display_unit: SizeUnit::Bytes,
-            max_file_size_mb: 256,
+            max_file_size_mb: 1024,
             default_encoding: TextEncoding::Utf8,
             default_eol: Eol::native(),
             ui_language: default_ui_language(),
@@ -260,7 +260,7 @@ mod tests {
         assert!(s.show_line_numbers);
         assert!(s.restore_session);
         assert_eq!(s.default_encoding, TextEncoding::Utf8);
-        assert_eq!(s.max_file_size_bytes(), 256 * 1024 * 1024);
+        assert_eq!(s.max_file_size_bytes(), 1024 * 1024 * 1024);
         assert_eq!(s.large_file_threshold, 100 * 1024 * 1024);
         assert!(s.large_file_controller);
         assert_eq!(s.large_file_controller_threshold, 200 * 1024 * 1024);

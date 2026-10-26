@@ -374,6 +374,10 @@ pub enum CloseIntent {
     Tab(u64),
     AllTabs,
     Exit,
+    /// A disk-engine save found the file changed on disk; "save" overwrites.
+    OverwriteExternal(u64),
+    /// Reload a tab after discarding or saving its edits.
+    ReloadTab(u64),
 }
 
 pub struct ConfirmState {
@@ -398,6 +402,10 @@ pub enum SaveThen {
     CloseTab(u64),
     Exit,
     CloseAll,
+    /// Continue a queued Save All / Close All / Exit sequence.
+    NextHugeSave,
+    /// Reload the tab after saving it.
+    ReloadTab(u64),
 }
 
 pub struct SaveAsRequest {

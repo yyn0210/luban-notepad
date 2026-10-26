@@ -105,6 +105,8 @@ pub struct LargeFileTarget {
     pub path: PathBuf,
     pub size: u64,
     pub tab_id: Option<u64>,
+    /// The target is opened through the disk engine (windowed editor).
+    pub engine: bool,
 }
 
 /// Parameters for pointing the panel at a file.
@@ -116,6 +118,7 @@ pub struct PanelBinding {
     pub unit: SizeUnit,
     pub loaded: u64,
     pub whole: bool,
+    pub engine: bool,
 }
 
 pub struct LargeFilePanel {
@@ -190,6 +193,7 @@ impl LargeFilePanel {
             path: binding.path,
             size: binding.size,
             tab_id: binding.tab_id,
+            engine: binding.engine,
         });
         self.selection = RangeSelection::new(binding.size, binding.default_size);
         self.selection.set_mode(if binding.whole {
@@ -209,10 +213,11 @@ impl LargeFilePanel {
 
     /// Bind the panel to an already open document.
     pub fn bind(&mut self, binding: PanelBinding, window: &mut Window, cx: &mut Context<LubanApp>) {
-        let same = self
-            .target
-            .as_ref()
-            .is_some_and(|target| target.path == binding.path && target.size == binding.size);
+        let same = self.target.as_ref().is_some_and(|target| {
+            target.path == binding.path
+                && target.size == binding.size
+                && target.engine == binding.engine
+        });
         if same {
             self.bound_tab = binding.tab_id;
             self.loaded = binding.loaded;
@@ -222,6 +227,7 @@ impl LargeFilePanel {
             path: binding.path,
             size: binding.size,
             tab_id: binding.tab_id,
+            engine: binding.engine,
         });
         self.selection = RangeSelection::new(binding.size, binding.default_size);
         self.selection.set_mode(if binding.whole {
@@ -519,6 +525,7 @@ impl LargeFilePanel {
     pub fn render(
         &mut self,
         can_save_part: bool,
+        saving: bool,
         window: &mut Window,
         cx: &mut Context<LubanApp>,
     ) -> AnyElement {
@@ -604,6 +611,9 @@ impl LargeFilePanel {
         body = body
             .child(self.labeled_value(tr("lfc.file_size"), size_text, cx))
             .child(self.labeled_value(tr("lfc.opened"), loaded_text, cx));
+        if self.target.as_ref().is_some_and(|target| target.engine) {
+            body = body.child(self.labeled_value(tr("lfc.engine"), tr("lfc.engine_value"), cx));
+        }
 
         let weak_stop = weak.clone();
         body = body.child(
@@ -612,11 +622,15 @@ impl LargeFilePanel {
                 .ghost()
                 .compact()
                 .w_full()
-                .disabled(!self.loading)
+                .disabled(!self.loading && !saving)
                 .on_click(move |_, _, cx| {
                     let _ = weak_stop.update(cx, |this, cx| {
-                        if this.large_file.stop() {
-                            this.set_status(tr("lfc.stopped"), cx);
+                        if this.large_file.loading {
+                            if this.large_file.stop() {
+                                this.set_status(tr("lfc.stopped"), cx);
+                            }
+                        } else {
+                            this.cancel_huge_save(cx);
                         }
                         cx.notify();
                     });
@@ -644,7 +658,15 @@ impl LargeFilePanel {
                     .cursor_pointer()
                     .hover(|this| this.bg(cx.theme().colors.secondary))
                     .child(div().child(if selected { "●" } else { "○" }))
-                    .child(tr(mode.key()))
+                    .child({
+                        let engine_whole = mode == RangeMode::Whole
+                            && self.target.as_ref().is_some_and(|target| target.engine);
+                        if engine_whole {
+                            tr("lfc.mode.whole_engine")
+                        } else {
+                            tr(mode.key())
+                        }
+                    })
                     .on_click(move |_, window, cx| {
                         let _ = weak_mode.update(cx, |this, cx| {
                             this.large_file.set_mode(mode, window, cx);

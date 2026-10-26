@@ -108,3 +108,28 @@ core.search.invalid_regex:
 core.encoding.decode_failed:
   en: "could not decode input"
   zh-CN: "无法解码输入"
+
+core.disk_engine.not_text:
+  en: "the file does not look like text; use the partial-range open instead"
+  zh-CN: "该文件不是文本文件，请改用部分范围打开"
+core.disk_engine.corrupt_index:
+  en: "the disk-engine index is inconsistent; reload the file"
+  zh-CN: "磁盘引擎索引不一致，请重新加载文件"
+core.disk_engine.journal_corrupt:
+  en: "the edit journal is unreadable; save to another file to recover the text"
+  zh-CN: "编辑日志无法读取，请另存为新文件以保留内容"
+core.disk_engine.invalid_edit:
+  en: "the edit position is outside the document"
+  zh-CN: "编辑位置超出文档范围"
+core.disk_engine.save_in_progress:
+  en: "a save is in progress; editing resumes when it finishes"
+  zh-CN: "正在保存，保存完成后可以继续编辑"
+core.disk_engine.external_change:
+  en: "the file changed on disk after it was opened; reload it or save to another path"
+  zh-CN: "文件在打开后已被外部修改；请重新加载或另存为其他文件"
+core.document.huge_save_flow:
+  en: "disk-engine documents are saved through the background save flow"
+  zh-CN: "磁盘引擎文档需要通过后台保存流程写入"
+core.disk_engine.file_changed_during_index:
+  en: "the file changed while it was being indexed; open it again"
+  zh-CN: "文件在建立索引期间发生变化，请重新打开"

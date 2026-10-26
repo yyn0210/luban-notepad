@@ -30,6 +30,22 @@ pub struct SessionTab {
     pub range: Option<[u64; 2]>,
     /// Total size of the source file when the range was recorded.
     pub source_size: Option<u64>,
+    /// The tab is backed by the disk engine.
+    #[serde(default)]
+    pub huge: bool,
+    /// Global 1-based line restored for a disk-engine tab.
+    #[serde(default)]
+    pub huge_line: Option<u64>,
+    /// Global 1-based column restored for a disk-engine tab.
+    #[serde(default)]
+    pub huge_column: Option<u64>,
+    /// Scroll offset (lines from the top of the window) for a disk-engine tab.
+    #[serde(default)]
+    pub huge_scroll: Option<f32>,
+    /// Whether a disk-engine tab had unsaved edits. The edits themselves are
+    /// never written to the session.
+    #[serde(default)]
+    pub huge_modified: bool,
 }
 
 impl Default for SessionTab {
@@ -46,6 +62,11 @@ impl Default for SessionTab {
             modified: false,
             range: None,
             source_size: None,
+            huge: false,
+            huge_line: None,
+            huge_column: None,
+            huge_scroll: None,
+            huge_modified: false,
         }
     }
 }
@@ -155,6 +176,11 @@ mod tests {
                 modified: true,
                 range: Some([100, 4096]),
                 source_size: Some(8192),
+                huge: true,
+                huge_line: Some(42),
+                huge_column: Some(3),
+                huge_scroll: Some(1.5),
+                huge_modified: true,
             }],
             active_tab: 0,
             workspace_root: Some(PathBuf::from("/tmp")),
@@ -168,6 +194,11 @@ mod tests {
         assert_eq!(loaded.tabs[0].language, "Rust");
         assert_eq!(loaded.tabs[0].range, Some([100, 4096]));
         assert_eq!(loaded.tabs[0].source_size, Some(8192));
+        assert!(loaded.tabs[0].huge);
+        assert_eq!(loaded.tabs[0].huge_line, Some(42));
+        assert_eq!(loaded.tabs[0].huge_column, Some(3));
+        assert_eq!(loaded.tabs[0].huge_scroll, Some(1.5));
+        assert!(loaded.tabs[0].huge_modified);
         assert_eq!(loaded.workspace_root, Some(PathBuf::from("/tmp")));
     }
 

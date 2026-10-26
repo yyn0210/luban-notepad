@@ -20,13 +20,14 @@ use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
 use gpui_kit::component::{Selectable as _, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
+use luban_core::disk_engine::{DiskEngine, WindowText, WINDOW_BYTES};
 use luban_core::document::Document;
 use luban_core::encoding::TextEncoding;
 use luban_core::eol::{self, Eol};
 use luban_core::i18n::language_display_name;
 use luban_core::language;
 use luban_core::large_file::{format_bytes, RangeMode, SizeUnit};
-use luban_core::search::Match;
+use luban_core::search::{ByteMatch, Match};
 use luban_core::session::{Session, SessionTab};
 use luban_core::settings::{Settings, ThemeChoice};
 use luban_core::text as textutil;
@@ -41,6 +42,10 @@ use crate::dialogs::{
 };
 use crate::explorer::ExplorerState;
 use crate::find::{FindInFilesPanel, FindPanel};
+use crate::huge_file::{
+    diff_bytes, HugeFileUi, SaveJob, SearchJob, SearchKind, WindowRequest, WindowTarget,
+    EDGE_LINES, PREFETCH_LINES,
+};
 use crate::i18n::{active_language_name, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
 use crate::preferences::PreferencesState;
@@ -63,6 +68,8 @@ pub struct Tab {
     pub editor: Entity<EditorState>,
     pub decorations: RangeDecorationCollection,
     pub needs_sync: bool,
+    /// Present when the tab is backed by the disk engine.
+    pub huge: Option<HugeFileUi>,
     pub highlighted_revision: u64,
     /// Files at or above `Settings::large_file_threshold` open in a reduced
     /// mode: no syntax highlighting, wrapping, bracket matching or live find.
@@ -85,8 +92,13 @@ struct LargeLoadJob {
     path: PathBuf,
     generation: u64,
     cancel: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
+    /// Total bytes to read, used for the status percentage.
+    size: u64,
     /// Tab that should be replaced after the load succeeds.
     replace_tab: Option<u64>,
+    /// The load indexes a disk-engine document.
+    huge: bool,
 }
 
 /// A session tab prepared for loading on the background executor.
@@ -101,10 +113,41 @@ struct RestoreSpec {
     modified: bool,
     fallback_name: String,
     range: Option<[u64; 2]>,
+    huge: bool,
+    huge_line: Option<u64>,
+    huge_column: Option<u64>,
 }
 
 impl RestoreSpec {
     fn load(self, max_size: u64) -> Document {
+        if self.huge {
+            if let Some(path) = &self.path {
+                let cancel = AtomicBool::new(false);
+                let progress = AtomicU64::new(0);
+                let line = self.huge_line.unwrap_or(1);
+                match Document::open_huge(path, line, &cancel, &progress) {
+                    Ok(mut doc) => {
+                        let column = self.huge_column.unwrap_or(1);
+                        if let Some(huge) = doc.huge_mut() {
+                            let (offset, window) = {
+                                let engine = huge.read();
+                                let offset = engine.offset_for_line(line, column).unwrap_or(0);
+                                let window = engine.read_window(offset, WINDOW_BYTES).ok();
+                                (offset, window)
+                            };
+                            if let Some(window) = window {
+                                huge.initial_window = Some(window.clone());
+                                huge.cursor = offset.min(window.start.saturating_add(window.len));
+                                huge.anchor = huge.cursor;
+                                huge.scroll_line = window.line;
+                            }
+                        }
+                        return doc;
+                    }
+                    Err(err) => log::warn!("could not restore huge {}: {err}", path.display()),
+                }
+            }
+        }
         let mut doc = if let Some(path) = &self.path {
             let opened = Self::open_restored(path, self.range, max_size).or_else(|err| {
                 log::warn!("could not restore {}: {err}", path.display());
@@ -244,6 +287,16 @@ pub struct LubanApp {
     pending_file_confirm: bool,
     pending_go_to_line: bool,
     pending_close_all_after_saves: bool,
+    /// Huge tabs queued by Save All / Close All / Exit.
+    pending_huge_saves: Vec<u64>,
+    pending_huge_all: bool,
+    pending_huge_exit: bool,
+    /// A save waiting for the user to confirm overwriting an externally
+    /// modified file.
+    pending_huge_overwrite: Option<(u64, Option<PathBuf>, SaveThen)>,
+    /// Line/column to apply once a disk-engine open started from a search hit
+    /// has finished indexing.
+    pending_huge_at: Option<(PathBuf, u64, u64)>,
     window_title: String,
     window_width: f32,
     window_height: f32,
@@ -378,11 +431,50 @@ impl LubanApp {
             pending_file_confirm: false,
             pending_go_to_line: false,
             pending_close_all_after_saves: false,
+            pending_huge_saves: Vec::new(),
+            pending_huge_all: false,
+            pending_huge_exit: false,
+            pending_huge_overwrite: None,
+            pending_huge_at: None,
             window_title: "Luban Notepad".to_string(),
             window_width: 1280.0,
             window_height: 820.0,
             _subscriptions: Vec::new(),
         };
+
+        // The editor binds Ctrl+Z/Y and Ctrl+Home/End itself. Intercept them
+        // before action dispatch so disk-engine tabs use the engine history
+        // and the global document rather than the mounted window.
+        let weak_shortcuts = cx.weak_entity();
+        app._subscriptions
+            .push(cx.intercept_keystrokes(move |event, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if !(modifiers.secondary() || modifiers.control) {
+                    return;
+                }
+                let key = event.keystroke.key.to_ascii_lowercase();
+                if !matches!(key.as_str(), "z" | "y" | "home" | "end") {
+                    return;
+                }
+                let handled = weak_shortcuts
+                    .update(cx, |app, cx| {
+                        if !app.active_doc().is_some_and(Document::is_huge) {
+                            return false;
+                        }
+                        match (key.as_str(), modifiers.shift) {
+                            ("z", false) => app.huge_history(false, window, cx),
+                            ("y", false) | ("z", true) => app.huge_history(true, window, cx),
+                            ("home", false) => app.huge_jump_line(1, 1, window, cx),
+                            ("end", false) => app.huge_jump_end(window, cx),
+                            _ => return false,
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if handled {
+                    cx.stop_propagation();
+                }
+            }));
 
         app._subscriptions.push(
             cx.subscribe(&app.find.query, |this, _, event, cx| match event {
@@ -554,17 +646,22 @@ impl LubanApp {
         &self,
         doc: &mut Document,
         large_file: bool,
+        huge_window: Option<WindowText>,
+        huge_cursor: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<EditorState>, RangeDecorationCollection, Subscription) {
         // Large documents are mounted by moving the decoded buffer into the
-        // editor; the document then releases its own copy.
-        let text = if large_file {
-            doc.detach_text().0
+        // editor; the document then releases its own copy. Disk-engine
+        // documents mount only their bounded window.
+        let (text, window_start) = if let Some(window_text) = huge_window {
+            (window_text.text, window_text.start)
+        } else if large_file {
+            (doc.detach_text().0, 0)
         } else {
-            doc.text.clone()
+            (doc.text.clone(), 0)
         };
-        let lang = if large_file {
+        let lang = if large_file || doc.is_huge() {
             "text".to_string()
         } else {
             language_key(&doc.language).to_string()
@@ -599,14 +696,28 @@ impl LubanApp {
             state.create_range_decorations_collection(Vec::new(), cx)
         });
 
-        let (anchor, cursor) = (doc.anchor, doc.cursor);
-        editor.update(cx, |state, cx| {
-            let total = state.text().len_chars();
-            let b0 = state.text().char_to_byte_idx(anchor.min(total));
-            let b1 = state.text().char_to_byte_idx(cursor.min(total));
-            let (start, end) = if b0 <= b1 { (b0, b1) } else { (b1, b0) };
-            state.set_selected_range(start..end, cx);
-        });
+        if doc.is_huge() {
+            let start = huge_cursor
+                .unwrap_or(window_start)
+                .saturating_sub(window_start);
+            editor.update(cx, |state, cx| {
+                let total = state.text().len();
+                let start = usize::try_from(start).unwrap_or(total).min(total);
+                state.set_selected_range(start..start, cx);
+                if doc.read_only {
+                    state.set_readonly(true, cx);
+                }
+            });
+        } else {
+            let (anchor, cursor) = (doc.anchor, doc.cursor);
+            editor.update(cx, |state, cx| {
+                let total = state.text().len_chars();
+                let b0 = state.text().char_to_byte_idx(anchor.min(total));
+                let b1 = state.text().char_to_byte_idx(cursor.min(total));
+                let (start, end) = if b0 <= b1 { (b0, b1) } else { (b1, b0) };
+                state.set_selected_range(start..end, cx);
+            });
+        }
         if self.focus_editor {
             editor.update(cx, |state, cx| state.focus(window, cx));
         }
@@ -629,16 +740,24 @@ impl LubanApp {
     fn add_document(&mut self, doc: Document, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let large_file =
-            doc.path.is_some() && doc.file_size >= self.settings.large_file_threshold as u64;
+        let huge = doc.is_huge();
+        let large_file = huge
+            || (doc.path.is_some() && doc.file_size >= self.settings.large_file_threshold as u64);
         let mut doc = doc;
-        let (editor, decorations, subscription) = self.new_editor(&mut doc, large_file, window, cx);
+        let initial = doc.take_initial_window();
+        let huge_ui = initial
+            .as_ref()
+            .map(|window| HugeFileUi::new(window.clone()));
+        let huge_cursor = doc.huge().map(|huge| huge.cursor);
+        let (editor, decorations, subscription) =
+            self.new_editor(&mut doc, large_file, initial, huge_cursor, window, cx);
         self.tabs.push(Tab {
             id,
             doc,
             editor,
             decorations,
             needs_sync: false,
+            huge: huge_ui,
             highlighted_revision: u64::MAX,
             large_file,
             decorations_key: None,
@@ -719,15 +838,40 @@ impl LubanApp {
             );
             return false;
         }
+        let size = metadata.len();
         let controller = self.settings.large_file_controller
-            && metadata.len() >= self.settings.large_file_controller_threshold_bytes();
-        if metadata.len() > max_size {
+            && size >= self.settings.large_file_controller_threshold_bytes();
+        if size > max_size {
+            let probe = match DiskEngine::probe(&path) {
+                Ok(probe) => probe,
+                Err(err) => {
+                    self.set_status(
+                        tr_args(
+                            "status.open_failed",
+                            &[
+                                ("path", path.display().to_string()),
+                                ("error", err.to_string()),
+                            ],
+                        ),
+                        cx,
+                    );
+                    return false;
+                }
+            };
+            if !probe.non_text {
+                if controller {
+                    self.start_controller_open(path, size, true, window, cx);
+                } else {
+                    self.start_huge_open(path, 1, None, false, window, cx);
+                }
+                return true;
+            }
             if controller {
-                self.start_controller_open(path, metadata.len(), window, cx);
+                self.start_controller_open(path, size, false, window, cx);
                 return true;
             }
             let err = luban_core::Error::FileTooLarge {
-                size: metadata.len(),
+                size,
                 limit: max_size,
             };
             self.set_status(
@@ -743,7 +887,7 @@ impl LubanApp {
             return false;
         }
         if controller {
-            self.start_controller_open(path, metadata.len(), window, cx);
+            self.start_controller_open(path, size, false, window, cx);
             return true;
         }
         if metadata.len() >= self.settings.large_file_threshold as u64 {
@@ -937,12 +1081,14 @@ impl LubanApp {
         &mut self,
         path: PathBuf,
         size: u64,
+        text: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let max_size = self.settings.max_file_size_bytes();
         let default_size = self.settings.large_file_partial_size_bytes();
-        let whole = size <= max_size;
+        let engine = size > max_size && text;
+        let whole = size <= max_size || engine;
         self.large_file.open_for(
             crate::large_file::PanelBinding {
                 path: path.clone(),
@@ -952,16 +1098,239 @@ impl LubanApp {
                 unit: self.settings.large_file_display_unit,
                 loaded: 0,
                 whole,
+                engine,
             },
             window,
             cx,
         );
+        if engine {
+            self.start_huge_open(path, 1, None, true, window, cx);
+            return;
+        }
         let range = if whole {
             None
         } else {
             Some((0, default_size.min(size)))
         };
         self.start_controller_load(path, range, None, window, cx);
+    }
+
+    /// Index a large text file in the background and mount its first window.
+    /// `target_line` positions the first window; `controller` keeps the
+    /// large-file panel's progress and stop button wired up.
+    fn start_huge_open(
+        &mut self,
+        path: PathBuf,
+        target_line: u64,
+        replace_tab: Option<u64>,
+        controller: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_controller_load_for_path(&path);
+        let generation = self.next_load_generation;
+        self.next_load_generation = self.next_load_generation.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let size = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        self.large_loads.push(LargeLoadJob {
+            path: path.clone(),
+            generation,
+            cancel: cancel.clone(),
+            progress: progress.clone(),
+            size,
+            replace_tab,
+            huge: true,
+        });
+        self.pending_opens.push(path.clone());
+        if controller {
+            self.large_file
+                .begin_loading(progress.clone(), cancel.clone(), cx);
+        }
+        self.set_status(
+            tr_args("status.opening", &[("path", path.display().to_string())]),
+            cx,
+        );
+
+        let task_path = path.clone();
+        let task_cancel = cancel.clone();
+        let task_progress = progress.clone();
+        let task = cx.background_executor().spawn(async move {
+            Document::open_huge(&task_path, target_line, &task_cancel, &task_progress)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_open(generation, path, result, window, cx);
+            });
+        })
+        .detach();
+
+        // Keep the status bar and controller progress moving while indexing.
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let keep = this
+                .update(cx, |app, cx| {
+                    let Some(job) = app
+                        .large_loads
+                        .iter()
+                        .find(|job| job.generation == generation)
+                    else {
+                        return false;
+                    };
+                    let total = job.size.max(1);
+                    let percent =
+                        (job.progress.load(Ordering::Relaxed).saturating_mul(100) / total).min(100);
+                    app.status =
+                        tr_args("status.huge_indexing", &[("percent", percent.to_string())]);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_huge_open(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        result: luban_core::Result<Document>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .large_loads
+            .iter()
+            .position(|job| job.generation == generation)
+        else {
+            return;
+        };
+        let job = self.large_loads.remove(index);
+        let has_newer = self
+            .large_loads
+            .iter()
+            .any(|candidate| util::same_path(&candidate.path, &path));
+        if !has_newer {
+            self.pending_opens
+                .retain(|pending| !util::same_path(pending, &path));
+        }
+        let is_current_target = self
+            .large_file
+            .target
+            .as_ref()
+            .is_some_and(|target| util::same_path(&target.path, &path));
+        let result = if job.cancel.load(Ordering::Relaxed) {
+            Err(luban_core::Error::Cancelled)
+        } else {
+            result
+        };
+
+        match result {
+            Ok(doc) => {
+                if let Some(tab_id) = job.replace_tab {
+                    if let Some(index) = self.tab_index_by_id(tab_id) {
+                        if self.tabs[index].doc.is_modified() {
+                            if is_current_target {
+                                let loaded = self.large_file.loaded;
+                                self.large_file.error = Some(tr("lfc.error.target_modified"));
+                                self.large_file.finish_loading(loaded);
+                            }
+                            self.set_status(tr("lfc.error.target_modified"), cx);
+                            if self.tabs.is_empty() {
+                                self.new_file(window, cx);
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        self.tabs.remove(index);
+                        if self.tabs.is_empty() {
+                            self.active = 0;
+                        } else if self.active >= self.tabs.len() {
+                            self.active = self.tabs.len() - 1;
+                        } else if self.active > index {
+                            self.active -= 1;
+                        }
+                    }
+                }
+                let size = doc.file_size;
+                self.settings.add_recent(path.clone());
+                let _ = self.settings.save();
+                self.add_document(doc, window, cx);
+                let tab_id = self.active_tab().map(|tab| tab.id);
+                if is_current_target {
+                    self.large_file.clear_pin();
+                    self.large_file.bound_tab = tab_id;
+                    self.large_file.finish_loading(size);
+                    self.large_file.available_space =
+                        crate::large_file::available_space(&std::env::temp_dir());
+                    if let Some(target) = &mut self.large_file.target {
+                        target.size = size;
+                        target.tab_id = tab_id;
+                    }
+                }
+                self.set_status(
+                    tr_args(
+                        "status.opened_huge",
+                        &[("path", path.display().to_string())],
+                    ),
+                    cx,
+                );
+                if self
+                    .pending_huge_at
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| util::same_path(pending, &path))
+                {
+                    if let Some((_, line, column)) = self.pending_huge_at.take() {
+                        self.huge_jump_line(line, column, window, cx);
+                    }
+                }
+            }
+            Err(err) => {
+                if self
+                    .pending_huge_at
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| util::same_path(pending, &path))
+                {
+                    self.pending_huge_at = None;
+                }
+                let cancelled = matches!(err, luban_core::Error::Cancelled);
+                if is_current_target && !has_newer {
+                    let loaded = self.large_file.loaded;
+                    self.large_file.finish_loading(loaded);
+                    if cancelled {
+                        self.large_file.status = Some(tr("lfc.stopped"));
+                    } else {
+                        self.large_file.error = Some(err.to_string());
+                    }
+                }
+                if cancelled {
+                    self.set_status(tr("lfc.stopped"), cx);
+                } else {
+                    self.set_status(
+                        tr_args(
+                            "status.open_failed",
+                            &[
+                                ("path", path.display().to_string()),
+                                ("error", err.to_string()),
+                            ],
+                        ),
+                        cx,
+                    );
+                    if self.tabs.is_empty() {
+                        self.new_file(window, cx);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn start_controller_load(
@@ -981,7 +1350,10 @@ impl LubanApp {
             path: path.clone(),
             generation,
             cancel: cancel.clone(),
+            progress: progress.clone(),
+            size: 0,
             replace_tab,
+            huge: false,
         });
         self.pending_opens.push(path.clone());
         self.large_file
@@ -1190,6 +1562,13 @@ impl LubanApp {
                 }
             }
             Err(err) => {
+                if self
+                    .pending_huge_at
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| util::same_path(pending, &path))
+                {
+                    self.pending_huge_at = None;
+                }
                 let cancelled = matches!(err, luban_core::Error::Cancelled);
                 if is_current_target && !has_newer {
                     let loaded = self.large_file.loaded;
@@ -1271,6 +1650,30 @@ impl LubanApp {
         if size == 0 {
             self.large_file.error = Some(tr("lfc.error.empty_file"));
             cx.notify();
+            return;
+        }
+        let text = DiskEngine::probe(&target.path)
+            .map(|probe| !probe.non_text)
+            .unwrap_or(false);
+        if whole && size > max_size && text {
+            let mut replace_tab = None;
+            if let Some(index) = self.tabs.iter().position(|tab| {
+                tab.doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| util::same_path(path, &target.path))
+            }) {
+                if self.tabs[index].doc.is_modified() {
+                    self.large_file.error = Some(tr("lfc.error.target_modified"));
+                    cx.notify();
+                    return;
+                }
+                replace_tab = Some(self.tabs[index].id);
+            }
+            let selection = luban_core::large_file::RangeSelection::new(size, default_size);
+            self.large_file.set_selection(selection, size, window, cx);
+            self.large_file.error = None;
+            self.start_huge_open(target.path, 1, replace_tab, true, window, cx);
             return;
         }
         if whole && size > max_size {
@@ -1370,7 +1773,13 @@ impl LubanApp {
             return;
         };
         let tab_id = tab.id;
+        let size = tab.doc.source_size();
         let same_target = self.large_file.bound_tab == Some(tab_id)
+            && self
+                .large_file
+                .target
+                .as_ref()
+                .is_some_and(|target| target.size == size)
             && tab
                 .doc
                 .path
@@ -1384,7 +1793,7 @@ impl LubanApp {
             self.large_file.clear_target(Some(tab_id), window, cx);
             return;
         };
-        let size = tab.doc.source_size();
+        let huge = tab.doc.is_huge();
         let loaded = tab
             .doc
             .partial_range()
@@ -1398,7 +1807,8 @@ impl LubanApp {
                 default_size: self.settings.large_file_partial_size_bytes(),
                 unit: self.settings.large_file_display_unit,
                 loaded,
-                whole: size <= self.settings.max_file_size_bytes(),
+                whole: huge || size <= self.settings.max_file_size_bytes(),
+                engine: huge,
             },
             window,
             cx,
@@ -1441,13 +1851,44 @@ impl LubanApp {
         cx: &mut Context<Self>,
     ) {
         let path = util::absolutize(path);
-        let already_open = self.tabs.iter().any(|t| {
+        if let Some(index) = self.tabs.iter().position(|t| {
             t.doc
                 .path
                 .as_ref()
                 .is_some_and(|open| util::same_path(open, &path))
-        });
-        let large = fs::metadata(&path)
+        }) {
+            self.active = index;
+            if self.tabs[index].doc.is_huge() {
+                self.huge_jump_line(line as u64, column as u64, window, cx);
+                self.find.dirty = true;
+                cx.notify();
+                return;
+            }
+            let (start, end) = self.line_selection_in_tab(index, line, column, match_len, cx);
+            self.select_char_range(start, end, window, cx);
+            self.focus_editor = true;
+            self.find.dirty = true;
+            cx.notify();
+            return;
+        }
+        let already_open = false;
+        let metadata = fs::metadata(&path).ok();
+        let size = metadata
+            .as_ref()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let text = size > self.settings.max_file_size_bytes()
+            && DiskEngine::probe(&path)
+                .map(|probe| !probe.non_text)
+                .unwrap_or(false);
+        if text {
+            let controller = self.settings.large_file_controller
+                && size >= self.settings.large_file_controller_threshold_bytes();
+            self.pending_huge_at = Some((path.clone(), line as u64, column as u64));
+            self.start_huge_open(path, line as u64, None, controller, window, cx);
+            return;
+        }
+        let large = metadata
             .map(|metadata| {
                 metadata.len() >= self.settings.large_file_threshold as u64
                     || (self.settings.large_file_controller
@@ -1510,7 +1951,7 @@ impl LubanApp {
                 .and_then(|path| fs::metadata(path).ok())
                 .map(|metadata| metadata.len() >= threshold)
                 .unwrap_or(false);
-            any_large |= large;
+            any_large |= large || tab.huge;
             let fallback_name = if let Some(path) = &tab.path {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -1533,6 +1974,9 @@ impl LubanApp {
                 modified: tab.modified,
                 fallback_name,
                 range: tab.range,
+                huge: tab.huge,
+                huge_line: tab.huge_line,
+                huge_column: tab.huge_column,
             });
         }
 
@@ -1589,6 +2033,10 @@ impl LubanApp {
         let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
             return;
         };
+        if self.tabs[index].doc.is_huge() {
+            self.sync_huge_tab(index, window, cx);
+            return;
+        }
         // Selection changes do not emit InputEvent, so they are synced from the
         // editor Rope every frame. This is O(log n) and keeps the document's
         // cursor/selection correct for replace-one, selection scope and session
@@ -1678,7 +2126,11 @@ impl LubanApp {
 
     /// Materialize a detached document buffer from its editor. Returns false
     /// when the tab does not exist.
-    fn ensure_tab_text(&mut self, index: usize, cx: &gpui_kit::App) -> bool {
+    fn ensure_tab_text(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if self.tabs.get(index).is_some_and(|tab| tab.doc.is_huge()) {
+            self.set_status(tr("status.huge_op_unavailable"), cx);
+            return false;
+        }
         let Some(tab) = self.tabs.get_mut(index) else {
             return false;
         };
@@ -1704,7 +2156,7 @@ impl LubanApp {
         }
     }
 
-    fn ensure_active_text(&mut self, cx: &gpui_kit::App) -> bool {
+    fn ensure_active_text(&mut self, cx: &mut Context<Self>) -> bool {
         self.ensure_tab_text(self.active, cx)
     }
 
@@ -1807,10 +2259,1806 @@ impl LubanApp {
         cx.notify();
     }
 
+    fn undo_or_editor(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(Document::is_huge) {
+            self.huge_history(redo, window, cx);
+            return;
+        }
+        if redo {
+            self.editor_action(Box::new(Redo), window, cx);
+        } else {
+            self.editor_action(Box::new(Undo), window, cx);
+        }
+    }
+
     fn active_selection(&self) -> (usize, usize) {
         self.active_doc()
             .map(|doc| doc.selection())
             .unwrap_or((0, 0))
+    }
+
+    // ------------------------------------------------------------------
+    // Disk-engine (huge) documents
+    // ------------------------------------------------------------------
+
+    /// Synchronise the editor window with the engine: apply text changes,
+    /// update the global cursor and request a new window near an edge.
+    fn sync_huge_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        let busy = ui.is_busy();
+        let wants_text = tab.needs_sync;
+        let (text, cursor_byte, range, visible) = {
+            let state = tab.editor.read(cx);
+            let rope = state.text();
+            let cursor = state.cursor().min(rope.len());
+            (
+                if wants_text {
+                    Some(rope.to_string())
+                } else {
+                    None
+                },
+                cursor,
+                state.selected_range(),
+                state.visible_row_range(),
+            )
+        };
+        let local_anchor = if cursor_byte <= range.start {
+            range.end
+        } else {
+            range.start
+        };
+
+        if !busy {
+            if let Some(text) = text.as_ref() {
+                if *text != ui.last_text {
+                    let (start, removed, inserted) = diff_bytes(&ui.last_text, text);
+                    let global = ui.window_start.saturating_add(start as u64);
+                    let inserted = inserted.to_string();
+                    let result = self.tabs[index]
+                        .doc
+                        .huge()
+                        .map(|huge| {
+                            let mut engine = huge.write();
+                            let result = engine
+                                .apply_edit(global, removed as u64, &inserted)
+                                .map(|_| ());
+                            if result.is_ok() {
+                                huge.refresh_metadata(&engine);
+                            }
+                            result
+                        })
+                        .unwrap_or(Ok(()));
+                    if let Err(error) = result {
+                        // Keep the editor and engine in agreement; the
+                        // committed text is the authoritative window.
+                        let revert = self.tabs[index]
+                            .huge
+                            .as_ref()
+                            .map(|ui| ui.last_text.clone())
+                            .unwrap_or_default();
+                        let local = cursor_byte.min(revert.len());
+                        let editor = self.tabs[index].editor.clone();
+                        editor.update(cx, |state, cx| {
+                            state.set_value(revert, window, cx);
+                            state.set_selected_range(local..local, cx);
+                        });
+                        self.set_status(error.to_string(), cx);
+                        return;
+                    }
+                    let newlines = text.bytes().filter(|byte| *byte == b'\n').count() as u64;
+                    if let Some(ui) = self.tabs[index].huge.as_mut() {
+                        ui.last_text = text.clone();
+                        ui.window_len = ui.last_text.len() as u64;
+                        ui.window_newlines = newlines;
+                        ui.cancel_pending();
+                    }
+                    self.find.huge_results.clear();
+                    self.find.huge_truncated = false;
+                    self.tabs[index].needs_sync = false;
+                    self.tabs[index].highlighted_revision = u64::MAX;
+                    let trimmed = self.tabs[index]
+                        .doc
+                        .huge()
+                        .map(|huge| huge.read().history_trimmed())
+                        .unwrap_or(false);
+                    if trimmed {
+                        let notify = self.tabs[index]
+                            .huge
+                            .as_mut()
+                            .map(|ui| {
+                                if ui.history_trimmed_notified {
+                                    false
+                                } else {
+                                    ui.history_trimmed_notified = true;
+                                    true
+                                }
+                            })
+                            .unwrap_or(false);
+                        if notify {
+                            self.set_status(tr("status.huge_history_trimmed"), cx);
+                        }
+                    }
+                }
+            }
+        }
+
+        let (position_line, position_character) = {
+            let state = self.tabs[index].editor.read(cx);
+            let rope = state.text();
+            let cursor = state.cursor().min(rope.len());
+            let position = rope.offset_to_position(cursor);
+            (position.line, position.character)
+        };
+        let (cursor, anchor, update_line, scroll_line, window_line, window_column) = {
+            let Some(ui) = self.tabs[index].huge.as_mut() else {
+                return;
+            };
+            let (cursor, anchor, update_line) = match ui.offscreen_cursor {
+                Some((local, global)) if local == cursor_byte as u64 => (global, global, false),
+                Some(_) => {
+                    ui.offscreen_cursor = None;
+                    (
+                        ui.window_start.saturating_add(cursor_byte as u64),
+                        ui.window_start.saturating_add(local_anchor as u64),
+                        true,
+                    )
+                }
+                None => (
+                    ui.window_start.saturating_add(cursor_byte as u64),
+                    ui.window_start.saturating_add(local_anchor as u64),
+                    true,
+                ),
+            };
+            let scroll_line = visible
+                .as_ref()
+                .map(|rows| ui.global_line_of_local_line(rows.start as u64))
+                .unwrap_or(ui.window_line);
+            (
+                cursor,
+                anchor,
+                update_line,
+                scroll_line,
+                ui.window_line,
+                ui.window_column,
+            )
+        };
+        if let Some(huge) = self.tabs[index].doc.huge_mut() {
+            huge.cursor = cursor;
+            huge.anchor = anchor;
+            huge.scroll_line = scroll_line;
+            if update_line {
+                huge.cursor_line = window_line.saturating_add(position_line as u64);
+                huge.cursor_column = if position_line == 0 {
+                    window_column.saturating_add(position_character as u64)
+                } else {
+                    position_character as u64 + 1
+                };
+            }
+        }
+        self.tabs[index].needs_sync = false;
+        self.maybe_schedule_huge_window(index, window, cx);
+    }
+
+    fn maybe_schedule_huge_window(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        if ui.pending_window.is_some() || ui.is_busy() || !ui.settle_elapsed() {
+            return;
+        }
+        let (cursor_byte, position_line, visible) = {
+            let state = tab.editor.read(cx);
+            let rope = state.text();
+            let cursor = state.cursor().min(rope.len());
+            let position = rope.offset_to_position(cursor);
+            (cursor, position.line as u64, state.visible_row_range())
+        };
+        let Some(visible) = visible else {
+            return;
+        };
+        let total_lines = tab.doc.line_count() as u64;
+        let window_line = ui.window_line;
+        let window_end = ui.window_end_line();
+        let top_global = window_line.saturating_add(visible.start as u64);
+        let bottom_global = window_line.saturating_add(visible.end as u64);
+        let cursor_line = window_line.saturating_add(position_line);
+        let local_cursor = cursor_byte as u64;
+        // Byte-edge tracking only matters when one line fills the window;
+        // normal windows swap by line.
+        let long_line_window = ui.window_newlines <= 8;
+        let edge_bytes = (WINDOW_BYTES / 8).max(64 * 1024);
+        let near_bytes_start =
+            long_line_window && ui.window_start > 0 && local_cursor <= edge_bytes;
+        let near_bytes_end = long_line_window
+            && !ui.at_eof
+            && local_cursor.saturating_add(edge_bytes) >= ui.window_len;
+        let left_edge = visible.start as u64 <= EDGE_LINES && ui.window_start > 0;
+        let right_edge = (visible.end as u64).saturating_add(EDGE_LINES) >= ui.window_newlines
+            && bottom_global < total_lines;
+        let near_cursor_start =
+            cursor_line.saturating_sub(window_line) <= EDGE_LINES && window_line > 1;
+        let near_cursor_end =
+            window_end.saturating_sub(cursor_line) <= EDGE_LINES && window_end < total_lines;
+        let cursor_outside = cursor_line < window_line || cursor_line > window_end;
+        if !near_bytes_start
+            && !near_bytes_end
+            && !left_edge
+            && !right_edge
+            && !near_cursor_start
+            && !near_cursor_end
+            && !cursor_outside
+        {
+            return;
+        }
+        let cursor = ui.window_start.saturating_add(local_cursor);
+        let top_line = top_global.max(1);
+        let target = if near_bytes_start {
+            WindowTarget::Offset(ui.window_start.saturating_sub(WINDOW_BYTES / 2))
+        } else if near_bytes_end {
+            WindowTarget::Offset(cursor)
+        } else {
+            let base = if cursor_outside {
+                cursor_line
+            } else {
+                top_global
+            };
+            WindowTarget::Line(base.saturating_sub(PREFETCH_LINES).max(1))
+        };
+        match target {
+            WindowTarget::Line(line) if line == window_line => return,
+            WindowTarget::Offset(offset)
+                if offset >= ui.window_start
+                    && offset.saturating_add(WINDOW_BYTES / 2)
+                        <= ui.window_start.saturating_add(ui.window_len) =>
+            {
+                return
+            }
+            _ => {}
+        }
+        self.request_huge_window(index, target, cursor, top_line, None, window, cx);
+    }
+
+    /// Ask the executor for another window. Stale results are discarded by
+    /// `generation`.
+    #[allow(clippy::too_many_arguments)]
+    fn request_huge_window(
+        &mut self,
+        index: usize,
+        target: WindowTarget,
+        cursor: u64,
+        top_line: u64,
+        select: Option<(u64, u64)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        if ui.is_busy() {
+            return;
+        }
+        let Some(engine) = tab.doc.huge().map(|huge| huge.engine.clone()) else {
+            return;
+        };
+        let tab_id = tab.id;
+        let generation = self.tabs[index]
+            .huge
+            .as_mut()
+            .map(|ui| ui.next_generation())
+            .unwrap_or(0);
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.pending_window = Some(WindowRequest {
+                generation,
+                cursor,
+                top_line,
+                select,
+            });
+        }
+        let task = cx.background_executor().spawn(async move {
+            let engine = engine.read().unwrap_or_else(|error| error.into_inner());
+            match target {
+                WindowTarget::Line(line) => engine.read_window_from_line(line, WINDOW_BYTES),
+                WindowTarget::Offset(offset) => engine.read_window(offset, WINDOW_BYTES),
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_window(tab_id, generation, result, window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_huge_window(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        result: luban_core::Result<WindowText>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let Some(ui) = self.tabs[index].huge.as_ref() else {
+            return;
+        };
+        let Some(request) = ui.pending_window.as_ref() else {
+            return;
+        };
+        if request.generation != generation {
+            return;
+        }
+        let request = self.tabs[index]
+            .huge
+            .as_mut()
+            .and_then(|ui| ui.pending_window.take());
+        let Some(request) = request else {
+            return;
+        };
+        match result {
+            Ok(loaded) => {
+                let cursor_local =
+                    request.cursor.saturating_sub(loaded.start).min(loaded.len) as usize;
+                let top_local = request.top_line.saturating_sub(loaded.line);
+                let line_height = self.tabs[index]
+                    .editor
+                    .read(cx)
+                    .line_height()
+                    .map(|height| height.as_f32())
+                    .unwrap_or(18.0);
+                let select = request.select.map(|(start, end)| {
+                    (
+                        start.saturating_sub(loaded.start).min(loaded.len) as usize,
+                        end.saturating_sub(loaded.start).min(loaded.len) as usize,
+                    )
+                });
+                let text = loaded.text.clone();
+                let editor = self.tabs[index].editor.clone();
+                editor.update(cx, |state, cx| {
+                    state.set_value(text, window, cx);
+                    state.set_selected_range(cursor_local..cursor_local, cx);
+                    if let Some((start, end)) = select {
+                        state.set_selected_range(start..end.max(start), cx);
+                    }
+                    let y = px(-(top_local as f32 * line_height));
+                    state.set_scroll_offset(point(px(0.), y), cx);
+                    state.focus(window, cx);
+                });
+                let inside = request.cursor >= loaded.start
+                    && request.cursor <= loaded.start.saturating_add(loaded.len);
+                if let Some(ui) = self.tabs[index].huge.as_mut() {
+                    ui.set_window(loaded.clone());
+                    ui.offscreen_cursor = if inside {
+                        None
+                    } else {
+                        Some((cursor_local as u64, request.cursor))
+                    };
+                }
+                if let Some(huge) = self.tabs[index].doc.huge_mut() {
+                    huge.cursor = request.cursor;
+                    huge.anchor = select
+                        .map(|(start, _)| loaded.start.saturating_add(start as u64))
+                        .unwrap_or(huge.cursor);
+                    huge.scroll_line = loaded.line.saturating_add(top_local);
+                }
+                self.tabs[index].needs_sync = false;
+                self.focus_editor = true;
+                cx.notify();
+            }
+            Err(err) => {
+                self.set_status(err.to_string(), cx);
+            }
+        }
+    }
+
+    fn huge_history(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.huge.as_ref().is_some_and(|ui| ui.is_busy()) {
+            return;
+        }
+        let Some(huge) = tab.doc.huge() else {
+            return;
+        };
+        let outcome = {
+            let mut engine = huge.write();
+            let outcome = if redo { engine.redo() } else { engine.undo() };
+            huge.refresh_metadata(&engine);
+            outcome
+        };
+        match outcome {
+            Some(outcome) => {
+                let target_line = outcome.line.saturating_sub(PREFETCH_LINES / 2).max(1);
+                let top_line = outcome.line.saturating_sub(1).max(1);
+                self.request_huge_window(
+                    index,
+                    WindowTarget::Line(target_line),
+                    outcome.cursor,
+                    top_line,
+                    None,
+                    window,
+                    cx,
+                );
+                self.set_status(
+                    tr(if redo {
+                        "status.huge_redo"
+                    } else {
+                        "status.huge_undo"
+                    }),
+                    cx,
+                );
+            }
+            None => self.set_status(tr("status.huge_no_history"), cx),
+        }
+    }
+
+    fn huge_jump_line(
+        &mut self,
+        line: u64,
+        column: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_active(window, cx);
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(huge) = tab.doc.huge() else {
+            return;
+        };
+        let offset = {
+            let engine = huge.read();
+            engine.offset_for_line(line, column)
+        };
+        let offset = match offset {
+            Ok(offset) => offset,
+            Err(err) => {
+                self.set_status(err.to_string(), cx);
+                return;
+            }
+        };
+        let target_line = line.saturating_sub(PREFETCH_LINES / 2).max(1);
+        let top_line = line.saturating_sub(1).max(1);
+        self.request_huge_window(
+            index,
+            WindowTarget::Line(target_line),
+            offset,
+            top_line,
+            Some((offset, offset)),
+            window,
+            cx,
+        );
+        self.focus_editor = true;
+        cx.notify();
+    }
+
+    fn huge_jump_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(huge) = tab.doc.huge() else {
+            return;
+        };
+        let (end, last_line) = {
+            let engine = huge.read();
+            (engine.total_len(), engine.total_lines())
+        };
+        self.request_huge_window(
+            index,
+            WindowTarget::Offset(end.saturating_sub(WINDOW_BYTES / 2)),
+            end,
+            last_line.saturating_sub(30).max(1),
+            Some((end, end)),
+            window,
+            cx,
+        );
+        self.focus_editor = true;
+        cx.notify();
+    }
+
+    fn huge_find_next(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let query = self.find.query_text(cx);
+        if query.is_empty() {
+            self.open_find(false, window, cx);
+            return;
+        }
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        if ui.is_busy() {
+            return;
+        }
+        let search = self.find.engine(&query);
+        if let Some(error) = search.error() {
+            self.find.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let Some(huge_state) = tab.doc.huge() else {
+            return;
+        };
+        let (cursor, anchor) = (huge_state.cursor, huge_state.anchor);
+        let from = if forward {
+            cursor.max(anchor)
+        } else {
+            cursor.min(anchor)
+        };
+        let total_len = huge_state.read().total_len();
+        // "In selection" is served from the current window; a selection can
+        // never span windows.
+        if self.find.in_selection && cursor != anchor {
+            let start = cursor.min(anchor);
+            let end = cursor.max(anchor);
+            if let (Some(local_start), Some(local_end)) =
+                (ui.local_of_global(start), ui.local_of_global(end))
+            {
+                let found = if forward {
+                    search.find_first_in(&ui.last_text, local_start as usize)
+                } else {
+                    search.find_last_in(&ui.last_text, local_end as usize)
+                };
+                match found {
+                    Some(found)
+                        if found.start as u64 >= local_start && found.end as u64 <= local_end =>
+                    {
+                        let editor = tab.editor.clone();
+                        editor.update(cx, |state, cx| {
+                            state.set_selected_range(found.start..found.end, cx);
+                            state.focus(window, cx);
+                        });
+                        self.find.status = tr("find.match_found");
+                    }
+                    _ => self.find.status = tr("find.no_matches"),
+                }
+                cx.notify();
+                return;
+            }
+        }
+
+        let engine = huge_state.engine.clone();
+        let tab_id = tab.id;
+        let editor = tab.editor.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let generation = self.tabs[index]
+            .huge
+            .as_mut()
+            .map(|ui| ui.next_generation())
+            .unwrap_or(0);
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.cancel_pending();
+            ui.search = Some(SearchJob {
+                generation,
+                kind: SearchKind::FindNext,
+                cancel: cancel.clone(),
+                progress: progress.clone(),
+                total: total_len,
+            });
+        }
+        if !self.tabs[index].doc.read_only {
+            editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        }
+        self.find.status = tr("find.huge_searching");
+        self.find.error = None;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            let engine = engine.read().unwrap_or_else(|error| error.into_inner());
+            engine.find(&search, from, forward, &cancel, &progress)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_find(tab_id, generation, forward, result, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_huge_find(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        forward: bool,
+        result: luban_core::Result<Option<luban_core::disk_engine::SearchHit>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let matching = self.tabs[index]
+            .huge
+            .as_ref()
+            .and_then(|ui| ui.search.as_ref())
+            .is_some_and(|job| job.generation == generation);
+        if !matching {
+            return;
+        }
+        self.tabs[index].huge.as_mut().unwrap().search = None;
+        let read_only = self.tabs[index].doc.read_only;
+        let editor = self.tabs[index].editor.clone();
+        editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+        match result {
+            Ok(Some(hit)) => {
+                let target_line = hit.line.saturating_sub(PREFETCH_LINES / 2).max(1);
+                self.request_huge_window(
+                    index,
+                    WindowTarget::Line(target_line),
+                    hit.start,
+                    hit.line.saturating_sub(1).max(1),
+                    Some((hit.start, hit.end)),
+                    window,
+                    cx,
+                );
+                self.find.current = None;
+                self.find.status = tr_args("find.huge_match_at", &[("line", hit.line.to_string())]);
+            }
+            Ok(None) => {
+                self.find.status = tr("find.no_matches");
+            }
+            Err(err) => {
+                if matches!(err, luban_core::Error::Cancelled) {
+                    self.find.status = tr("find.stopped");
+                } else {
+                    self.find.error = Some(err.to_string());
+                }
+            }
+        }
+        let _ = forward;
+        cx.notify();
+    }
+
+    fn huge_find_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let query = self.find.query_text(cx);
+        if query.is_empty() {
+            self.find.status = tr("find.empty_query");
+            cx.notify();
+            return;
+        }
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        if ui.is_busy() {
+            return;
+        }
+        let search = self.find.engine(&query);
+        if let Some(error) = search.error() {
+            self.find.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let Some(huge_state) = tab.doc.huge() else {
+            return;
+        };
+        let total_len = huge_state.read().total_len();
+        let engine = huge_state.engine.clone();
+        let tab_id = tab.id;
+        let editor = tab.editor.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let generation = self.tabs[index]
+            .huge
+            .as_mut()
+            .map(|ui| ui.next_generation())
+            .unwrap_or(0);
+        let limit = self.find.huge_limit;
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.cancel_pending();
+            ui.search = Some(SearchJob {
+                generation,
+                kind: SearchKind::FindAll,
+                cancel: cancel.clone(),
+                progress: progress.clone(),
+                total: total_len,
+            });
+        }
+        if !self.tabs[index].doc.read_only {
+            editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        }
+        self.find.dirty = false;
+        self.find.huge_results.clear();
+        self.find.status = tr("find.huge_searching");
+        self.find.error = None;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            let engine = engine.read().unwrap_or_else(|error| error.into_inner());
+            engine.count_matches(&search, limit, &cancel, &progress)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_find_all(tab_id, generation, limit, result, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_huge_find_all(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        limit: usize,
+        result: luban_core::Result<Vec<luban_core::disk_engine::SearchHit>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let matching = self.tabs[index]
+            .huge
+            .as_ref()
+            .and_then(|ui| ui.search.as_ref())
+            .is_some_and(|job| job.generation == generation);
+        if !matching {
+            return;
+        }
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.search = None;
+        }
+        let read_only = self.tabs[index].doc.read_only;
+        let editor = self.tabs[index].editor.clone();
+        editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+        let _ = window;
+        match result {
+            Ok(hits) => {
+                self.find.huge_truncated = hits.len() >= limit;
+                self.find.status = if self.find.huge_truncated {
+                    tr_args(
+                        "find.match_count_limited",
+                        &[
+                            ("count", hits.len().to_string()),
+                            ("first", limit.to_string()),
+                        ],
+                    )
+                } else if hits.len() == 1 {
+                    tr("find.match_count.one")
+                } else {
+                    tr_args(
+                        "find.match_count.other",
+                        &[("count", hits.len().to_string())],
+                    )
+                };
+                self.find.huge_results = hits;
+            }
+            Err(err) => {
+                self.find.huge_results.clear();
+                if matches!(err, luban_core::Error::Cancelled) {
+                    self.find.status = tr("find.stopped");
+                } else {
+                    self.find.error = Some(err.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn huge_find_jump(
+        &mut self,
+        hit: luban_core::disk_engine::SearchHit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.active;
+        if !self.tabs.get(index).is_some_and(|tab| tab.doc.is_huge()) {
+            return;
+        }
+        let target_line = hit.line.saturating_sub(PREFETCH_LINES / 2).max(1);
+        self.request_huge_window(
+            index,
+            WindowTarget::Line(target_line),
+            hit.start,
+            hit.line.saturating_sub(1).max(1),
+            Some((hit.start, hit.end)),
+            window,
+            cx,
+        );
+        self.focus_editor = true;
+        cx.notify();
+    }
+
+    fn huge_replace_one(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let query = self.find.query_text(cx);
+        let replacement = self.find.replacement_text(cx);
+        if query.is_empty() {
+            return;
+        }
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        if ui.is_busy() {
+            return;
+        }
+        let search = self.find.engine(&query);
+        if let Some(error) = search.error() {
+            self.find.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let Some(huge_state) = tab.doc.huge() else {
+            return;
+        };
+        let from = huge_state.cursor.max(huge_state.anchor);
+        let total_len = huge_state.read().total_len();
+        // Replace the selection when it is exactly one match.
+        let selection = (huge_state.cursor != huge_state.anchor).then(|| {
+            (
+                huge_state.cursor.min(huge_state.anchor),
+                huge_state.cursor.max(huge_state.anchor),
+            )
+        });
+        if let Some((start, end)) = selection {
+            if let Some(local_start) = ui.local_of_global(start) {
+                if let Some(found) = search.find_first_in(&ui.last_text, local_start as usize) {
+                    if found.start as u64 == local_start
+                        && found.end as u64 == local_start + (end - start)
+                    {
+                        let matched_text = ui.last_text[found.start..found.end].to_string();
+                        let expansion = search.replacement_for_bytes(
+                            &matched_text,
+                            ByteMatch {
+                                start: 0,
+                                end: matched_text.len(),
+                            },
+                            &replacement,
+                        );
+                        let mut engine = huge_state.write();
+                        let cursor = start + expansion.len() as u64;
+                        let applied = engine.apply_edit(start, end - start, &expansion);
+                        huge_state.refresh_metadata(&engine);
+                        match applied {
+                            Ok(_) => {
+                                drop(engine);
+                                let target_line = huge_state
+                                    .read()
+                                    .line_at(cursor)
+                                    .unwrap_or(1)
+                                    .saturating_sub(PREFETCH_LINES / 2)
+                                    .max(1);
+                                self.request_huge_window(
+                                    index,
+                                    WindowTarget::Line(target_line),
+                                    cursor,
+                                    target_line,
+                                    Some((cursor, cursor)),
+                                    window,
+                                    cx,
+                                );
+                                self.find.status = tr("find.replaced_one");
+                            }
+                            Err(err) => self.find.error = Some(err.to_string()),
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+        let engine = huge_state.engine.clone();
+        let tab_id = tab.id;
+        let editor = tab.editor.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let generation = self.tabs[index]
+            .huge
+            .as_mut()
+            .map(|ui| ui.next_generation())
+            .unwrap_or(0);
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.cancel_pending();
+            ui.search = Some(SearchJob {
+                generation,
+                kind: SearchKind::ReplaceOne,
+                cancel: cancel.clone(),
+                progress: progress.clone(),
+                total: total_len,
+            });
+        }
+        if !self.tabs[index].doc.read_only {
+            editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        }
+        self.find.status = tr("find.huge_searching");
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            let engine = engine.read().unwrap_or_else(|error| error.into_inner());
+            engine.find(&search, from, true, &cancel, &progress)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_replace_one(tab_id, generation, result, replacement, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_huge_replace_one(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        result: luban_core::Result<Option<luban_core::disk_engine::SearchHit>>,
+        replacement: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let matching = self.tabs[index]
+            .huge
+            .as_ref()
+            .and_then(|ui| ui.search.as_ref())
+            .is_some_and(|job| job.generation == generation);
+        if !matching {
+            return;
+        }
+        self.tabs[index].huge.as_mut().unwrap().search = None;
+        let read_only = self.tabs[index].doc.read_only;
+        let editor = self.tabs[index].editor.clone();
+        editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+        let hit = match result {
+            Ok(Some(hit)) => hit,
+            Ok(None) => {
+                self.find.status = tr("find.no_matches");
+                cx.notify();
+                return;
+            }
+            Err(err) => {
+                if matches!(err, luban_core::Error::Cancelled) {
+                    self.find.status = tr("find.stopped");
+                } else {
+                    self.find.error = Some(err.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let query = self.find.query_text(cx);
+        let search = self.find.engine(&query);
+        let matched_text = {
+            let Some(huge) = self.tabs[index].doc.huge() else {
+                return;
+            };
+            huge.read()
+                .read_text(hit.start, hit.end.saturating_sub(hit.start))
+        };
+        let matched_text = match matched_text {
+            Ok(text) => text,
+            Err(err) => {
+                self.find.error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let expansion = search.replacement_for_bytes(
+            &matched_text,
+            ByteMatch {
+                start: 0,
+                end: matched_text.len(),
+            },
+            &replacement,
+        );
+        let cursor = hit.start.saturating_add(expansion.len() as u64);
+        let line = {
+            let Some(huge) = self.tabs[index].doc.huge() else {
+                return;
+            };
+            let mut engine = huge.write();
+            let applied =
+                engine.apply_edit(hit.start, hit.end.saturating_sub(hit.start), &expansion);
+            huge.refresh_metadata(&engine);
+            match applied {
+                Ok(_) => engine.line_at(cursor).unwrap_or(hit.line),
+                Err(err) => {
+                    self.find.error = Some(err.to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let target_line = line.saturating_sub(PREFETCH_LINES / 2).max(1);
+        self.request_huge_window(
+            index,
+            WindowTarget::Line(target_line),
+            cursor,
+            line.saturating_sub(1).max(1),
+            Some((cursor, cursor)),
+            window,
+            cx,
+        );
+        self.find.status = tr("find.replaced_one");
+        cx.notify();
+    }
+
+    fn huge_replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let query = self.find.query_text(cx);
+        let replacement = self.find.replacement_text(cx);
+        if query.is_empty() {
+            return;
+        }
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(ui) = tab.huge.as_ref() else {
+            return;
+        };
+        if ui.is_busy() {
+            return;
+        }
+        let search = self.find.engine(&query);
+        if let Some(error) = search.error() {
+            self.find.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let Some(huge_state) = tab.doc.huge() else {
+            return;
+        };
+        let engine = huge_state.engine.clone();
+        let cursor = huge_state.cursor;
+        let tab_id = tab.id;
+        let editor = tab.editor.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let generation = self.tabs[index]
+            .huge
+            .as_mut()
+            .map(|ui| ui.next_generation())
+            .unwrap_or(0);
+        {
+            let mut engine = engine.write().unwrap_or_else(|error| error.into_inner());
+            engine.set_editing_locked(true);
+        }
+        editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.cancel_pending();
+            ui.search = Some(SearchJob {
+                generation,
+                kind: SearchKind::ReplaceAll,
+                cancel: cancel.clone(),
+                progress: progress.clone(),
+                total: engine.read().map(|e| e.total_len()).unwrap_or(0),
+            });
+        }
+        self.find.status = tr("find.huge_replace_all_running");
+        self.find.error = None;
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let mut engine = engine.write().unwrap_or_else(|error| error.into_inner());
+            engine.replace_all(&search, &replacement, &cancel, &progress)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_replace_all(tab_id, generation, cursor, result, window, cx);
+            });
+        })
+        .detach();
+
+        // Repaint the status bar while the replacement streams.
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let keep = this
+                .update(cx, |app, cx| {
+                    let Some(index) = app.tab_index_by_id(tab_id) else {
+                        return false;
+                    };
+                    let Some(ui) = app.tabs[index].huge.as_ref() else {
+                        return false;
+                    };
+                    let Some(job) = ui.search.as_ref() else {
+                        return false;
+                    };
+                    if job.generation != generation {
+                        return false;
+                    }
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_huge_replace_all(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        cursor: u64,
+        result: luban_core::Result<luban_core::disk_engine::ReplaceReport>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let matching = self.tabs[index]
+            .huge
+            .as_ref()
+            .and_then(|ui| ui.search.as_ref())
+            .is_some_and(|job| job.generation == generation);
+        if !matching {
+            return;
+        }
+        self.tabs[index].huge.as_mut().unwrap().search = None;
+        let read_only = self.tabs[index].doc.read_only;
+        {
+            if let Some(huge) = self.tabs[index].doc.huge() {
+                let mut engine = huge.write();
+                engine.set_editing_locked(false);
+                huge.refresh_metadata(&engine);
+            }
+        }
+        let editor = self.tabs[index].editor.clone();
+        editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+        match result {
+            Ok(report) => {
+                if report.cancelled {
+                    self.find.status = tr("find.stopped");
+                } else {
+                    self.find.status = tr_args(
+                        "find.replaced_other",
+                        &[("count", report.count.to_string())],
+                    );
+                }
+                // The huge result list is separate from `matches`; leaving
+                // dirty set would overwrite the count with the hint.
+                self.find.dirty = false;
+                let line = {
+                    let Some(huge) = self.tabs[index].doc.huge() else {
+                        cx.notify();
+                        return;
+                    };
+                    huge.read().line_at(cursor).unwrap_or(1)
+                };
+                let target_line = line.saturating_sub(PREFETCH_LINES / 2).max(1);
+                self.request_huge_window(
+                    index,
+                    WindowTarget::Line(target_line),
+                    cursor,
+                    line.saturating_sub(1).max(1),
+                    Some((cursor, cursor)),
+                    window,
+                    cx,
+                );
+            }
+            Err(err) => {
+                if matches!(err, luban_core::Error::Cancelled) {
+                    self.find.status = tr("find.stopped");
+                } else {
+                    self.find.error = Some(err.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_tab_jobs(&self, index: usize) {
+        if let Some(ui) = self.tabs.get(index).and_then(|tab| tab.huge.as_ref()) {
+            if let Some(job) = &ui.save {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+            if let Some(job) = &ui.search {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn cancel_huge_search(&mut self) {
+        for tab in &self.tabs {
+            if let Some(job) = tab.huge.as_ref().and_then(|ui| ui.search.as_ref()) {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Stop background disk-engine index scans.
+    fn cancel_huge_opens(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut cancelled = false;
+        for job in &self.large_loads {
+            if job.huge {
+                job.cancel.store(true, Ordering::Relaxed);
+                cancelled = true;
+            }
+        }
+        if cancelled {
+            self.set_status(tr("lfc.stopped"), cx);
+        }
+        cancelled
+    }
+
+    /// Stop a running disk-engine save and any in-flight full-file search.
+    pub(crate) fn cancel_huge_save(&mut self, cx: &mut Context<Self>) {
+        let mut save_cancelled = false;
+        let mut search_cancelled = false;
+        for tab in &self.tabs {
+            if let Some(ui) = &tab.huge {
+                if let Some(job) = &ui.save {
+                    job.cancel.store(true, Ordering::Relaxed);
+                    save_cancelled = true;
+                }
+                if let Some(job) = &ui.search {
+                    job.cancel.store(true, Ordering::Relaxed);
+                    search_cancelled = true;
+                }
+            }
+        }
+        if save_cancelled {
+            self.set_status(tr("status.save_cancelled"), cx);
+        } else if search_cancelled {
+            self.set_status(tr("find.stopped"), cx);
+        }
+    }
+
+    /// Start a background save. `then` continues a close/exit flow after the
+    /// file has been replaced.
+    fn start_huge_save(
+        &mut self,
+        index: usize,
+        target: Option<PathBuf>,
+        then: SaveThen,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.tabs.len() || !self.tabs[index].doc.is_huge() {
+            return;
+        }
+        self.sync_active(window, cx);
+        if self.tabs[index]
+            .huge
+            .as_ref()
+            .is_some_and(|ui| ui.save.is_some())
+        {
+            // The running save already contains every edit (editing is
+            // locked); remember what the caller wanted to do afterwards.
+            if let Some(ui) = self.tabs[index].huge.as_mut() {
+                ui.queued_save_then = Some(then);
+            }
+            return;
+        }
+        if self.tabs[index]
+            .huge
+            .as_ref()
+            .is_some_and(|ui| ui.search.is_some())
+        {
+            self.set_status(tr("status.huge_busy"), cx);
+            return;
+        }
+        let Some(path) = self.tabs[index].doc.path.clone() else {
+            return;
+        };
+        let save_to_source = target.is_none();
+        if save_to_source && self.tabs[index].doc.read_only {
+            self.set_status(tr("core.document.read_only"), cx);
+            return;
+        }
+        let target = target.unwrap_or(path);
+        if !force && self.tabs[index].doc.changed_on_disk() {
+            self.pending_huge_overwrite = Some((self.tabs[index].id, Some(target.clone()), then));
+            let name = self.tabs[index].doc.display_name();
+            self.confirm = Some(ConfirmState::new(
+                CloseIntent::OverwriteExternal(self.tabs[index].id),
+                tr_args("confirm.overwrite_external_title", &[("name", name)]),
+                tr("confirm.overwrite_external_detail"),
+            ));
+            cx.notify();
+            return;
+        }
+        // The save writes a complete copy next to the target; refuse when the
+        // filesystem cannot hold it.
+        let directory = target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let (engine_arc, snapshot, estimated) = {
+            let Some(huge) = self.tabs[index].doc.huge() else {
+                return;
+            };
+            let engine = huge.read();
+            (
+                huge.engine.clone(),
+                engine.snapshot(),
+                engine.estimated_save_size(),
+            )
+        };
+        if let Some(free) = crate::large_file::available_space(&directory) {
+            if free < estimated.saturating_add(16 * 1024 * 1024) {
+                self.set_status(
+                    tr_args(
+                        "status.huge_no_space",
+                        &[
+                            (
+                                "needed",
+                                format_bytes(estimated, self.settings.large_file_display_unit),
+                            ),
+                            (
+                                "free",
+                                format_bytes(free, self.settings.large_file_display_unit),
+                            ),
+                        ],
+                    ),
+                    cx,
+                );
+                return;
+            }
+        }
+        let restore_read_only = self.tabs[index].doc.read_only;
+        let should_lock_editor = !restore_read_only;
+        let tab_id = self.tabs[index].id;
+        let editor = self.tabs[index].editor.clone();
+        if let Some(huge) = self.tabs[index].doc.huge() {
+            let mut engine = huge.write();
+            engine.set_editing_locked(true);
+        }
+        if should_lock_editor {
+            editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = self.tabs[index]
+            .doc
+            .huge()
+            .map(|huge| huge.read().estimated_save_size())
+            .unwrap_or(0);
+        let generation = self.next_load_generation;
+        self.next_load_generation = self.next_load_generation.wrapping_add(1);
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.cancel_pending();
+            ui.save = Some(SaveJob {
+                generation,
+                then,
+                cancel: cancel.clone(),
+                progress: progress.clone(),
+                total,
+                restore_read_only,
+            });
+        }
+        self.set_status(tr("status.huge_saving"), cx);
+        let task_target = target.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { snapshot.write(&task_target, force, &progress, &cancel) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_save(tab_id, generation, target, result, window, cx);
+            });
+        })
+        .detach();
+        let _ = engine_arc;
+
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let keep = this
+                .update(cx, |app, cx| {
+                    let Some(index) = app.tab_index_by_id(tab_id) else {
+                        return false;
+                    };
+                    let Some(ui) = app.tabs[index].huge.as_ref() else {
+                        return false;
+                    };
+                    let Some(job) = ui.save.as_ref() else {
+                        return false;
+                    };
+                    if job.generation != generation {
+                        return false;
+                    }
+                    let total = job.total.max(1);
+                    let percent =
+                        (job.progress.load(Ordering::Relaxed).saturating_mul(100) / total).min(100);
+                    app.status = tr_args(
+                        "status.huge_saving_percent",
+                        &[("percent", percent.to_string())],
+                    );
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_huge_save(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        target: PathBuf,
+        result: luban_core::Result<luban_core::disk_engine::SaveReport>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let matching = self.tabs[index]
+            .huge
+            .as_ref()
+            .and_then(|ui| ui.save.as_ref())
+            .is_some_and(|job| job.generation == generation);
+        if !matching {
+            return;
+        }
+        let job = self.tabs[index].huge.as_mut().and_then(|ui| ui.save.take());
+        let Some(job) = job else {
+            return;
+        };
+        let restore_read_only = job.restore_read_only;
+        match result {
+            Ok(report) => {
+                let lossy = report.lossy();
+                let adopted = {
+                    if let Some(huge) = self.tabs[index].doc.huge() {
+                        let mut engine = huge.write();
+                        let result = engine.adopt_saved(report, target.clone());
+                        if result.is_err() {
+                            engine.set_editing_locked(false);
+                        }
+                        huge.refresh_metadata(&engine);
+                        result
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(err) = adopted {
+                    self.set_status(err.to_string(), cx);
+                    return;
+                }
+                let tab = &mut self.tabs[index];
+                tab.doc.path = Some(target.clone());
+                if let Ok(metadata) = fs::metadata(&target) {
+                    tab.doc.file_size = metadata.len();
+                    tab.doc.last_modified = metadata.modified().ok();
+                    tab.doc.read_only = metadata.permissions().readonly();
+                }
+                let read_only = tab.doc.read_only;
+                let tab_name = tab.doc.display_name();
+                let tab_editor = tab.editor.clone();
+                if let Some(ui) = tab.huge.as_mut() {
+                    ui.history_trimmed_notified = false;
+                }
+                tab_editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+                if self
+                    .large_file
+                    .target
+                    .as_ref()
+                    .is_some_and(|panel| util::same_path(&panel.path, &target))
+                {
+                    let size = self.tabs[index].doc.source_size();
+                    let selection = luban_core::large_file::RangeSelection::new(
+                        size,
+                        self.settings.large_file_partial_size_bytes(),
+                    );
+                    self.large_file.set_selection(selection, size, window, cx);
+                    self.large_file.loaded = size;
+                    self.large_file.bound_tab = Some(tab_id);
+                }
+                self.settings.add_recent(target.clone());
+                let _ = self.settings.save();
+                if lossy {
+                    let encoding = self.tabs[index].doc.encoding;
+                    self.set_status(
+                        tr_args(
+                            "status.saved_lossy",
+                            &[("name", tab_name), ("encoding", encoding.label())],
+                        ),
+                        cx,
+                    );
+                } else {
+                    self.set_status(
+                        tr_args(
+                            "status.saved_path",
+                            &[("path", target.display().to_string())],
+                        ),
+                        cx,
+                    );
+                }
+                self.finish_save_flow(job.then, window, cx);
+                let queued = self.tabs[index]
+                    .huge
+                    .as_mut()
+                    .and_then(|ui| ui.queued_save_then.take());
+                if let Some(queued) = queued {
+                    self.finish_save_flow(queued, window, cx);
+                }
+            }
+            Err(err) => {
+                if let Some(huge) = self.tabs[index].doc.huge() {
+                    let mut engine = huge.write();
+                    engine.set_editing_locked(false);
+                }
+                let editor = self.tabs[index].editor.clone();
+                editor.update(cx, |state, cx| state.set_readonly(restore_read_only, cx));
+                if matches!(err, luban_core::Error::Cancelled) {
+                    self.set_status(tr("status.save_cancelled"), cx);
+                } else {
+                    self.set_status(
+                        tr_args("status.save_failed", &[("error", err.to_string())]),
+                        cx,
+                    );
+                }
+                self.pending_exit_saves.clear();
+                self.pending_close_saves.clear();
+                self.pending_huge_saves.clear();
+                self.pending_huge_all = false;
+                self.pending_huge_exit = false;
+                if let Some(ui) = self.tabs[index].huge.as_mut() {
+                    ui.queued_save_then = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_save_flow(&mut self, then: SaveThen, window: &mut Window, cx: &mut Context<Self>) {
+        match then {
+            SaveThen::Nothing => {
+                if !self.pending_huge_saves.is_empty() {
+                    self.save_next_huge(window, cx);
+                } else {
+                    self.focus_editor(window, cx);
+                }
+            }
+            SaveThen::NextHugeSave => {
+                if self.pending_huge_saves.is_empty() {
+                    if self.pending_huge_exit {
+                        self.pending_huge_exit = false;
+                        if self.pending_exit_saves.is_empty() {
+                            self.request_quit(window, cx);
+                        } else {
+                            self.prompt_next_batch_save(window, cx);
+                        }
+                    } else if self.pending_huge_all {
+                        self.pending_huge_all = false;
+                        if self.pending_close_saves.is_empty() {
+                            self.close_all_now(window, cx);
+                        } else {
+                            self.prompt_next_batch_save(window, cx);
+                        }
+                    } else {
+                        self.set_status(tr("status.saved_modified"), cx);
+                    }
+                } else {
+                    self.save_next_huge(window, cx);
+                }
+            }
+            SaveThen::ReloadTab(id) => {
+                if let Some(index) = self.tab_index_by_id(id) {
+                    self.start_huge_reload(index, window, cx);
+                }
+            }
+            SaveThen::CloseTab(id) => {
+                if let Some(index) = self.tab_index_by_id(id) {
+                    self.close_tab_at(index, window, cx);
+                }
+            }
+            SaveThen::Exit => {
+                if self.pending_exit_saves.is_empty() {
+                    self.request_quit(window, cx);
+                } else {
+                    self.prompt_next_batch_save(window, cx);
+                }
+            }
+            SaveThen::CloseAll => {
+                if self.pending_close_saves.is_empty() {
+                    self.close_all_now(window, cx);
+                } else {
+                    self.prompt_next_batch_save(window, cx);
+                }
+            }
+        }
+    }
+
+    fn save_next_huge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(id) = self.pending_huge_saves.first().copied() {
+            self.pending_huge_saves.remove(0);
+            let Some(index) = self.tab_index_by_id(id) else {
+                continue;
+            };
+            if !self.tabs[index].doc.is_modified() {
+                continue;
+            }
+            self.start_huge_save(index, None, SaveThen::NextHugeSave, false, window, cx);
+            return;
+        }
+        if self.pending_huge_exit {
+            self.pending_huge_exit = false;
+            if self.pending_exit_saves.is_empty() {
+                self.request_quit(window, cx);
+            } else {
+                self.prompt_next_batch_save(window, cx);
+            }
+        } else if self.pending_huge_all {
+            self.pending_huge_all = false;
+            if self.pending_close_saves.is_empty() {
+                self.close_all_now(window, cx);
+            } else {
+                self.prompt_next_batch_save(window, cx);
+            }
+        } else {
+            self.set_status(tr("status.saved_modified"), cx);
+        }
+    }
+
+    /// Reload a disk-engine tab. The engine is replaced by a freshly indexed
+    /// one after the background scan completes.
+    fn start_huge_reload(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(path) = tab.doc.path.clone() else {
+            return;
+        };
+        let Some(huge) = tab.doc.huge() else {
+            return;
+        };
+        let (line, column) = {
+            let engine = huge.read();
+            engine.line_col_at(huge.cursor).unwrap_or((1, 1))
+        };
+        let tab_id = tab.id;
+        let editor = tab.editor.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.cancel_pending();
+            ui.search = Some(SearchJob {
+                generation: 0,
+                kind: SearchKind::FindNext,
+                cancel: cancel.clone(),
+                progress: progress.clone(),
+                total: path.metadata().map(|meta| meta.len()).unwrap_or(0),
+            });
+        }
+        editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        self.set_status(tr("status.huge_reloading"), cx);
+        let task_path = path.clone();
+        let task_cancel = cancel.clone();
+        let task_progress = progress.clone();
+        let task = cx.background_executor().spawn(async move {
+            let engine = DiskEngine::open(&task_path, &task_cancel, &task_progress)?;
+            let offset = engine.offset_for_line(line, column).unwrap_or(0);
+            let window = engine.read_window(offset, WINDOW_BYTES)?;
+            Ok::<_, luban_core::Error>((engine, window, offset))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_huge_reload(tab_id, path, result, window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_huge_reload(
+        &mut self,
+        tab_id: u64,
+        path: PathBuf,
+        result: luban_core::Result<(DiskEngine, WindowText, u64)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        if let Some(ui) = self.tabs[index].huge.as_mut() {
+            ui.search = None;
+        }
+        match result {
+            Ok((engine, loaded, offset)) => {
+                let encoding = engine.encoding();
+                let eol = engine.eol();
+                let read_only = engine.is_read_only();
+                let size = engine.base_size();
+                let last_modified = engine.last_modified();
+                let total_chars = engine.total_chars();
+                let (cursor_line, cursor_column) =
+                    engine.line_col_at(offset).unwrap_or((loaded.line, 1));
+                let cursor_local = offset.saturating_sub(loaded.start) as usize;
+                if let Some(huge) = self.tabs[index].doc.huge_mut() {
+                    huge.engine = Arc::new(std::sync::RwLock::new(engine));
+                    huge.cursor = offset;
+                    huge.anchor = offset;
+                    huge.scroll_line = loaded.line;
+                    huge.cursor_line = cursor_line;
+                    huge.cursor_column = cursor_column;
+                    huge.initial_window = None;
+                    let guard = huge.read();
+                    huge.refresh_metadata(&guard);
+                }
+                {
+                    let tab = &mut self.tabs[index];
+                    tab.doc.encoding = encoding;
+                    tab.doc.eol = eol;
+                    tab.doc.read_only = read_only;
+                    tab.doc.file_size = size;
+                    tab.doc.last_modified = last_modified;
+                    let _ = total_chars;
+                    let editor = tab.editor.clone();
+                    let text = loaded.text.clone();
+                    editor.update(cx, |state, cx| {
+                        state.set_value(text, window, cx);
+                        let total = state.text().len();
+                        let cursor = cursor_local.min(total);
+                        state.set_selected_range(cursor..cursor, cx);
+                        state.set_readonly(read_only, cx);
+                        state.focus(window, cx);
+                    });
+                    if let Some(ui) = tab.huge.as_mut() {
+                        ui.set_window(loaded.clone());
+                        ui.history_trimmed_notified = false;
+                    }
+                }
+                self.tabs[index].needs_sync = false;
+                let _ = path;
+                self.set_status(tr("status.reloaded"), cx);
+            }
+            Err(err) => {
+                let read_only = self.tabs[index].doc.read_only;
+                let editor = self.tabs[index].editor.clone();
+                editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+                self.set_status(
+                    tr_args("status.reload_failed", &[("error", err.to_string())]),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
     }
 
     // ------------------------------------------------------------------
@@ -1819,17 +4067,25 @@ impl LubanApp {
 
     pub fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
+        let index = self.active;
         let Some(tab) = self.active_tab() else { return };
+        if tab.doc.is_huge() {
+            self.start_huge_save(index, None, SaveThen::Nothing, false, window, cx);
+            return;
+        }
         if tab.doc.path.is_none() || tab.doc.is_partial() {
             self.save_active_as(window, cx);
             return;
         }
-        let index = self.active;
         self.save_tab_at(index, window, cx);
     }
 
     fn save_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[index].doc.is_huge() {
+            self.start_huge_save(index, None, SaveThen::Nothing, false, window, cx);
             return;
         }
         if self.tabs[index].doc.is_partial() {
@@ -1895,6 +4151,7 @@ impl LubanApp {
     pub fn save_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
         let mut skipped_partial = false;
+        let mut huge = Vec::new();
         for index in 0..self.tabs.len() {
             if !self.tabs[index].doc.is_modified() || self.tabs[index].doc.path.is_none() {
                 continue;
@@ -1903,7 +4160,18 @@ impl LubanApp {
                 skipped_partial = true;
                 continue;
             }
+            if self.tabs[index].doc.is_huge() {
+                huge.push(self.tabs[index].id);
+                continue;
+            }
             self.save_tab_at(index, window, cx);
+        }
+        if !huge.is_empty() {
+            self.pending_huge_saves = huge;
+            self.pending_huge_all = false;
+            self.pending_huge_exit = false;
+            self.save_next_huge(window, cx);
+            return;
         }
         if skipped_partial {
             self.set_status(tr("status.save_partial_as"), cx);
@@ -1947,6 +4215,10 @@ impl LubanApp {
         let Some(index) = self.tab_index_by_id(request.tab_id) else {
             return;
         };
+        if self.tabs[index].doc.is_huge() {
+            self.start_huge_save(index, Some(request.path), request.then, false, window, cx);
+            return;
+        }
         if !self.ensure_tab_text(index, cx) {
             return;
         }
@@ -1983,28 +4255,7 @@ impl LubanApp {
                 cx,
             );
         }
-        match request.then {
-            SaveThen::Nothing => self.focus_editor(window, cx),
-            SaveThen::CloseTab(id) => {
-                if let Some(index) = self.tab_index_by_id(id) {
-                    self.close_tab_at(index, window, cx);
-                }
-            }
-            SaveThen::Exit => {
-                if self.pending_exit_saves.is_empty() {
-                    self.request_quit(window, cx);
-                } else {
-                    self.prompt_next_batch_save(window, cx);
-                }
-            }
-            SaveThen::CloseAll => {
-                if self.pending_close_saves.is_empty() {
-                    self.close_all_now(window, cx);
-                } else {
-                    self.prompt_next_batch_save(window, cx);
-                }
-            }
-        }
+        self.finish_save_flow(request.then, window, cx);
         cx.notify();
     }
 
@@ -2519,13 +4770,29 @@ impl LubanApp {
 
     pub fn reload_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let index = self.active;
+        let Some(tab) = self.tabs.get(index) else {
             return;
         };
         if tab.doc.path.is_none() {
             self.set_status(tr("status.reload_untitled"), cx);
             return;
         }
+        if tab.doc.is_huge() {
+            let id = tab.id;
+            if tab.doc.is_modified() {
+                self.confirm = Some(ConfirmState::new(
+                    CloseIntent::ReloadTab(id),
+                    tr("confirm.reload_title"),
+                    tr("confirm.reload_detail"),
+                ));
+                cx.notify();
+            } else {
+                self.start_huge_reload(index, window, cx);
+            }
+            return;
+        }
+        let tab = &mut self.tabs[index];
         match tab.doc.reload() {
             Ok(()) => {
                 let (text, cursor, anchor) = if tab.large_file {
@@ -2605,6 +4872,7 @@ impl LubanApp {
         if index >= self.tabs.len() {
             return;
         }
+        self.cancel_tab_jobs(index);
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -2646,6 +4914,9 @@ impl LubanApp {
     }
 
     fn close_all_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for index in 0..self.tabs.len() {
+            self.cancel_tab_jobs(index);
+        }
         self.tabs.clear();
         self.active = 0;
         self.find.clear();
@@ -2726,10 +4997,32 @@ impl LubanApp {
             return;
         };
         match confirm.intent {
+            CloseIntent::OverwriteExternal(id) => {
+                let Some((tab_id, target, then)) = self.pending_huge_overwrite.take() else {
+                    return;
+                };
+                if tab_id != id {
+                    return;
+                }
+                let Some(index) = self.tab_index_by_id(id) else {
+                    return;
+                };
+                self.start_huge_save(index, target, then, true, window, cx);
+            }
+            CloseIntent::ReloadTab(id) => {
+                let Some(index) = self.tab_index_by_id(id) else {
+                    return;
+                };
+                self.start_huge_save(index, None, SaveThen::ReloadTab(id), false, window, cx);
+            }
             CloseIntent::Tab(id) => {
                 let Some(index) = self.tab_index_by_id(id) else {
                     return;
                 };
+                if self.tabs[index].doc.is_huge() {
+                    self.start_huge_save(index, None, SaveThen::CloseTab(id), false, window, cx);
+                    return;
+                }
                 if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
                     self.save_tab_at(index, window, cx);
                     if !self.tabs[index].doc.is_modified() {
@@ -2764,17 +5057,26 @@ impl LubanApp {
             }
             CloseIntent::AllTabs => {
                 let ids = self.modified_tabs();
+                let mut huge = Vec::new();
                 for id in ids {
                     let Some(index) = self.tab_index_by_id(id) else {
                         continue;
                     };
-                    if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
+                    if self.tabs[index].doc.is_huge() {
+                        huge.push(id);
+                    } else if self.tabs[index].doc.path.is_some()
+                        && !self.tabs[index].doc.is_partial()
+                    {
                         self.save_tab_at(index, window, cx);
                     } else {
                         self.pending_close_saves.push(id);
                     }
                 }
-                if self.pending_close_saves.is_empty() {
+                if !huge.is_empty() {
+                    self.pending_huge_saves = huge;
+                    self.pending_huge_all = true;
+                    self.save_next_huge(window, cx);
+                } else if self.pending_close_saves.is_empty() {
                     self.close_all_now(window, cx);
                 } else {
                     self.pending_close_all_after_saves = true;
@@ -2783,17 +5085,26 @@ impl LubanApp {
             }
             CloseIntent::Exit => {
                 let ids = self.modified_tabs();
+                let mut huge = Vec::new();
                 for id in ids {
                     let Some(index) = self.tab_index_by_id(id) else {
                         continue;
                     };
-                    if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
+                    if self.tabs[index].doc.is_huge() {
+                        huge.push(id);
+                    } else if self.tabs[index].doc.path.is_some()
+                        && !self.tabs[index].doc.is_partial()
+                    {
                         self.save_tab_at(index, window, cx);
                     } else {
                         self.pending_exit_saves.push(id);
                     }
                 }
-                if self.pending_exit_saves.is_empty() {
+                if !huge.is_empty() {
+                    self.pending_huge_saves = huge;
+                    self.pending_huge_exit = true;
+                    self.save_next_huge(window, cx);
+                } else if self.pending_exit_saves.is_empty() {
                     self.request_quit(window, cx);
                 } else {
                     self.prompt_next_batch_save(window, cx);
@@ -2807,6 +5118,15 @@ impl LubanApp {
             return;
         };
         match confirm.intent {
+            CloseIntent::OverwriteExternal(_) => {
+                self.pending_huge_overwrite = None;
+                self.set_status(tr("status.save_cancelled"), cx);
+            }
+            CloseIntent::ReloadTab(id) => {
+                if let Some(index) = self.tab_index_by_id(id) {
+                    self.start_huge_reload(index, window, cx);
+                }
+            }
             CloseIntent::Tab(id) => {
                 if let Some(index) = self.tab_index_by_id(id) {
                     self.close_tab_at(index, window, cx);
@@ -2822,6 +5142,10 @@ impl LubanApp {
         self.pending_exit_saves.clear();
         self.pending_close_saves.clear();
         self.pending_close_all_after_saves = false;
+        self.pending_huge_saves.clear();
+        self.pending_huge_all = false;
+        self.pending_huge_exit = false;
+        self.pending_huge_overwrite = None;
         cx.notify();
     }
 
@@ -2836,6 +5160,9 @@ impl LubanApp {
     }
 
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for index in 0..self.tabs.len() {
+            self.cancel_tab_jobs(index);
+        }
         self.persist_state(window, cx);
         self.allow_close = true;
         cx.quit();
@@ -2849,32 +5176,53 @@ impl LubanApp {
         let tabs = self
             .tabs
             .iter()
-            .map(|tab| SessionTab {
-                path: tab.doc.path.clone(),
-                // Large buffers are never written to the session: the file is
-                // restored from disk instead.
-                text: if !tab.large_file
-                    && tab.doc.partial_range().is_none()
-                    && (tab.doc.is_modified() || tab.doc.is_untitled())
-                {
-                    Some(tab.doc.text.clone())
-                } else {
-                    None
-                },
-                encoding: tab.doc.encoding,
-                eol: tab.doc.eol,
-                language: tab.doc.language.clone(),
-                cursor: tab.doc.cursor,
-                anchor: tab.doc.anchor,
-                scroll_offset: 0.0,
-                modified: !tab.large_file
-                    && tab.doc.partial_range().is_none()
-                    && tab.doc.is_modified(),
-                range: tab
-                    .doc
-                    .partial_range()
-                    .map(|range| [range.start, range.end]),
-                source_size: tab.doc.partial_range().map(|range| range.total),
+            .map(|tab| {
+                let huge = tab.doc.is_huge();
+                let (huge_line, huge_column, huge_scroll) = match tab.doc.huge() {
+                    Some(state) => {
+                        let (line, column) = state
+                            .engine
+                            .try_read()
+                            .map(|engine| engine.line_col_at(state.cursor).unwrap_or((1, 1)))
+                            .unwrap_or((1, 1));
+                        (Some(line), Some(column), Some(state.scroll_line as f32))
+                    }
+                    None => (None, None, None),
+                };
+                SessionTab {
+                    path: tab.doc.path.clone(),
+                    // Large buffers are never written to the session: the file
+                    // is restored from disk instead.
+                    text: if !tab.large_file
+                        && !huge
+                        && tab.doc.partial_range().is_none()
+                        && (tab.doc.is_modified() || tab.doc.is_untitled())
+                    {
+                        Some(tab.doc.text.clone())
+                    } else {
+                        None
+                    },
+                    encoding: tab.doc.encoding,
+                    eol: tab.doc.eol,
+                    language: tab.doc.language.clone(),
+                    cursor: if huge { 0 } else { tab.doc.cursor },
+                    anchor: if huge { 0 } else { tab.doc.anchor },
+                    scroll_offset: 0.0,
+                    modified: !tab.large_file
+                        && !huge
+                        && tab.doc.partial_range().is_none()
+                        && tab.doc.is_modified(),
+                    range: tab
+                        .doc
+                        .partial_range()
+                        .map(|range| [range.start, range.end]),
+                    source_size: tab.doc.partial_range().map(|range| range.total),
+                    huge,
+                    huge_line,
+                    huge_column,
+                    huge_scroll,
+                    huge_modified: huge && tab.doc.is_modified(),
+                }
             })
             .collect();
         Session {
@@ -3198,6 +5546,10 @@ impl LubanApp {
     }
 
     pub fn find_next(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(Document::is_huge) {
+            self.huge_find_next(forward, window, cx);
+            return;
+        }
         self.sync_active(window, cx);
         let query = self.find.query_text(cx);
         if query.is_empty() {
@@ -3296,6 +5648,10 @@ impl LubanApp {
     }
 
     pub fn replace_one(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(Document::is_huge) {
+            self.huge_replace_one(window, cx);
+            return;
+        }
         self.sync_active(window, cx);
         let query = self.find.query_text(cx);
         let replacement = self.find.replacement_text(cx);
@@ -3422,6 +5778,10 @@ impl LubanApp {
     }
 
     pub fn replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(Document::is_huge) {
+            self.huge_replace_all(window, cx);
+            return;
+        }
         self.sync_active(window, cx);
         let query = self.find.query_text(cx);
         let replacement = self.find.replacement_text(cx);
@@ -3732,9 +6092,17 @@ impl LubanApp {
         }
         let query = self.find.query_text(cx);
         if self.active_tab().is_some_and(|tab| tab.large_file) {
+            // A query change invalidates an in-flight scan.
+            if let Some(ui) = self.tabs.get(self.active).and_then(|tab| tab.huge.as_ref()) {
+                if let Some(job) = &ui.search {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            }
             // Large files only search when the user asks for it.
             self.find.dirty = false;
             self.find.matches.clear();
+            self.find.huge_results.clear();
+            self.find.huge_truncated = false;
             self.find.current = None;
             self.find.error = None;
             self.find.generation = self.find.generation.wrapping_add(1);
@@ -3769,7 +6137,6 @@ impl LubanApp {
         let secondary = modifiers.secondary();
         let shift = modifiers.shift;
         let command = secondary || modifiers.control;
-
         if key == "escape" {
             if self.overwrite_save.is_some() {
                 self.cancel_overwrite(cx);
@@ -3812,8 +6179,12 @@ impl LubanApp {
             }
             if self.find.open {
                 self.find.open = false;
+                self.cancel_huge_search();
                 self.find.clear();
                 cx.notify();
+                return true;
+            }
+            if self.cancel_huge_opens(cx) {
                 return true;
             }
             return false;
@@ -3843,6 +6214,32 @@ impl LubanApp {
 
         if !command {
             return false;
+        }
+
+        if self.active_doc().is_some_and(Document::is_huge) {
+            match (key.as_str(), shift) {
+                ("z", false) => {
+                    self.huge_history(false, window, cx);
+                    return true;
+                }
+                ("y", false) => {
+                    self.huge_history(true, window, cx);
+                    return true;
+                }
+                ("z", true) => {
+                    self.huge_history(true, window, cx);
+                    return true;
+                }
+                ("home", false) => {
+                    self.huge_jump_line(1, 1, window, cx);
+                    return true;
+                }
+                ("end", false) => {
+                    self.huge_jump_end(window, cx);
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         match (key.as_str(), shift) {
@@ -3931,6 +6328,12 @@ impl LubanApp {
         let line = parts.next().and_then(Result::ok).unwrap_or(1).max(1);
         let column = parts.next().and_then(Result::ok).unwrap_or(1).max(1);
         let index = self.active;
+        if self.tabs.get(index).is_some_and(|tab| tab.doc.is_huge()) {
+            self.huge_jump_line(line as u64, column as u64, window, cx);
+            self.focus_editor = true;
+            cx.notify();
+            return;
+        }
         let (position, position_end) = self.line_selection_in_tab(index, line, column, 0, cx);
         let _ = position_end;
         self.select_char_range(position, position, window, cx);
@@ -4160,7 +6563,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Undo), window, cx);
+                            this.undo_or_editor(false, window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -4169,7 +6572,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Redo), window, cx);
+                            this.undo_or_editor(true, window, cx);
                         },
                     ))
                     .separator()
@@ -5002,19 +7405,81 @@ impl LubanApp {
         let (mut line, mut column) = (1, 1);
         let (mut sel_len, mut chars, mut lines) = (0, 0, 0);
         let mut large_file = false;
+        let mut huge_label = String::new();
+        let mut window_label = String::new();
+        let mut save_label = String::new();
         if let Some(tab) = self.active_tab() {
             large_file = tab.large_file;
-            let state = tab.editor.read(cx);
-            let rope = state.text();
-            chars = rope.len_chars();
-            lines = rope.lines_len();
-            let position = rope.offset_to_position(state.cursor());
-            line = position.line as usize + 1;
-            column = position.character as usize + 1;
-            let range = state.selected_range();
-            let start = rope.byte_to_char_idx(range.start.min(rope.len()));
-            let end = rope.byte_to_char_idx(range.end.min(rope.len()));
-            sel_len = end.saturating_sub(start);
+            if let Some(ui) = &tab.huge {
+                let state = tab.editor.read(cx);
+                let rope = state.text();
+                chars = tab.doc.char_count();
+                lines = tab.doc.line_count();
+                let _ = rope;
+                let (global_line, global_column) = tab
+                    .doc
+                    .huge()
+                    .map(|huge| (huge.cursor_line, huge.cursor_column))
+                    .unwrap_or((1, 1));
+                line = usize::try_from(global_line).unwrap_or(usize::MAX);
+                column = usize::try_from(global_column).unwrap_or(usize::MAX);
+                let range = state.selected_range();
+                let start = rope.byte_to_char_idx(range.start.min(rope.len()));
+                let end = rope.byte_to_char_idx(range.end.min(rope.len()));
+                sel_len = end.saturating_sub(start);
+                huge_label = tr("status.huge_file");
+                window_label = tr_args(
+                    "status.huge_window",
+                    &[
+                        ("start", ui.window_line.to_string()),
+                        ("end", ui.window_end_line().to_string()),
+                        ("total", lines.to_string()),
+                    ],
+                );
+                if ui.starts_mid_line {
+                    window_label.push_str(&tr("status.huge_continuation"));
+                }
+                if let Some(save) = &ui.save {
+                    let total = save.total.max(1);
+                    let percent = (save
+                        .progress
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .saturating_mul(100)
+                        / total)
+                        .min(100);
+                    save_label = tr_args(
+                        "status.huge_saving_percent",
+                        &[("percent", percent.to_string())],
+                    );
+                } else if let Some(search) = &ui.search {
+                    let percent = search
+                        .progress
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .min(search.total)
+                        .saturating_mul(100)
+                        .checked_div(search.total)
+                        .unwrap_or(0);
+                    save_label = match search.kind {
+                        SearchKind::ReplaceAll => tr("find.huge_replace_all_running"),
+                        _ => tr_args(
+                            "find.huge_searching_percent",
+                            &[("percent", percent.to_string())],
+                        ),
+                    };
+                }
+            } else {
+                let state = tab.editor.read(cx);
+                let rope = state.text();
+                chars = rope.len_chars();
+                lines = rope.lines_len();
+                let position = rope.offset_to_position(state.cursor());
+                line = position.line as usize + 1;
+                column = position.character as usize + 1;
+                let range = state.selected_range();
+                let start = rope.byte_to_char_idx(range.start.min(rope.len()));
+                let end = rope.byte_to_char_idx(range.end.min(rope.len()));
+                sel_len = end.saturating_sub(start);
+            }
         }
         let eol_label = self.active_doc().map(|d| d.eol.label()).unwrap_or("LF");
         let encoding = self
@@ -5090,6 +7555,9 @@ impl LubanApp {
                 } else {
                     String::new()
                 }),
+                div().child(huge_label),
+                div().child(window_label),
+                div().child(save_label),
                 div().child(partial_label),
                 div().child(if non_text {
                     tr("status.non_text")
@@ -5325,6 +7793,7 @@ impl LubanApp {
         let show_replace = self.find.show_replace;
         let weak_prev = weak.clone();
         let weak_next = weak.clone();
+        let weak_all_find = weak.clone();
         let weak_close = weak.clone();
         let mut bar = div()
             .flex()
@@ -5367,6 +7836,31 @@ impl LubanApp {
                             }),
                     )
                     .child(
+                        Button::new("find-all")
+                            .label(tr("find.find_all"))
+                            .ghost()
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_all_find.update(cx, |this, cx| {
+                                    if this.active_doc().is_some_and(Document::is_huge) {
+                                        this.huge_find_all(window, cx);
+                                    } else {
+                                        let query = this.find.query_text(cx);
+                                        if this.ensure_active_text(cx) {
+                                            let text = std::mem::take(
+                                                &mut this.tabs[this.active].doc.text,
+                                            );
+                                            this.find.refresh(&text, &query);
+                                            this.tabs[this.active].doc.text = text;
+                                            this.release_active_text();
+                                        }
+                                        this.find.dirty = false;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    )
+                    .child(
                         Button::new("find-close")
                             .label(tr("common.close"))
                             .ghost()
@@ -5374,6 +7868,7 @@ impl LubanApp {
                             .on_click(move |_, _, cx| {
                                 let _ = weak_close.update(cx, |this, cx| {
                                     this.find.open = false;
+                                    this.cancel_huge_search();
                                     this.find.clear();
                                     cx.notify();
                                 });
@@ -5478,6 +7973,40 @@ impl LubanApp {
                             }),
                     ),
             );
+        }
+        if !self.find.huge_results.is_empty() {
+            let results = self.find.huge_results.clone();
+            let mut list = div()
+                .id("find-huge-results")
+                .max_h(px(150.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_xs();
+            for (index, hit) in results.iter().take(200).enumerate() {
+                let hit = *hit;
+                let weak_row = weak.clone();
+                list = list.child(
+                    div()
+                        .id(("find-huge-result", index))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|this| this.bg(cx.theme().colors.secondary))
+                        .child(tr_args(
+                            "find.huge_result",
+                            &[("line", hit.line.to_string())],
+                        ))
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_row.update(cx, |this, cx| {
+                                this.huge_find_jump(hit, window, cx);
+                            });
+                        }),
+                );
+            }
+            bar = bar.child(list);
         }
         if let Some(error) = error {
             bar = bar.child(
@@ -6018,6 +8547,12 @@ impl LubanApp {
         let title = confirm.title.clone();
         let detail = confirm.detail.clone();
         let exit = matches!(confirm.intent, CloseIntent::Exit);
+        let (save_key, discard_key) = match confirm.intent {
+            CloseIntent::OverwriteExternal(_) => ("confirm.overwrite_yes", "confirm.overwrite_no"),
+            CloseIntent::ReloadTab(_) => ("confirm.reload_save", "confirm.reload_discard"),
+            _ if exit => ("confirm.save_exit", "confirm.discard_exit"),
+            _ => ("confirm.save_close", "confirm.discard"),
+        };
         let weak_save = cx.weak_entity();
         let weak_discard = cx.weak_entity();
         let weak_cancel = cx.weak_entity();
@@ -6052,11 +8587,7 @@ impl LubanApp {
                     )
                     .child(
                         Button::new("confirm-discard")
-                            .label(tr(if exit {
-                                "confirm.discard_exit"
-                            } else {
-                                "confirm.discard"
-                            }))
+                            .label(tr(discard_key))
                             .danger()
                             .on_click(move |_, window, cx| {
                                 let _ = weak_discard
@@ -6065,11 +8596,7 @@ impl LubanApp {
                     )
                     .child(
                         Button::new("confirm-save")
-                            .label(tr(if exit {
-                                "confirm.save_exit"
-                            } else {
-                                "confirm.save_close"
-                            }))
+                            .label(tr(save_key))
                             .primary()
                             .on_click(move |_, window, cx| {
                                 let _ =
@@ -6933,8 +9460,15 @@ impl Render for LubanApp {
             None
         };
         let can_save_part = self.active_doc().is_some_and(Document::is_partial);
+        let huge_saving = self
+            .tabs
+            .iter()
+            .any(|tab| tab.huge.as_ref().is_some_and(|ui| ui.save.is_some()));
         let large_file_panel = if self.large_file.open {
-            Some(self.large_file.render(can_save_part, window, cx))
+            Some(
+                self.large_file
+                    .render(can_save_part, huge_saving, window, cx),
+            )
         } else {
             None
         };
@@ -7091,6 +9625,9 @@ mod restore_tests {
             modified: true,
             fallback_name: "bin.dat".to_string(),
             range: None,
+            huge: false,
+            huge_line: None,
+            huge_column: None,
         };
         let doc = spec.load(1024);
         assert!(doc.is_non_text());
@@ -7114,6 +9651,9 @@ mod restore_tests {
             modified: false,
             fallback_name: "small.txt".to_string(),
             range: Some([100, 200]),
+            huge: false,
+            huge_line: None,
+            huge_column: None,
         };
         let doc = spec.load(1024);
         assert!(doc.is_partial());

@@ -3,8 +3,11 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Instant, SystemTime};
 
+use crate::disk_engine::{DiskEngine, WindowText};
 use crate::encoding::{self, TextEncoding};
 use crate::eol::{self, Eol};
 use crate::error::{Error, Result};
@@ -12,10 +15,10 @@ use crate::language;
 use crate::text::{self, LineIndex};
 use crate::undo::{Edit, EditKind, UndoStack};
 
-/// Files larger than this are rejected by default. The GUI allows changing the
-/// limit in Preferences; 256 MiB is beyond what a text widget can usefully
-/// render while still protecting against accidental huge opens.
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
+/// Files up to this size are opened wholly and edited in memory. Larger text
+/// files go through the disk engine instead of being rejected; the GUI still
+/// lets users lower or raise the limit in Preferences.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// A document opened from a byte range rather than the whole file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +29,58 @@ pub struct PartialRange {
     pub end: u64,
     /// Size of the complete source file.
     pub total: u64,
+}
+
+/// State of a document backed by the disk engine.
+///
+/// The editor only holds a bounded window; `cursor` and `anchor` are global
+/// logical byte offsets, not character indices.
+#[derive(Debug)]
+pub struct HugeFileState {
+    pub engine: Arc<RwLock<DiskEngine>>,
+    pub cursor: u64,
+    pub anchor: u64,
+    /// 1-based global line at the top of the viewport (used by the session).
+    pub scroll_line: u64,
+    /// 1-based global line and column of the caret. Kept separately from the
+    /// editor window so scrolling the window does not lose an off-screen
+    /// caret.
+    pub cursor_line: u64,
+    pub cursor_column: u64,
+    /// First window prepared by [`Document::open_huge`], consumed when the
+    /// editor is mounted.
+    pub initial_window: Option<WindowText>,
+    /// Lock-free copies of engine facts for status rendering and prompts.
+    /// They are refreshed after every edit, save and reload so the UI never
+    /// blocks on a long-running background operation.
+    pub total_chars: AtomicU64,
+    pub total_lines: AtomicU64,
+    pub modified: AtomicBool,
+    pub revision: AtomicU64,
+}
+
+impl HugeFileState {
+    pub fn read(&self) -> RwLockReadGuard<'_, DiskEngine> {
+        self.engine
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn write(&self) -> RwLockWriteGuard<'_, DiskEngine> {
+        self.engine
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Copy engine facts into the lock-free cache. Call while holding a guard.
+    pub fn refresh_metadata(&self, engine: &DiskEngine) {
+        self.total_chars
+            .store(engine.total_chars(), Ordering::Relaxed);
+        self.total_lines
+            .store(engine.total_lines(), Ordering::Relaxed);
+        self.modified.store(engine.is_modified(), Ordering::Relaxed);
+        self.revision.store(engine.revision(), Ordering::Relaxed);
+    }
 }
 
 /// An open text document.
@@ -61,6 +116,8 @@ pub struct Document {
     /// [`Document::attach_text`].
     text_detached: bool,
     cached_chars: Option<usize>,
+    /// Set when the document is backed by the disk engine. `text` stays empty.
+    huge: Option<HugeFileState>,
 }
 
 impl Document {
@@ -86,6 +143,7 @@ impl Document {
             saved_revision: 0,
             text_detached: false,
             cached_chars: Some(0),
+            huge: None,
         }
     }
 
@@ -158,6 +216,56 @@ impl Document {
             metadata.modified().ok(),
             metadata.permissions().readonly(),
         )
+    }
+
+    /// Open a text file through the disk engine. The file is indexed on the
+    /// calling thread (use a background executor) and the editor receives the
+    /// first window around `target_line`.
+    pub fn open_huge(
+        path: impl AsRef<Path>,
+        target_line: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let engine = DiskEngine::open(path, cancel, progress)?;
+        let total_chars = engine.total_chars();
+        let mut doc = Self::new_untitled("new 1");
+        doc.path = Some(path.to_path_buf());
+        doc.encoding = engine.encoding();
+        doc.eol = engine.eol();
+        doc.language = crate::large_file::language_for(path);
+        doc.file_size = engine.base_size();
+        doc.last_modified = engine.last_modified();
+        doc.read_only = engine.is_read_only();
+        doc.cached_chars = Some(usize::try_from(total_chars).unwrap_or(usize::MAX));
+        doc.text_detached = true;
+        let line = target_line.max(1).min(engine.total_lines());
+        let offset = engine.offset_for_line(line, 1).unwrap_or(0);
+        let window = engine.read_window(offset, crate::disk_engine::WINDOW_BYTES)?;
+        let cursor = window.start;
+        let scroll_line = window.line;
+        let huge = HugeFileState {
+            engine: Arc::new(RwLock::new(engine)),
+            cursor,
+            anchor: cursor,
+            scroll_line,
+            cursor_line: line,
+            cursor_column: 1,
+            initial_window: Some(window),
+            total_chars: AtomicU64::new(total_chars),
+            total_lines: AtomicU64::new(0),
+            modified: AtomicBool::new(false),
+            revision: AtomicU64::new(1),
+        };
+        {
+            let engine = huge.read();
+            huge.refresh_metadata(&engine);
+        }
+        doc.huge = Some(huge);
+        doc.revision = 1;
+        doc.saved_revision = 1;
+        Ok(doc)
     }
 
     /// Open only `from..to` of a file. The range is aligned to line boundaries
@@ -255,6 +363,25 @@ impl Document {
         self.text_detached
     }
 
+    pub fn is_huge(&self) -> bool {
+        self.huge.is_some()
+    }
+
+    pub fn huge(&self) -> Option<&HugeFileState> {
+        self.huge.as_ref()
+    }
+
+    pub fn huge_mut(&mut self) -> Option<&mut HugeFileState> {
+        self.huge.as_mut()
+    }
+
+    /// Take the window prepared by [`Document::open_huge`].
+    pub fn take_initial_window(&mut self) -> Option<WindowText> {
+        self.huge
+            .as_mut()
+            .and_then(|huge| huge.initial_window.take())
+    }
+
     /// Whether this document was opened from content that looks binary. Such
     /// documents keep their original line endings and are saved without
     /// re-encoding untouched bytes.
@@ -273,6 +400,9 @@ impl Document {
 
     /// Size of the complete source file, including unopened bytes.
     pub fn source_size(&self) -> u64 {
+        if self.huge.is_some() {
+            return self.file_size;
+        }
         self.partial
             .map(|range| range.total)
             .unwrap_or(self.file_size)
@@ -286,6 +416,10 @@ impl Document {
     pub fn detach_text(&mut self) -> (String, usize) {
         let count = self.char_count();
         self.text_detached = true;
+        if self.huge.is_some() {
+            // The disk engine owns the text; there is no document snapshot.
+            return (String::new(), count);
+        }
         (std::mem::take(&mut self.text), count)
     }
 
@@ -297,6 +431,10 @@ impl Document {
 
     /// Install a materialized snapshot with a known character count.
     pub fn attach_text_counted(&mut self, text: String, char_count: usize) {
+        if self.huge.is_some() {
+            // Never materialize a disk-engine document into `text`.
+            return;
+        }
         self.text = text;
         self.cached_chars = Some(char_count);
         self.text_detached = false;
@@ -341,31 +479,70 @@ impl Document {
     }
 
     pub fn is_modified(&self) -> bool {
+        if let Some(huge) = &self.huge {
+            return huge.modified.load(Ordering::Relaxed);
+        }
         self.revision != self.saved_revision
     }
 
     pub fn revision(&self) -> u64 {
+        if let Some(huge) = &self.huge {
+            return huge.revision.load(Ordering::Relaxed);
+        }
         self.revision
     }
 
     pub fn mark_saved(&mut self) {
+        if self.huge.is_some() {
+            // The engine rebases itself after a save.
+            return;
+        }
         self.saved_revision = self.revision;
     }
 
     /// Mark the document dirty after a metadata-only change.
     pub fn touch(&mut self) {
+        if self.huge.is_some() {
+            return;
+        }
         self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn line_count(&self) -> usize {
+        if let Some(huge) = &self.huge {
+            return usize::try_from(huge.total_lines.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+        }
         LineIndex::new(&self.text).len()
     }
 
     pub fn line_col(&self) -> (usize, usize) {
+        if let Some(huge) = &self.huge {
+            let (line, column) = huge
+                .engine
+                .try_read()
+                .map(|engine| engine.line_col_at(huge.cursor).unwrap_or((1, 1)))
+                .unwrap_or((1, 1));
+            return (
+                usize::try_from(line).unwrap_or(usize::MAX),
+                usize::try_from(column).unwrap_or(usize::MAX),
+            );
+        }
         LineIndex::new(&self.text).line_col(self.cursor)
     }
 
     pub fn selection(&self) -> (usize, usize) {
+        if let Some(huge) = &self.huge {
+            let (anchor, cursor) = (huge.anchor, huge.cursor);
+            let (a, b) = if anchor <= cursor {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            };
+            return (
+                usize::try_from(a).unwrap_or(usize::MAX),
+                usize::try_from(b).unwrap_or(usize::MAX),
+            );
+        }
         if self.anchor <= self.cursor {
             (self.anchor, self.cursor)
         } else {
@@ -374,27 +551,51 @@ impl Document {
     }
 
     pub fn has_selection(&self) -> bool {
+        if let Some(huge) = &self.huge {
+            return huge.anchor != huge.cursor;
+        }
         self.anchor != self.cursor
     }
 
     pub fn selected_text(&self) -> String {
+        if self.huge.is_some() {
+            // Callers use the editor's rope for huge documents.
+            return String::new();
+        }
         let (a, b) = self.selection();
         text::slice_chars(&self.text, a, b)
     }
 
     pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
+        if let Some(huge) = &mut self.huge {
+            let total = huge.read().total_len();
+            let anchor = u64::try_from(anchor).unwrap_or(u64::MAX).min(total);
+            let cursor = u64::try_from(cursor).unwrap_or(u64::MAX).min(total);
+            huge.anchor = anchor;
+            huge.cursor = cursor;
+            return;
+        }
         let total = self.char_count();
         self.anchor = anchor.min(total);
         self.cursor = cursor.min(total);
     }
 
     pub fn select_all(&mut self) {
+        if let Some(huge) = &mut self.huge {
+            let total = huge.read().total_len();
+            huge.anchor = 0;
+            huge.cursor = total;
+            return;
+        }
         let total = self.char_count();
         self.anchor = 0;
         self.cursor = total;
     }
 
     pub fn char_count(&self) -> usize {
+        if let Some(huge) = &self.huge {
+            return usize::try_from(huge.total_chars.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+        }
         match self.cached_chars {
             Some(count) => count,
             None => text::char_count(&self.text),
@@ -569,8 +770,9 @@ impl Document {
     /// document dirty, because the bytes written to disk will change.
     pub fn convert_eol(&mut self, new_eol: Eol) -> bool {
         // Converting line endings would rewrite arbitrary bytes in a non-text
-        // file and break the byte-preserving save guarantee.
-        if self.non_text || self.eol == new_eol {
+        // file and break the byte-preserving save guarantee. Disk-engine
+        // documents keep the encoding they were opened with.
+        if self.huge.is_some() || self.non_text || self.eol == new_eol {
             return false;
         }
         self.eol = new_eol;
@@ -579,7 +781,7 @@ impl Document {
     }
 
     pub fn set_encoding(&mut self, new_encoding: TextEncoding) -> bool {
-        if self.encoding == new_encoding {
+        if self.huge.is_some() || self.encoding == new_encoding {
             return false;
         }
         self.encoding = new_encoding;
@@ -605,6 +807,11 @@ impl Document {
     /// Save to the current path. Returns `Ok(true)` when the selected encoding
     /// could not represent every character (the file was still written).
     pub fn save(&mut self) -> Result<bool> {
+        if self.huge.is_some() {
+            return Err(Error::Other(
+                crate::i18n::tr("core.document.huge_save_flow").to_string(),
+            ));
+        }
         if self.partial.is_some() {
             return Err(Error::Other(crate::i18n::tr(
                 "core.document.partial_save_as",
@@ -618,6 +825,11 @@ impl Document {
     }
 
     pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<bool> {
+        if self.huge.is_some() {
+            return Err(Error::Other(
+                crate::i18n::tr("core.document.huge_save_flow").to_string(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
         if self.partial.is_some()
             && self
@@ -687,6 +899,11 @@ impl Document {
 
     /// Reload the file from disk, discarding the undo history.
     pub fn reload(&mut self) -> Result<()> {
+        if self.huge.is_some() {
+            return Err(Error::Other(
+                crate::i18n::tr("core.document.huge_save_flow").to_string(),
+            ));
+        }
         if self.partial.is_some() {
             return Err(Error::Other(crate::i18n::tr(
                 "core.document.partial_reload",
@@ -716,6 +933,13 @@ impl Document {
 
     /// Whether the file on disk appears to have changed since opening/saving.
     pub fn changed_on_disk(&self) -> bool {
+        if let Some(huge) = &self.huge {
+            return huge
+                .engine
+                .try_read()
+                .map(|engine| engine.changed_on_disk())
+                .unwrap_or(false);
+        }
         let Some(path) = &self.path else {
             return false;
         };
@@ -1117,6 +1341,38 @@ mod tests {
         assert_eq!(doc.path.as_deref(), Some(copy.as_path()));
         assert_eq!(fs::read(&copy).unwrap(), b"bbb\nccc\n");
         assert!(doc.reload().is_ok());
+    }
+
+    #[test]
+    fn huge_documents_expose_engine_metadata_and_refuse_direct_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        let mut contents = String::new();
+        while contents.len() < 2 * 1024 * 1024 {
+            contents.push_str("a line of huge text\n");
+        }
+        fs::write(&path, contents.as_bytes()).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let mut doc = Document::open_huge(&path, 1, &cancel, &progress).unwrap();
+        assert!(doc.is_huge());
+        assert!(doc.is_text_detached());
+        assert_eq!(doc.char_count(), contents.chars().count());
+        assert_eq!(doc.line_count(), contents.matches('\n').count() + 1);
+        assert!(!doc.is_modified());
+        assert_eq!(doc.source_size(), contents.len() as u64);
+        assert!(doc.take_initial_window().is_some());
+        assert!(doc.save().is_err());
+        assert!(doc.reload().is_err());
+        assert!(!doc.convert_eol(Eol::CrLf));
+        assert!(!doc.set_encoding(TextEncoding::Utf16Le));
+        assert!(!doc.apply_edit(0, 0, "x", EditKind::Typing, 1, 1));
+        let (text, count) = doc.detach_text();
+        assert!(text.is_empty());
+        assert_eq!(count, contents.chars().count());
+        doc.select_all();
+        assert!(doc.has_selection());
+        assert_eq!(doc.selection().1, contents.chars().count());
     }
 
     #[test]

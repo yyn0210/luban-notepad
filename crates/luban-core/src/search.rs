@@ -50,6 +50,103 @@ impl Match {
     }
 }
 
+/// A match expressed as UTF-8 byte offsets into the searched slice. Used by
+/// the disk engine, whose positions are global byte offsets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteMatch {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl ByteMatch {
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+impl SearchEngine {
+    /// First match whose start is at or after `from` (a byte offset).
+    pub fn find_first_in(&self, text: &str, from: usize) -> Option<ByteMatch> {
+        let regex = self.regex.as_ref()?;
+        if from > text.len() {
+            return None;
+        }
+        let from = if text.is_char_boundary(from) {
+            from
+        } else {
+            let mut adjusted = from;
+            while adjusted < text.len() && !text.is_char_boundary(adjusted) {
+                adjusted += 1;
+            }
+            adjusted
+        };
+        regex.find_at(text, from).map(|matched| ByteMatch {
+            start: matched.start(),
+            end: matched.end(),
+        })
+    }
+
+    /// Last match starting before `until` (a byte offset).
+    pub fn find_last_in(&self, text: &str, until: usize) -> Option<ByteMatch> {
+        let regex = self.regex.as_ref()?;
+        let mut until = until.min(text.len());
+        while until > 0 && !text.is_char_boundary(until) {
+            until -= 1;
+        }
+        regex
+            .find_iter(&text[..until])
+            .last()
+            .map(|matched| ByteMatch {
+                start: matched.start(),
+                end: matched.end(),
+            })
+    }
+
+    /// All matches inside `text`, in order.
+    pub fn find_all_bytes(&self, text: &str, limit: usize) -> Vec<ByteMatch> {
+        let Some(regex) = self.regex.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for matched in regex.find_iter(text) {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(ByteMatch {
+                start: matched.start(),
+                end: matched.end(),
+            });
+        }
+        out
+    }
+
+    /// Expand `replacement` for a byte match.
+    pub fn replacement_for_bytes(
+        &self,
+        text: &str,
+        matched: ByteMatch,
+        replacement: &str,
+    ) -> String {
+        if !self.options.regex {
+            return expand_literal_replacement(replacement);
+        }
+        if let Some(regex) = self.regex.as_ref() {
+            if let Some(captures) = regex.captures_at(text, matched.start) {
+                if captures.get(0).map(|found| found.start()) == Some(matched.start) {
+                    let mut out = String::new();
+                    captures.expand(replacement, &mut out);
+                    return out;
+                }
+            }
+        }
+        expand_literal_replacement(replacement)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchEngine {
     pattern: String,

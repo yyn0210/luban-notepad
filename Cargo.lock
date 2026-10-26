@@ -3730,6 +3730,7 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

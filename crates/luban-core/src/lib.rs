@@ -7,6 +7,7 @@
 
 rust_i18n::i18n!("locales", fallback = "en");
 
+pub mod disk_engine;
 pub mod document;
 pub mod encoding;
 pub mod eol;
