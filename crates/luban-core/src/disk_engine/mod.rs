@@ -2316,6 +2316,9 @@ mod tests {
         assert_eq!(engine.total_len(), 0);
         assert_eq!(engine.total_lines(), 1);
         assert_eq!(engine.read_window(0, 1024).unwrap().text, "");
+        // An empty file has no line-ending evidence, so it falls back to the
+        // platform convention.
+        assert_eq!(engine.eol(), Eol::native());
         engine.apply_edit(0, 0, "hello\n").unwrap();
         assert_eq!(engine.total_lines(), 2);
         let temp = dir.path().join("empty-out.txt");
@@ -2323,7 +2326,8 @@ mod tests {
             .snapshot()
             .write(&temp, false, &AtomicU64::new(0), &no_cancel())
             .unwrap();
-        assert_eq!(fs::read(&temp).unwrap(), b"hello\n");
+        let expected = eol::normalize("hello\n", Eol::native());
+        assert_eq!(fs::read(&temp).unwrap(), expected.as_bytes());
     }
 
     #[test]
