@@ -209,8 +209,10 @@ mod tests {
     fn cleanup_only_touches_old_journals() {
         let journal = Journal::create().unwrap();
         let dir = journal.dir().to_path_buf();
-        let removed = cleanup_stale(std::time::Duration::from_secs(3600));
-        assert_eq!(removed, 0);
+        // The sweep covers the shared system temp directory, so it may also
+        // collect stale journals left behind by other runs; only this fresh
+        // one must survive.
+        cleanup_stale(std::time::Duration::from_secs(3600));
         assert!(dir.is_dir());
     }
 }
