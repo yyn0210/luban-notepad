@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use luban_core::disk_engine::WindowText;
 
 use crate::dialogs::SaveThen;
+use crate::huge_scrollbar::HugeScrollShared;
 
 /// How close the viewport may get to a window edge before the next window is
 /// requested.
@@ -33,6 +34,18 @@ pub enum WindowTarget {
 #[derive(Debug)]
 pub struct WindowRequest {
     pub generation: u64,
+    pub cursor: u64,
+    pub top_line: u64,
+    pub select: Option<(u64, u64)>,
+    pub requested_at: Instant,
+}
+
+/// A jump that arrived while another window read was in flight. Only the
+/// newest one is kept; it is issued when the in-flight read finishes, so a tab
+/// never has two disk reads running at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowJump {
+    pub target: WindowTarget,
     pub cursor: u64,
     pub top_line: u64,
     pub select: Option<(u64, u64)>,
@@ -78,6 +91,8 @@ pub struct HugeFileUi {
     pub last_text: String,
     pub next_generation: u64,
     pub pending_window: Option<WindowRequest>,
+    /// The newest jump that arrived while `pending_window` was in flight.
+    pub queued_window: Option<WindowJump>,
     pub save: Option<SaveJob>,
     /// A close/exit request that arrived while a save was already running.
     pub queued_save_then: Option<SaveThen>,
@@ -91,6 +106,14 @@ pub struct HugeFileUi {
     pub loaded_at: Instant,
     /// The undo-history limit was reported once for this document.
     pub history_trimmed_notified: bool,
+    /// Global line currently shown at the top of the editor viewport.
+    pub scroll_top_line: u64,
+    /// Global line a file-global scrollbar drag wants to reach. Kept until the
+    /// viewport arrives, so a pending window load cannot overwrite a newer
+    /// pointer position.
+    pub scroll_target: Option<u64>,
+    /// Shared state with the rendered file-global scrollbar.
+    pub scroll: HugeScrollShared,
 }
 
 impl HugeFileUi {
@@ -106,12 +129,16 @@ impl HugeFileUi {
             last_text: window.text,
             next_generation: 1,
             pending_window: None,
+            queued_window: None,
             save: None,
             queued_save_then: None,
             search: None,
             offscreen_cursor: None,
             loaded_at: Instant::now(),
             history_trimmed_notified: false,
+            scroll_top_line: window.line,
+            scroll_target: None,
+            scroll: HugeScrollShared::default(),
         }
     }
 
@@ -150,6 +177,7 @@ impl HugeFileUi {
 
     pub fn cancel_pending(&mut self) {
         self.pending_window = None;
+        self.queued_window = None;
         self.next_generation = self.next_generation.wrapping_add(1);
     }
 
@@ -230,5 +258,47 @@ mod tests {
         let ui = HugeFileUi::new(window);
         assert_eq!(ui.local_of_global(104), Some(4));
         assert_eq!(ui.window_end_line(), 12);
+    }
+
+    fn sample_window() -> WindowText {
+        WindowText {
+            text: "abc\n".into(),
+            start: 0,
+            len: 4,
+            line: 1,
+            newlines: 1,
+            start_column: 1,
+            starts_mid_line: false,
+            ends_mid_line: false,
+            at_eof: false,
+        }
+    }
+
+    #[test]
+    fn cancelling_pending_drops_the_queued_jump() {
+        let mut ui = HugeFileUi::new(sample_window());
+        ui.queued_window = Some(WindowJump {
+            target: WindowTarget::Line(5),
+            cursor: 7,
+            top_line: 1,
+            select: None,
+        });
+        ui.cancel_pending();
+        assert!(ui.queued_window.is_none());
+    }
+
+    #[test]
+    fn installing_a_window_keeps_the_queued_jump() {
+        // The app issues the queued jump from the completion path, so
+        // `set_window` must not drop it.
+        let mut ui = HugeFileUi::new(sample_window());
+        ui.queued_window = Some(WindowJump {
+            target: WindowTarget::Line(5),
+            cursor: 7,
+            top_line: 1,
+            select: None,
+        });
+        ui.set_window(sample_window());
+        assert!(ui.queued_window.is_some());
     }
 }
