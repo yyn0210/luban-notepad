@@ -57,6 +57,11 @@ pub struct SaveSnapshot {
     pub(super) eol: Eol,
     pub(super) bom_len: u64,
     pub(super) base_len: u64,
+    /// Absolute file offset of the indexed body. Range views use it to read
+    /// untouched source blocks; whole-file engines use the BOM length.
+    pub(super) body_start: u64,
+    /// Source range for a range view; `None` for a whole file.
+    pub(super) range: Option<super::RangeSpec>,
     pub(super) base_modified: Option<SystemTime>,
     pub(super) blocks: Vec<Block>,
     pub(super) pieces: Vec<Piece>,
@@ -77,6 +82,8 @@ impl DiskEngine {
             eol: self.eol(),
             bom_len: self.bom_len(),
             base_len: self.base_size(),
+            body_start: self.body_start,
+            range: self.range,
             base_modified: self.last_modified(),
             blocks: self.blocks.clone(),
             pieces: self.pieces.clone(),
@@ -99,6 +106,11 @@ impl SaveSnapshot {
         cancel: &AtomicBool,
     ) -> Result<SaveReport> {
         progress.store(0, Ordering::Relaxed);
+        if self.range.is_some() && self.is_same_file(target) {
+            return Err(Error::Other(
+                tr("core.document.partial_same_path").to_string(),
+            ));
+        }
         if !force {
             self.verify_source()?;
         }
@@ -252,7 +264,7 @@ impl SaveSnapshot {
                 if let Some(block) = self.blocks.get(block as usize) {
                     if piece.offset == 0 && piece.len == block.logical_len {
                         let mut bytes = vec![0u8; usize::try_from(block.src_len).unwrap_or(0)];
-                        read_exact_at(&base.file, &mut bytes, self.bom_len + block.src_offset)?;
+                        read_exact_at(&base.file, &mut bytes, self.body_start + block.src_offset)?;
                         return Ok((bytes, true));
                     }
                 }

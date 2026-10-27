@@ -107,6 +107,8 @@ pub struct LargeFileTarget {
     pub tab_id: Option<u64>,
     /// The target is opened through the disk engine (windowed editor).
     pub engine: bool,
+    /// The target is a line-aligned range view rather than a whole file.
+    pub partial: bool,
 }
 
 /// Parameters for pointing the panel at a file.
@@ -119,6 +121,7 @@ pub struct PanelBinding {
     pub loaded: u64,
     pub whole: bool,
     pub engine: bool,
+    pub partial: bool,
 }
 
 pub struct LargeFilePanel {
@@ -194,6 +197,7 @@ impl LargeFilePanel {
             size: binding.size,
             tab_id: binding.tab_id,
             engine: binding.engine,
+            partial: binding.partial,
         });
         self.selection = RangeSelection::new(binding.size, binding.default_size);
         self.selection.set_mode(if binding.whole {
@@ -217,6 +221,7 @@ impl LargeFilePanel {
             target.path == binding.path
                 && target.size == binding.size
                 && target.engine == binding.engine
+                && target.partial == binding.partial
         });
         if same {
             self.bound_tab = binding.tab_id;
@@ -228,6 +233,7 @@ impl LargeFilePanel {
             size: binding.size,
             tab_id: binding.tab_id,
             engine: binding.engine,
+            partial: binding.partial,
         });
         self.selection = RangeSelection::new(binding.size, binding.default_size);
         self.selection.set_mode(if binding.whole {
@@ -612,7 +618,16 @@ impl LargeFilePanel {
             .child(self.labeled_value(tr("lfc.file_size"), size_text, cx))
             .child(self.labeled_value(tr("lfc.opened"), loaded_text, cx));
         if self.target.as_ref().is_some_and(|target| target.engine) {
-            body = body.child(self.labeled_value(tr("lfc.engine"), tr("lfc.engine_value"), cx));
+            let partial = self.target.as_ref().is_some_and(|target| target.partial);
+            body = body.child(self.labeled_value(
+                tr("lfc.engine"),
+                tr(if partial {
+                    "lfc.engine_range_value"
+                } else {
+                    "lfc.engine_value"
+                }),
+                cx,
+            ));
         }
 
         let weak_stop = weak.clone();

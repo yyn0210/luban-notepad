@@ -235,11 +235,78 @@ impl Document {
         doc.encoding = engine.encoding();
         doc.eol = engine.eol();
         doc.language = crate::large_file::language_for(path);
-        doc.file_size = engine.base_size();
+        doc.file_size = engine.source_size();
         doc.last_modified = engine.last_modified();
         doc.read_only = engine.is_read_only();
         doc.cached_chars = Some(usize::try_from(total_chars).unwrap_or(usize::MAX));
         doc.text_detached = true;
+        let line = target_line.max(1).min(engine.total_lines());
+        let offset = engine.offset_for_line(line, 1).unwrap_or(0);
+        let window = engine.read_window(offset, crate::disk_engine::WINDOW_BYTES)?;
+        let cursor = window.start;
+        let scroll_line = window.line;
+        let huge = HugeFileState {
+            engine: Arc::new(RwLock::new(engine)),
+            cursor,
+            anchor: cursor,
+            scroll_line,
+            cursor_line: line,
+            cursor_column: 1,
+            initial_window: Some(window),
+            total_chars: AtomicU64::new(total_chars),
+            total_lines: AtomicU64::new(0),
+            modified: AtomicBool::new(false),
+            revision: AtomicU64::new(1),
+        };
+        {
+            let engine = huge.read();
+            huge.refresh_metadata(&engine);
+        }
+        doc.huge = Some(huge);
+        doc.revision = 1;
+        doc.saved_revision = 1;
+        Ok(doc)
+    }
+
+    /// Open a line-aligned byte range of a text file through the disk engine.
+    ///
+    /// Only the selected range is indexed. The editor mounts windows inside it
+    /// and line numbers are local to the range. The document is marked partial
+    /// so it can only be saved as a new file.
+    pub fn open_huge_range(
+        path: impl AsRef<Path>,
+        from: u64,
+        to: u64,
+        target_line: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let engine = DiskEngine::open_range(path, from, to, cancel, progress)?;
+        let range = engine.range().ok_or_else(|| Error::InvalidRange {
+            start: from,
+            end: to,
+            size: engine.source_size(),
+        })?;
+        let total_chars = engine.total_chars();
+        let source_size = engine.source_size();
+        let mut doc = Self::new_untitled("new 1");
+        doc.path = Some(path.to_path_buf());
+        doc.encoding = engine.encoding();
+        doc.eol = engine.eol();
+        doc.language = crate::large_file::language_for(path);
+        doc.file_size = source_size;
+        doc.last_modified = engine.last_modified();
+        // The source is protected by `partial`; the range stays editable and
+        // save-as writes only the selected bytes.
+        doc.read_only = false;
+        doc.cached_chars = Some(usize::try_from(total_chars).unwrap_or(usize::MAX));
+        doc.text_detached = true;
+        doc.partial = Some(PartialRange {
+            start: range.start,
+            end: range.end,
+            total: source_size,
+        });
         let line = target_line.max(1).min(engine.total_lines());
         let offset = engine.offset_for_line(line, 1).unwrap_or(0);
         let window = engine.read_window(offset, crate::disk_engine::WINDOW_BYTES)?;
@@ -392,6 +459,12 @@ impl Document {
     /// The byte range when only a portion of the source file is loaded.
     pub fn partial_range(&self) -> Option<PartialRange> {
         self.partial
+    }
+
+    /// Replace the partial-range marker after a save-as or reload changed the
+    /// document's backing file.
+    pub fn set_partial_range(&mut self, range: Option<PartialRange>) {
+        self.partial = range;
     }
 
     pub fn is_partial(&self) -> bool {
@@ -1373,6 +1446,34 @@ mod tests {
         doc.select_all();
         assert!(doc.has_selection());
         assert_eq!(doc.selection().1, contents.chars().count());
+    }
+
+    #[test]
+    fn huge_range_documents_expose_the_source_range_and_local_lines() {
+        let (_dir, path) = temp_file("range-doc.txt", b"one\ntwo\nthree\nfour\n");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let mut doc = Document::open_huge_range(&path, 4, 9, 1, &cancel, &progress).unwrap();
+        assert!(doc.is_huge());
+        assert!(doc.is_partial());
+        assert_eq!(
+            doc.partial_range(),
+            Some(PartialRange {
+                start: 4,
+                end: 14,
+                total: 19,
+            })
+        );
+        assert_eq!(doc.source_size(), 19);
+        assert_eq!(doc.char_count(), "two\nthree\n".chars().count());
+        assert_eq!(doc.line_count(), 3);
+        assert!(!doc.is_modified());
+        let window = doc.take_initial_window().unwrap();
+        assert_eq!(window.text, "two\nthree\n");
+        assert_eq!(window.line, 1);
+        assert!(window.at_eof);
+        assert!(doc.save().is_err());
+        assert!(doc.save_as(&path).is_err());
     }
 
     #[test]
