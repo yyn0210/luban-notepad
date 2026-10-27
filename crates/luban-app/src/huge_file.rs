@@ -192,6 +192,41 @@ impl HugeFileUi {
     }
 }
 
+/// Largest 1-based top line that still fills `viewport_lines` rows of a
+/// document with `total_lines` lines. A document shorter than one screen has a
+/// single valid top line.
+pub fn max_top_line(total_lines: u64, viewport_lines: u64) -> u64 {
+    total_lines
+        .saturating_sub(viewport_lines.max(1).saturating_sub(1))
+        .max(1)
+}
+
+/// Largest top line that still fills a viewport inside a mounted window.
+///
+/// A window starting at `window_line` with `window_newlines` line breaks ends
+/// at `window_line + window_newlines`. The last full screen starts at
+/// `end - viewport_lines + 1`; a window shorter than the viewport has only its
+/// first line as a valid top.
+pub fn window_max_top_line(window_line: u64, window_newlines: u64, viewport_lines: u64) -> u64 {
+    window_line
+        .saturating_add(window_newlines)
+        .saturating_sub(viewport_lines.max(1).saturating_sub(1))
+        .max(window_line)
+}
+
+/// Clamp a desired top line into the mounted window's valid viewport tops.
+pub fn clamp_top_line(
+    desired: u64,
+    window_line: u64,
+    window_newlines: u64,
+    viewport_lines: u64,
+) -> u64 {
+    desired.clamp(
+        window_line,
+        window_max_top_line(window_line, window_newlines, viewport_lines),
+    )
+}
+
 /// Diff two window snapshots, returning the changed byte range and the new
 /// text. Both inputs are UTF-8; the returned offsets are char boundaries.
 pub fn diff_bytes<'a>(old: &str, new: &'a str) -> (usize, usize, &'a str) {
@@ -300,5 +335,46 @@ mod tests {
         });
         ui.set_window(sample_window());
         assert!(ui.queued_window.is_some());
+    }
+
+    #[test]
+    fn max_top_line_leaves_a_full_screen() {
+        assert_eq!(max_top_line(100, 10), 91);
+        assert_eq!(max_top_line(10, 10), 1);
+        assert_eq!(max_top_line(5, 10), 1);
+        assert_eq!(max_top_line(100, 1), 100);
+        assert_eq!(max_top_line(100, 0), 100);
+        assert_eq!(max_top_line(0, 10), 1);
+    }
+
+    #[test]
+    fn window_top_line_cannot_scroll_past_the_window_end() {
+        // Window lines 10..=30, viewport 10 rows: the last full screen starts
+        // at 21, not at the window end.
+        assert_eq!(window_max_top_line(10, 20, 10), 21);
+        assert_eq!(clamp_top_line(30, 10, 20, 10), 21);
+        assert_eq!(clamp_top_line(5, 10, 20, 10), 10);
+        assert_eq!(clamp_top_line(15, 10, 20, 10), 15);
+        // A window shorter than the viewport has one valid top line.
+        assert_eq!(window_max_top_line(10, 3, 10), 10);
+        assert_eq!(clamp_top_line(12, 10, 3, 10), 10);
+    }
+
+    #[test]
+    fn range_end_clamp_keeps_the_last_screen() {
+        // The reproduced case: window starts near the range end with 634 line
+        // breaks and a 37-row viewport.
+        let window_line = 12_548_479;
+        let newlines = 634;
+        let viewport = 37;
+        let end = window_line + newlines;
+        assert_eq!(
+            window_max_top_line(window_line, newlines, viewport),
+            end - 36
+        );
+        assert_eq!(
+            clamp_top_line(end - 5, window_line, newlines, viewport),
+            end - 36
+        );
     }
 }

@@ -940,6 +940,9 @@ lfc.engine:
 lfc.engine_value:
   en: "Disk engine (windowed editing)"
   zh-CN: "磁盘引擎（窗口化编辑）"
+lfc.engine_range_value:
+  en: "Disk engine (partial range)"
+  zh-CN: "磁盘引擎（部分范围）"
 lfc.mode.whole_engine:
   en: "Open whole file (disk engine)"
   zh-CN: "打开整个文件（磁盘引擎）"

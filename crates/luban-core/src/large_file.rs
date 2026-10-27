@@ -395,6 +395,82 @@ pub fn read_range(
     })
 }
 
+/// Align a requested byte range to complete lines without reading the range.
+///
+/// The engine range view uses this before indexing so it only scans the
+/// selected bytes. The actual range can grow by up to
+/// [`BOUNDARY_WINDOW_BYTES`] on each side to finish a line; it never exceeds
+/// the file. Returns `(start, end)` with an exclusive end.
+pub fn align_range(
+    path: &Path,
+    from: u64,
+    to: u64,
+    encoding: TextEncoding,
+    total: u64,
+    cancel: &AtomicBool,
+) -> Result<(u64, u64)> {
+    if total == 0 || from >= total {
+        return Err(Error::InvalidRange {
+            start: from,
+            end: to,
+            size: total,
+        });
+    }
+    let to = to.min(total);
+    let (mut from, mut to) = (from, to);
+    if encoding.is_utf16() {
+        if !from.is_multiple_of(2) {
+            from = (from + 1).min(total);
+        }
+        if !to.is_multiple_of(2) {
+            to = (to + 1).min(total);
+        }
+    }
+    if from >= to || from >= total {
+        return Err(Error::InvalidRange {
+            start: from,
+            end: to,
+            size: total,
+        });
+    }
+
+    let window_start = from.saturating_sub(BOUNDARY_WINDOW_BYTES);
+    let window_end = to.saturating_add(BOUNDARY_WINDOW_BYTES).min(total);
+    let progress = AtomicU64::new(0);
+    let window = read_bytes(
+        path,
+        window_start,
+        window_end - window_start,
+        cancel,
+        &progress,
+    )?;
+    let available_end = window_start + window.len() as u64;
+
+    let scanner = NewlineScanner::new(encoding);
+    let mut start = from;
+    let mut end = to.min(available_end);
+    if from > 0 {
+        match scanner.find_backward(&window, (from - window_start) as usize) {
+            Some(offset) => start = window_start + offset as u64,
+            None if window_start == 0 => start = 0,
+            None => {}
+        }
+    }
+    if to < total && !scanner.is_line_start(&window, (to - window_start) as usize) {
+        if let Some(offset) = scanner.find_forward(&window, (to - window_start) as usize) {
+            end = end.max((window_start + offset as u64).min(available_end));
+        }
+    }
+    if start >= end {
+        return Err(Error::InvalidRange {
+            start: from,
+            end: to,
+            size: total,
+        });
+    }
+    Ok((start, end.min(total)))
+}
+
 /// Read a whole file in chunks so the UI can show progress and cancel.
 pub fn read_whole(
     path: &Path,
@@ -916,6 +992,31 @@ mod tests {
         assert!(content.end - content.start <= 5);
         assert_eq!(content.text, "111\n");
         assert_eq!(content.end, 4);
+    }
+
+    #[test]
+    fn align_range_finds_complete_lines_without_reading_the_slice() {
+        let (_dir, path) = write_temp(b"aaa\nbbb\nccc\nddd\n");
+        let cancel = AtomicBool::new(false);
+        let total = 16;
+        assert_eq!(
+            align_range(&path, 5, 10, TextEncoding::Utf8, total, &cancel).unwrap(),
+            (4, 12)
+        );
+        assert_eq!(
+            align_range(&path, 0, 6, TextEncoding::Utf8, total, &cancel).unwrap(),
+            (0, 8)
+        );
+        assert_eq!(
+            align_range(&path, 9, 16, TextEncoding::Utf8, total, &cancel).unwrap(),
+            (8, 16)
+        );
+        assert_eq!(
+            align_range(&path, 0, 16, TextEncoding::Utf8, total, &cancel).unwrap(),
+            (0, 16)
+        );
+        assert!(align_range(&path, 0, 0, TextEncoding::Utf8, total, &cancel).is_err());
+        assert!(align_range(&path, 16, 16, TextEncoding::Utf8, total, &cancel).is_err());
     }
 
     #[test]

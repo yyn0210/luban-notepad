@@ -21,7 +21,7 @@ use gpui_kit::component::{Selectable as _, Sizable as _, Size, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use luban_core::disk_engine::{DiskEngine, WindowText, WINDOW_BYTES};
-use luban_core::document::Document;
+use luban_core::document::{Document, PartialRange};
 use luban_core::encoding::TextEncoding;
 use luban_core::eol::{self, Eol};
 use luban_core::i18n::language_display_name;
@@ -43,8 +43,8 @@ use crate::dialogs::{
 use crate::explorer::ExplorerState;
 use crate::find::{FindInFilesPanel, FindPanel};
 use crate::huge_file::{
-    diff_bytes, HugeFileUi, SaveJob, SearchJob, SearchKind, WindowJump, WindowRequest,
-    WindowTarget, EDGE_LINES, PREFETCH_LINES,
+    clamp_top_line, diff_bytes, max_top_line, window_max_top_line, HugeFileUi, SaveJob, SearchJob,
+    SearchKind, WindowJump, WindowRequest, WindowTarget, EDGE_LINES, PREFETCH_LINES,
 };
 use crate::huge_scrollbar::{self, HugeScrollbarProps};
 use crate::i18n::{active_language_name, tr, tr_args};
@@ -126,7 +126,20 @@ impl RestoreSpec {
                 let cancel = AtomicBool::new(false);
                 let progress = AtomicU64::new(0);
                 let line = self.huge_line.unwrap_or(1);
-                match Document::open_huge(path, line, &cancel, &progress) {
+                let restored = match self.range {
+                    Some([from, to]) => {
+                        Document::open_huge_range(path, from, to, line, &cancel, &progress)
+                    }
+                    None => Document::open_huge(path, line, &cancel, &progress),
+                };
+                let restored = restored.or_else(|err| {
+                    log::warn!(
+                        "could not restore huge range {}: {err}; opening the whole file",
+                        path.display()
+                    );
+                    Document::open_huge(path, 1, &cancel, &progress)
+                });
+                match restored {
                     Ok(mut doc) => {
                         let column = self.huge_column.unwrap_or(1);
                         if let Some(huge) = doc.huge_mut() {
@@ -1100,6 +1113,7 @@ impl LubanApp {
                 loaded: 0,
                 whole,
                 engine,
+                partial: false,
             },
             window,
             cx,
@@ -1128,14 +1142,56 @@ impl LubanApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.start_huge_job(path, target_line, None, replace_tab, controller, window, cx);
+    }
+
+    /// Index only the line-aligned `from..to` range of a text file and mount a
+    /// windowed view of that range.
+    #[allow(clippy::too_many_arguments)]
+    fn start_huge_range_open(
+        &mut self,
+        path: PathBuf,
+        from: u64,
+        to: u64,
+        target_line: u64,
+        replace_tab: Option<u64>,
+        controller: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_huge_job(
+            path,
+            target_line,
+            Some((from, to)),
+            replace_tab,
+            controller,
+            window,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_huge_job(
+        &mut self,
+        path: PathBuf,
+        target_line: u64,
+        range: Option<(u64, u64)>,
+        replace_tab: Option<u64>,
+        controller: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel_controller_load_for_path(&path);
         let generation = self.next_load_generation;
         self.next_load_generation = self.next_load_generation.wrapping_add(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
-        let size = fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let size = match range {
+            Some((from, to)) => to.saturating_sub(from),
+            None => fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+        };
         self.large_loads.push(LargeLoadJob {
             path: path.clone(),
             generation,
@@ -1159,7 +1215,17 @@ impl LubanApp {
         let task_cancel = cancel.clone();
         let task_progress = progress.clone();
         let task = cx.background_executor().spawn(async move {
-            Document::open_huge(&task_path, target_line, &task_cancel, &task_progress)
+            match range {
+                Some((from, to)) => Document::open_huge_range(
+                    &task_path,
+                    from,
+                    to,
+                    target_line,
+                    &task_cancel,
+                    &task_progress,
+                ),
+                None => Document::open_huge(&task_path, target_line, &task_cancel, &task_progress),
+            }
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
@@ -1262,6 +1328,10 @@ impl LubanApp {
                     }
                 }
                 let size = doc.file_size;
+                let partial = doc.partial_range();
+                let loaded = partial
+                    .map(|range| range.end.saturating_sub(range.start))
+                    .unwrap_or(size);
                 self.settings.add_recent(path.clone());
                 let _ = self.settings.save();
                 self.add_document(doc, window, cx);
@@ -1269,13 +1339,26 @@ impl LubanApp {
                 if is_current_target {
                     self.large_file.clear_pin();
                     self.large_file.bound_tab = tab_id;
-                    self.large_file.finish_loading(size);
                     self.large_file.available_space =
                         crate::large_file::available_space(&std::env::temp_dir());
                     if let Some(target) = &mut self.large_file.target {
                         target.size = size;
                         target.tab_id = tab_id;
+                        target.partial = partial.is_some();
                     }
+                    if let Some(range) = partial {
+                        // Show the line-aligned range that was actually
+                        // indexed, not the raw field values.
+                        let mode = self.large_file.selection.mode();
+                        let mut selection = luban_core::large_file::RangeSelection::new(
+                            size,
+                            self.settings.large_file_partial_size_bytes(),
+                        );
+                        selection.set_mode(mode);
+                        let _ = selection.set_range(range.start, range.end);
+                        self.large_file.set_selection(selection, size, window, cx);
+                    }
+                    self.large_file.finish_loading(loaded);
                 }
                 self.set_status(
                     tr_args(
@@ -1703,6 +1786,32 @@ impl LubanApp {
                 cx.notify();
                 return;
             }
+            if text {
+                // Text partial opens are engine range views and are not capped
+                // by max_file_size_mb: the engine indexes only this range.
+                let mut replace_tab = None;
+                if let Some(index) = self.tabs.iter().position(|tab| {
+                    tab.doc
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| util::same_path(path, &target.path))
+                }) {
+                    if self.tabs[index].doc.is_modified() {
+                        self.large_file.error = Some(tr("lfc.error.target_modified"));
+                        cx.notify();
+                        return;
+                    }
+                    replace_tab = Some(self.tabs[index].id);
+                }
+                let mode = self.large_file.selection.mode();
+                let mut selection = luban_core::large_file::RangeSelection::new(size, default_size);
+                selection.set_mode(mode);
+                let _ = selection.set_range(from, to);
+                self.large_file.set_selection(selection, size, window, cx);
+                self.large_file.error = None;
+                self.start_huge_range_open(target.path, from, to, 1, replace_tab, true, window, cx);
+                return;
+            }
             if to - from > max_size {
                 self.large_file.error = Some(
                     luban_core::Error::FileTooLarge {
@@ -1776,11 +1885,9 @@ impl LubanApp {
         let tab_id = tab.id;
         let size = tab.doc.source_size();
         let same_target = self.large_file.bound_tab == Some(tab_id)
-            && self
-                .large_file
-                .target
-                .as_ref()
-                .is_some_and(|target| target.size == size)
+            && self.large_file.target.as_ref().is_some_and(|target| {
+                target.size == size && target.partial == tab.doc.partial_range().is_some()
+            })
             && tab
                 .doc
                 .path
@@ -1795,9 +1902,8 @@ impl LubanApp {
             return;
         };
         let huge = tab.doc.is_huge();
-        let loaded = tab
-            .doc
-            .partial_range()
+        let partial = tab.doc.partial_range();
+        let loaded = partial
             .map(|range| range.end.saturating_sub(range.start))
             .unwrap_or(size);
         self.large_file.bind(
@@ -1808,12 +1914,27 @@ impl LubanApp {
                 default_size: self.settings.large_file_partial_size_bytes(),
                 unit: self.settings.large_file_display_unit,
                 loaded,
-                whole: huge || size <= self.settings.max_file_size_bytes(),
+                whole: if huge {
+                    partial.is_none()
+                } else {
+                    size <= self.settings.max_file_size_bytes()
+                },
                 engine: huge,
+                partial: partial.is_some(),
             },
             window,
             cx,
         );
+        if let Some(range) = partial {
+            let mode = self.large_file.selection.mode();
+            let mut selection = luban_core::large_file::RangeSelection::new(
+                size,
+                self.settings.large_file_partial_size_bytes(),
+            );
+            selection.set_mode(mode);
+            let _ = selection.set_range(range.start, range.end);
+            self.large_file.set_selection(selection, size, window, cx);
+        }
     }
 
     /// Character range for a 1-based line/column and match length, read from
@@ -1860,7 +1981,17 @@ impl LubanApp {
         }) {
             self.active = index;
             if self.tabs[index].doc.is_huge() {
+                if self.tabs[index].doc.is_partial() {
+                    // Range views use local line numbers; a file-global line
+                    // cannot be mapped back without scanning the prefix.
+                    self.set_status(tr("status.line_outside_partial"), cx);
+                    self.focus_editor = true;
+                    self.find.dirty = true;
+                    cx.notify();
+                    return;
+                }
                 self.huge_jump_line(line as u64, column as u64, window, cx);
+                self.focus_editor = true;
                 self.find.dirty = true;
                 cx.notify();
                 return;
@@ -2282,6 +2413,23 @@ impl LubanApp {
     // Disk-engine (huge) documents
     // ------------------------------------------------------------------
 
+    /// Rows the editor's text area can actually display. `visible_row_range`
+    /// is clipped to the mounted window and is therefore too small near a
+    /// window or range end.
+    fn huge_viewport_lines(&self, index: usize, cx: &gpui_kit::App) -> Option<u64> {
+        let tab = self.tabs.get(index)?;
+        let state = tab.editor.read(cx);
+        let line_height = state.line_height()?.as_f32();
+        if line_height <= 0.0 {
+            return None;
+        }
+        let height = state.input_bounds().size.height.as_f32();
+        if height <= 0.0 {
+            return None;
+        }
+        Some((height / line_height).floor().max(1.0) as u64)
+    }
+
     /// Synchronise the editor window with the engine: apply text changes,
     /// update the global cursor and request a new window near an edge.
     fn sync_huge_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2495,7 +2643,9 @@ impl LubanApp {
         let scroll_target = ui.scroll_target;
         let dragging = ui.scroll.is_dragging();
         if let Some(target) = scroll_target {
-            let viewport_lines = visible.len().max(1) as u64;
+            let viewport_lines = self
+                .huge_viewport_lines(index, cx)
+                .unwrap_or_else(|| visible.len().max(1) as u64);
             self.huge_scroll_to(
                 index,
                 target,
@@ -2611,15 +2761,10 @@ impl LubanApp {
         }
         let editor = tab.editor.clone();
         let total_lines = tab.doc.line_count() as u64;
-        let max_top = total_lines
-            .saturating_sub(viewport_lines.saturating_sub(1))
-            .max(1);
+        let max_top = max_top_line(total_lines, viewport_lines);
         let target = target.clamp(1, max_top);
         let window_line = ui.window_line;
-        let window_max_top = ui
-            .window_end_line()
-            .saturating_sub(viewport_lines.saturating_sub(1))
-            .max(window_line);
+        let window_max_top = window_max_top_line(window_line, ui.window_newlines, viewport_lines);
         let cursor = ui
             .offscreen_cursor
             .map(|(_, global)| global)
@@ -2767,11 +2912,20 @@ impl LubanApp {
                     .as_ref()
                     .and_then(|ui| ui.scroll_target)
                     .unwrap_or(request.top_line);
-                let cursor_local =
-                    request.cursor.saturating_sub(loaded.start).min(loaded.len) as usize;
-                let top_local = desired_top.saturating_sub(loaded.line).min(loaded.newlines);
+                let viewport_lines = self.huge_viewport_lines(index, cx).unwrap_or(1);
+                // `visible_row_range` is clipped to the mounted window; use the
+                // real viewport capacity so the last screen of the window or
+                // range is filled instead of scrolled past its end.
+                let top_line =
+                    clamp_top_line(desired_top, loaded.line, loaded.newlines, viewport_lines);
+                let top_local = top_line.saturating_sub(loaded.line);
                 let target_inside =
                     desired_top >= loaded.line && desired_top <= loaded.line + loaded.newlines;
+                let target_visible = target_inside
+                    && desired_top >= top_line
+                    && desired_top < top_line.saturating_add(viewport_lines);
+                let cursor_local =
+                    request.cursor.saturating_sub(loaded.start).min(loaded.len) as usize;
                 let line_height = self.tabs[index]
                     .editor
                     .read(cx)
@@ -2785,7 +2939,7 @@ impl LubanApp {
                     )
                 });
                 log::debug!(
-                    "huge window line={} newlines={} top={desired_top} cursor_local={cursor_local} elapsed_ms={}",
+                    "huge window line={} newlines={} top={top_line} desired={desired_top} viewport={viewport_lines} cursor_local={cursor_local} elapsed_ms={}",
                     loaded.line,
                     loaded.newlines,
                     request.requested_at.elapsed().as_millis()
@@ -2811,8 +2965,8 @@ impl LubanApp {
                     } else {
                         Some((cursor_local as u64, request.cursor))
                     };
-                    ui.scroll_top_line = loaded.line.saturating_add(top_local);
-                    if target_inside && ui.scroll_target == Some(desired_top) {
+                    ui.scroll_top_line = top_line;
+                    if target_visible && ui.scroll_target == Some(desired_top) {
                         ui.scroll_target = None;
                     }
                 }
@@ -2821,7 +2975,7 @@ impl LubanApp {
                     huge.anchor = select
                         .map(|(start, _)| loaded.start.saturating_add(start as u64))
                         .unwrap_or(huge.cursor);
-                    huge.scroll_line = loaded.line.saturating_add(top_local);
+                    huge.scroll_line = top_line;
                 }
                 self.tabs[index].needs_sync = false;
                 self.focus_editor = true;
@@ -2882,8 +3036,14 @@ impl LubanApp {
         };
         match outcome {
             Some(outcome) => {
+                let total_lines = tab.doc.line_count() as u64;
+                let viewport_lines = self.huge_viewport_lines(index, cx).unwrap_or(1);
                 let target_line = outcome.line.saturating_sub(PREFETCH_LINES / 2).max(1);
-                let top_line = outcome.line.saturating_sub(1).max(1);
+                let top_line = outcome
+                    .line
+                    .saturating_sub(1)
+                    .max(1)
+                    .min(max_top_line(total_lines, viewport_lines));
                 self.request_huge_window(
                     index,
                     WindowTarget::Line(target_line),
@@ -2932,8 +3092,14 @@ impl LubanApp {
                 return;
             }
         };
+        let total_lines = tab.doc.line_count() as u64;
+        let line = line.clamp(1, total_lines.max(1));
+        let viewport_lines = self.huge_viewport_lines(index, cx).unwrap_or(1);
         let target_line = line.saturating_sub(PREFETCH_LINES / 2).max(1);
-        let top_line = line.saturating_sub(1).max(1);
+        let top_line = line
+            .saturating_sub(1)
+            .max(1)
+            .min(max_top_line(total_lines, viewport_lines));
         self.request_huge_window(
             index,
             WindowTarget::Line(target_line),
@@ -2960,11 +3126,13 @@ impl LubanApp {
             let engine = huge.read();
             (engine.total_len(), engine.total_lines())
         };
+        let viewport_lines = self.huge_viewport_lines(index, cx).unwrap_or(1);
+        let top_line = max_top_line(last_line, viewport_lines);
         self.request_huge_window(
             index,
             WindowTarget::Offset(end.saturating_sub(WINDOW_BYTES / 2)),
             end,
-            last_line.saturating_sub(30).max(1),
+            top_line,
             Some((end, end)),
             window,
             cx,
@@ -3769,6 +3937,11 @@ impl LubanApp {
             return;
         };
         let save_to_source = target.is_none();
+        if save_to_source && self.tabs[index].doc.is_partial() {
+            // A range view never writes back to its source.
+            self.set_status(tr("status.save_partial_as"), cx);
+            return;
+        }
         if save_to_source && self.tabs[index].doc.read_only {
             self.set_status(tr("core.document.read_only"), cx);
             return;
@@ -3930,6 +4103,7 @@ impl LubanApp {
             return;
         };
         let restore_read_only = job.restore_read_only;
+        let was_partial = self.tabs[index].doc.is_partial();
         match result {
             Ok(report) => {
                 let lossy = report.lossy();
@@ -3957,6 +4131,12 @@ impl LubanApp {
                     tab.doc.last_modified = metadata.modified().ok();
                     tab.doc.read_only = metadata.permissions().readonly();
                 }
+                // Saving a range view as a new file turns the tab into a
+                // whole-file engine over the target; the partial marker must
+                // not survive the transition.
+                if was_partial {
+                    tab.doc.set_partial_range(None);
+                }
                 let read_only = tab.doc.read_only;
                 let tab_name = tab.doc.display_name();
                 let tab_editor = tab.editor.clone();
@@ -3964,6 +4144,42 @@ impl LubanApp {
                     ui.history_trimmed_notified = false;
                 }
                 tab_editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
+                if was_partial {
+                    let window_text = self.tabs[index]
+                        .doc
+                        .huge()
+                        .and_then(|huge| huge.read().read_window(0, WINDOW_BYTES).ok());
+                    if let Some(window_text) = window_text {
+                        let line = window_text.line;
+                        let start = window_text.start;
+                        let text = window_text.text.clone();
+                        let editor = self.tabs[index].editor.clone();
+                        editor.update(cx, |state, cx| {
+                            state.set_value(text, window, cx);
+                            state.set_selected_range(0..0, cx);
+                            state.set_scroll_offset(point(px(0.), px(0.)), cx);
+                            state.focus(window, cx);
+                        });
+                        if let Some(huge) = self.tabs[index].doc.huge_mut() {
+                            huge.cursor = start;
+                            huge.anchor = start;
+                            huge.scroll_line = line;
+                            huge.cursor_line = line;
+                            huge.cursor_column = 1;
+                            huge.initial_window = None;
+                            let guard = huge.read();
+                            huge.refresh_metadata(&guard);
+                        }
+                        if let Some(ui) = self.tabs[index].huge.as_mut() {
+                            ui.set_window(window_text);
+                            ui.scroll_top_line = line;
+                            ui.scroll_target = None;
+                            ui.queued_window = None;
+                            ui.offscreen_cursor = None;
+                        }
+                        self.tabs[index].needs_sync = false;
+                    }
+                }
                 if self
                     .large_file
                     .target
@@ -4142,6 +4358,10 @@ impl LubanApp {
             let engine = huge.read();
             engine.line_col_at(huge.cursor).unwrap_or((1, 1))
         };
+        let range = tab
+            .doc
+            .partial_range()
+            .map(|range| (range.start, range.end));
         let tab_id = tab.id;
         let editor = tab.editor.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -4153,7 +4373,9 @@ impl LubanApp {
                 kind: SearchKind::FindNext,
                 cancel: cancel.clone(),
                 progress: progress.clone(),
-                total: path.metadata().map(|meta| meta.len()).unwrap_or(0),
+                total: range
+                    .map(|(from, to)| to.saturating_sub(from))
+                    .unwrap_or_else(|| path.metadata().map(|meta| meta.len()).unwrap_or(0)),
             });
         }
         editor.update(cx, |state, cx| state.set_readonly(true, cx));
@@ -4162,7 +4384,12 @@ impl LubanApp {
         let task_cancel = cancel.clone();
         let task_progress = progress.clone();
         let task = cx.background_executor().spawn(async move {
-            let engine = DiskEngine::open(&task_path, &task_cancel, &task_progress)?;
+            let engine = match range {
+                Some((from, to)) => {
+                    DiskEngine::open_range(&task_path, from, to, &task_cancel, &task_progress)?
+                }
+                None => DiskEngine::open(&task_path, &task_cancel, &task_progress)?,
+            };
             let offset = engine.offset_for_line(line, column).unwrap_or(0);
             let window = engine.read_window(offset, WINDOW_BYTES)?;
             Ok::<_, luban_core::Error>((engine, window, offset))
@@ -4196,7 +4423,8 @@ impl LubanApp {
                 let encoding = engine.encoding();
                 let eol = engine.eol();
                 let read_only = engine.is_read_only();
-                let size = engine.base_size();
+                let size = engine.source_size();
+                let range = engine.range();
                 let last_modified = engine.last_modified();
                 let total_chars = engine.total_chars();
                 let (cursor_line, cursor_column) =
@@ -4220,6 +4448,11 @@ impl LubanApp {
                     tab.doc.read_only = read_only;
                     tab.doc.file_size = size;
                     tab.doc.last_modified = last_modified;
+                    tab.doc.set_partial_range(range.map(|range| PartialRange {
+                        start: range.start,
+                        end: range.end,
+                        total: size,
+                    }));
                     let _ = total_chars;
                     let editor = tab.editor.clone();
                     let text = loaded.text.clone();
@@ -4264,11 +4497,17 @@ impl LubanApp {
         self.sync_active(window, cx);
         let index = self.active;
         let Some(tab) = self.active_tab() else { return };
+        // Range views are engine documents too, but they must never write back
+        // to their source; Ctrl+S opens the save-as flow.
+        if tab.doc.is_partial() {
+            self.save_active_as(window, cx);
+            return;
+        }
         if tab.doc.is_huge() {
             self.start_huge_save(index, None, SaveThen::Nothing, false, window, cx);
             return;
         }
-        if tab.doc.path.is_none() || tab.doc.is_partial() {
+        if tab.doc.path.is_none() {
             self.save_active_as(window, cx);
             return;
         }
@@ -4279,12 +4518,12 @@ impl LubanApp {
         if index >= self.tabs.len() {
             return;
         }
-        if self.tabs[index].doc.is_huge() {
-            self.start_huge_save(index, None, SaveThen::Nothing, false, window, cx);
-            return;
-        }
         if self.tabs[index].doc.is_partial() {
             self.set_status(tr("status.save_partial_as"), cx);
+            return;
+        }
+        if self.tabs[index].doc.is_huge() {
+            self.start_huge_save(index, None, SaveThen::Nothing, false, window, cx);
             return;
         }
         if !self.ensure_tab_text(index, cx) {
@@ -5208,13 +5447,38 @@ impl LubanApp {
                 let Some(index) = self.tab_index_by_id(id) else {
                     return;
                 };
+                if self.tabs[index].doc.is_partial() {
+                    let (dir, name) = {
+                        let tab = &self.tabs[index];
+                        (
+                            util::default_save_directory(tab.doc.path.as_deref()),
+                            tab.doc
+                                .path
+                                .as_deref()
+                                .map(luban_core::large_file::partial_save_name)
+                                .unwrap_or_else(|| tab.doc.display_name()),
+                        )
+                    };
+                    self.show_file_dialog(
+                        FileDialogMode::Save,
+                        FileDialogPurpose::SaveAs {
+                            tab_id: id,
+                            then: SaveThen::ReloadTab(id),
+                        },
+                        dir,
+                        name,
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 self.start_huge_save(index, None, SaveThen::ReloadTab(id), false, window, cx);
             }
             CloseIntent::Tab(id) => {
                 let Some(index) = self.tab_index_by_id(id) else {
                     return;
                 };
-                if self.tabs[index].doc.is_huge() {
+                if self.tabs[index].doc.is_huge() && !self.tabs[index].doc.is_partial() {
                     self.start_huge_save(index, None, SaveThen::CloseTab(id), false, window, cx);
                     return;
                 }
@@ -5257,7 +5521,7 @@ impl LubanApp {
                     let Some(index) = self.tab_index_by_id(id) else {
                         continue;
                     };
-                    if self.tabs[index].doc.is_huge() {
+                    if self.tabs[index].doc.is_huge() && !self.tabs[index].doc.is_partial() {
                         huge.push(id);
                     } else if self.tabs[index].doc.path.is_some()
                         && !self.tabs[index].doc.is_partial()
@@ -5285,7 +5549,7 @@ impl LubanApp {
                     let Some(index) = self.tab_index_by_id(id) else {
                         continue;
                     };
-                    if self.tabs[index].doc.is_huge() {
+                    if self.tabs[index].doc.is_huge() && !self.tabs[index].doc.is_partial() {
                         huge.push(id);
                     } else if self.tabs[index].doc.path.is_some()
                         && !self.tabs[index].doc.is_partial()
@@ -6604,6 +6868,7 @@ impl LubanApp {
             .map(|d| d.language.clone())
             .unwrap_or_else(|| language::PLAIN_TEXT.to_string());
         let active_partial = self.active_doc().is_some_and(Document::is_partial);
+        let active_huge = self.active_doc().is_some_and(Document::is_huge);
 
         let weak_file = weak.clone();
         let weak_edit = weak.clone();
@@ -6708,7 +6973,7 @@ impl LubanApp {
                     .item(Self::menu_item(
                         &weak_file,
                         tr("menu.file.reload"),
-                        !has_doc || active_partial,
+                        !has_doc || (active_partial && !active_huge),
                         None,
                         |this, window, cx| {
                             this.reload_active(window, cx);
@@ -7819,7 +8084,12 @@ impl LubanApp {
             } else {
                 0
             };
-            let average_line_bytes = tab.doc.file_size / total_lines.max(1);
+            let view_bytes = tab
+                .doc
+                .partial_range()
+                .map(|range| range.end.saturating_sub(range.start))
+                .unwrap_or(tab.doc.file_size);
+            let average_line_bytes = view_bytes / total_lines.max(1);
             viewport.origin.y -= padding_y;
             viewport.size.height += padding_y * 2.;
             viewport.size.width += padding_x;

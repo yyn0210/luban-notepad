@@ -74,6 +74,27 @@ pub struct FileProbe {
     pub last_modified: Option<SystemTime>,
 }
 
+/// Byte range of the source file indexed by a range view.
+///
+/// Offsets are absolute file offsets and are aligned to complete lines before
+/// the range is indexed. A `start` of 0 includes the source BOM in the saved
+/// output; any other start excludes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeSpec {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl RangeSpec {
+    pub fn len(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+}
+
 /// A bounded slice of the logical text mounted in the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowText {
@@ -240,8 +261,14 @@ pub struct DiskEngine {
     encoding: TextEncoding,
     eol: Eol,
     bom_len: u64,
+    /// Absolute file offset where the indexed body starts. For a whole-file
+    /// engine this is the BOM length; for a range view it is the aligned range
+    /// start (or the BOM length when the range starts at byte 0).
+    body_start: u64,
     base_len: u64,
     body_len: u64,
+    /// Source byte range indexed by a range view; `None` for a whole file.
+    range: Option<RangeSpec>,
     base_modified: Option<SystemTime>,
     read_only: bool,
     editing_locked: bool,
@@ -269,6 +296,8 @@ impl std::fmt::Debug for DiskEngine {
             .field("encoding", &self.encoding)
             .field("eol", &self.eol)
             .field("base_len", &self.base_len)
+            .field("body_start", &self.body_start)
+            .field("range", &self.range)
             .field("total_len", &self.total_len)
             .field("blocks", &self.blocks.len())
             .field("pieces", &self.pieces.len())
@@ -310,14 +339,18 @@ impl DiskEngine {
         }
         let base = Arc::new(BaseFile::open(path)?);
         let bom_len = detect_bom_len(&base, probe.encoding, probe.size)?;
+        // Whole-file opens index the body after the BOM; `body_start` keeps the
+        // absolute source offset used by block reads and the save snapshot.
         let blocks = index_blocks(&base, bom_len, probe.size, probe.encoding, cancel, progress)?;
         let mut engine = Self {
             path: path.to_path_buf(),
             encoding: probe.encoding,
             eol: probe.eol,
             bom_len,
+            body_start: bom_len,
             base_len: probe.size,
             body_len: probe.size.saturating_sub(bom_len),
+            range: None,
             base_modified: probe.last_modified,
             read_only: probe.read_only,
             editing_locked: false,
@@ -354,6 +387,96 @@ impl DiskEngine {
         Ok(engine)
     }
 
+    /// Build an engine over the line-aligned `from..to` range of a text file.
+    ///
+    /// Only the selected range is indexed. Logical offsets and line numbers are
+    /// local to the range, and an unmodified block is copied byte-for-byte when
+    /// the edited range is saved as a new file. Non-text files are rejected so
+    /// callers keep their lossless byte-range path.
+    pub fn open_range(
+        path: &Path,
+        from: u64,
+        to: u64,
+        cancel: &AtomicBool,
+        progress: &AtomicU64,
+    ) -> Result<Self> {
+        progress.store(0, Ordering::Relaxed);
+        let probe = Self::probe(path)?;
+        if probe.non_text {
+            return Err(Error::Other(tr("core.disk_engine.not_text").to_string()));
+        }
+        let base = Arc::new(BaseFile::open(path)?);
+        let bom_len = detect_bom_len(&base, probe.encoding, probe.size)?;
+        let (start, end) =
+            crate::large_file::align_range(path, from, to, probe.encoding, probe.size, cancel)?;
+        if start >= end || start >= probe.size {
+            return Err(Error::InvalidRange {
+                start: from,
+                end: to,
+                size: probe.size,
+            });
+        }
+        // The range owns the BOM only when it begins at file byte 0.
+        let body_start = if start == 0 { bom_len } else { start };
+        if body_start >= end {
+            return Err(Error::InvalidRange {
+                start,
+                end,
+                size: probe.size,
+            });
+        }
+        let range_bom = if start == 0 { bom_len } else { 0 };
+        let blocks = index_blocks(&base, body_start, end, probe.encoding, cancel, progress)?;
+        let mut engine = Self {
+            path: path.to_path_buf(),
+            encoding: probe.encoding,
+            eol: probe.eol,
+            bom_len: range_bom,
+            body_start,
+            base_len: probe.size,
+            body_len: end.saturating_sub(body_start),
+            range: Some(RangeSpec { start, end }),
+            base_modified: probe.last_modified,
+            // Range views are editable and can only be saved as a new file;
+            // a read-only source does not disable editing the range.
+            read_only: false,
+            editing_locked: false,
+            base,
+            blocks,
+            pieces: Vec::new(),
+            journal: Journal::create()?,
+            total_len: 0,
+            total_chars: 0,
+            total_newlines: 0,
+            history: Vec::new(),
+            history_pos: 0,
+            history_bytes: 0,
+            history_trimmed: false,
+            revision: 0,
+            cache: Mutex::new(BlockCache::new()),
+        };
+        engine.rebuild_pieces_from_blocks();
+        engine.verify_source_unchanged(probe.size, probe.last_modified)?;
+        progress.store(engine.body_len, Ordering::Relaxed);
+        Ok(engine)
+    }
+
+    fn verify_source_unchanged(&self, size: u64, modified: Option<SystemTime>) -> Result<()> {
+        if let Ok(metadata) = fs::metadata(&self.path) {
+            let changed = metadata.len() != size
+                || match (metadata.modified().ok(), modified) {
+                    (Some(current), Some(known)) => current != known,
+                    _ => false,
+                };
+            if changed {
+                return Err(Error::Other(
+                    tr("core.disk_engine.file_changed_during_index").to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -369,6 +492,17 @@ impl DiskEngine {
     /// Size of the base file on disk, including the BOM.
     pub fn base_size(&self) -> u64 {
         self.base_len
+    }
+
+    /// Total size of the source file. For a range view this is the whole file,
+    /// not the indexed range.
+    pub fn source_size(&self) -> u64 {
+        self.base_len
+    }
+
+    /// Source byte range indexed by a range view, or `None` for a whole file.
+    pub fn range(&self) -> Option<RangeSpec> {
+        self.range
     }
 
     pub fn last_modified(&self) -> Option<SystemTime> {
@@ -652,7 +786,7 @@ impl DiskEngine {
             .ok_or_else(|| Error::Other(tr("core.disk_engine.corrupt_index").to_string()))?;
         let raw = self
             .base
-            .read(self.bom_len + block.src_offset, block.src_len)?;
+            .read(self.body_start + block.src_offset, block.src_len)?;
         let text = Arc::new(eol::to_lf_owned(decode_body(&raw, self.encoding)));
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(index, text.clone());
@@ -1518,12 +1652,19 @@ impl DiskEngine {
     // ------------------------------------------------------------------
 
     /// Rebase the engine on a file just produced by a save.
+    ///
+    /// Saving a range view as a new file turns the engine into a whole-file
+    /// engine over the target, so the range is cleared here.
     pub fn adopt_saved(&mut self, report: SaveReport, path: PathBuf) -> Result<()> {
         let base = Arc::new(BaseFile::open(&path)?);
+        let bom_len = detect_bom_len(&base, self.encoding, report.size)?;
         self.path = path;
         self.base = base;
+        self.bom_len = bom_len;
+        self.body_start = bom_len;
         self.base_len = report.size;
-        self.body_len = report.size.saturating_sub(self.bom_len);
+        self.body_len = report.size.saturating_sub(bom_len);
+        self.range = None;
         self.base_modified = report.modified;
         self.read_only = report.read_only;
         self.editing_locked = false;
@@ -1542,7 +1683,8 @@ impl DiskEngine {
         Ok(())
     }
 
-    /// Re-index the file from scratch, discarding edits.
+    /// Re-index the file from scratch, discarding edits. A range view keeps its
+    /// source range and re-aligns it against the current file.
     pub fn reload(&mut self, cancel: &AtomicBool, progress: &AtomicU64) -> Result<()> {
         progress.store(0, Ordering::Relaxed);
         let probe = Self::probe(&self.path)?;
@@ -1551,14 +1693,61 @@ impl DiskEngine {
         }
         let base = Arc::new(BaseFile::open(&self.path)?);
         let bom_len = detect_bom_len(&base, probe.encoding, probe.size)?;
-        let blocks = index_blocks(&base, bom_len, probe.size, probe.encoding, cancel, progress)?;
+        let (body_start, body_end, range, range_bom) = match self.range {
+            Some(range) => {
+                let (start, end) = crate::large_file::align_range(
+                    &self.path,
+                    range.start,
+                    range.end,
+                    probe.encoding,
+                    probe.size,
+                    cancel,
+                )?;
+                if start >= end || start >= probe.size {
+                    return Err(Error::InvalidRange {
+                        start: range.start,
+                        end: range.end,
+                        size: probe.size,
+                    });
+                }
+                let body_start = if start == 0 { bom_len } else { start };
+                if body_start >= end {
+                    return Err(Error::InvalidRange {
+                        start,
+                        end,
+                        size: probe.size,
+                    });
+                }
+                (
+                    body_start,
+                    end,
+                    Some(RangeSpec { start, end }),
+                    if start == 0 { bom_len } else { 0 },
+                )
+            }
+            None => (bom_len, probe.size, None, bom_len),
+        };
+        let blocks = index_blocks(
+            &base,
+            body_start,
+            body_end,
+            probe.encoding,
+            cancel,
+            progress,
+        )?;
         self.encoding = probe.encoding;
         self.eol = probe.eol;
-        self.bom_len = bom_len;
+        self.bom_len = range_bom;
+        self.body_start = body_start;
         self.base_len = probe.size;
-        self.body_len = probe.size.saturating_sub(bom_len);
+        self.body_len = body_end.saturating_sub(body_start);
+        self.range = range;
         self.base_modified = probe.last_modified;
-        self.read_only = probe.read_only;
+        self.read_only = if range.is_some() {
+            false
+        } else {
+            probe.read_only
+        };
         self.base = base;
         self.blocks = blocks;
         self.journal.reset()?;
@@ -1572,7 +1761,14 @@ impl DiskEngine {
             cache.map.clear();
             cache.order.clear();
         }
-        progress.store(probe.size, Ordering::Relaxed);
+        progress.store(
+            if self.range.is_some() {
+                self.body_len
+            } else {
+                probe.size
+            },
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -1653,13 +1849,13 @@ fn shift_saturating(value: u64, delta: i64) -> u64 {
 
 fn index_blocks(
     base: &BaseFile,
-    bom_len: u64,
-    size: u64,
+    body_start: u64,
+    body_end: u64,
     encoding: TextEncoding,
     cancel: &AtomicBool,
     progress: &AtomicU64,
 ) -> Result<Vec<Block>> {
-    let body_len = size.saturating_sub(bom_len);
+    let body_len = body_end.saturating_sub(body_start);
     let mut blocks = Vec::new();
     let mut buffer: Vec<u8> = Vec::with_capacity(BLOCK_TARGET_BYTES + 2 * READ_CHUNK_BYTES);
     let mut begin = 0usize;
@@ -1680,14 +1876,14 @@ fn index_blocks(
                 eof = true;
                 break;
             }
-            let chunk = base.read(bom_len + read_pos, want as u64)?;
+            let chunk = base.read(body_start + read_pos, want as u64)?;
             if chunk.is_empty() {
                 eof = true;
                 break;
             }
             read_pos += chunk.len() as u64;
             buffer.extend_from_slice(&chunk);
-            progress.store(bom_len + read_pos, Ordering::Relaxed);
+            progress.store(read_pos, Ordering::Relaxed);
             if read_pos >= body_len {
                 eof = true;
             }
@@ -1723,7 +1919,7 @@ fn index_blocks(
         }
     }
 
-    progress.store(size, Ordering::Relaxed);
+    progress.store(body_len, Ordering::Relaxed);
     Ok(blocks)
 }
 
@@ -2470,5 +2666,133 @@ mod tests {
         let progress = AtomicU64::new(0);
         let result = DiskEngine::open(&path, &cancel, &progress);
         assert!(result.is_err());
+    }
+
+    fn open_range(path: &Path, from: u64, to: u64) -> DiskEngine {
+        DiskEngine::open_range(path, from, to, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap()
+    }
+
+    #[test]
+    fn range_open_indexes_only_the_selected_lines() {
+        let (_dir, path) = write_file("range.txt", b"one\ntwo\nthree\nfour\n");
+        let engine = open_range(&path, 4, 9);
+        assert_eq!(engine.range(), Some(RangeSpec { start: 4, end: 14 }));
+        assert_eq!(engine.source_size(), 19);
+        assert_eq!(engine.total_len(), 10);
+        assert_eq!(engine.total_lines(), 3);
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "two\nthree\n"
+        );
+        let window = engine.read_window(0, 1024).unwrap();
+        assert_eq!(window.text, "two\nthree\n");
+        assert_eq!(window.line, 1);
+        assert!(window.at_eof);
+        assert_eq!(engine.line_at(0).unwrap(), 1);
+        assert_eq!(engine.line_at(4).unwrap(), 2);
+    }
+
+    #[test]
+    fn range_edits_and_search_stay_inside_the_range() {
+        let (_dir, path) = write_file("range-edit.txt", b"one\ntwo\nthree\nfour\n");
+        let mut engine = open_range(&path, 4, 9);
+        engine.apply_edit(0, 0, "T").unwrap();
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "Ttwo\nthree\n"
+        );
+        engine.undo().unwrap();
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "two\nthree\n"
+        );
+
+        let inside = SearchEngine::new("three", SearchOptions::default());
+        let hit = engine
+            .find(&inside, 0, true, &no_cancel(), &AtomicU64::new(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.line, 2);
+        assert_eq!(hit.start, 4);
+        let outside = SearchEngine::new("one", SearchOptions::default());
+        assert!(engine
+            .find(&outside, 0, true, &no_cancel(), &AtomicU64::new(0))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn range_save_as_writes_only_the_range_and_adopts_the_target() {
+        let (dir, path) = write_file("range-save.txt", b"one\ntwo\nthree\nfour\n");
+        let mut engine = open_range(&path, 4, 9);
+        let target = dir.path().join("part.txt");
+        let report = engine
+            .snapshot()
+            .write(&target, false, &AtomicU64::new(0), &no_cancel())
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"two\nthree\n");
+        assert_eq!(report.file_size(), 10);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"one\ntwo\nthree\nfour\n",
+            "the source stays untouched"
+        );
+        engine.adopt_saved(report, target.clone()).unwrap();
+        assert_eq!(engine.range(), None);
+        assert_eq!(engine.total_len(), 10);
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "two\nthree\n"
+        );
+    }
+
+    #[test]
+    fn range_save_as_refuses_to_overwrite_the_source() {
+        let (_dir, path) = write_file("range-source.txt", b"one\ntwo\nthree\nfour\n");
+        let engine = open_range(&path, 4, 9);
+        let result = engine
+            .snapshot()
+            .write(&path, true, &AtomicU64::new(0), &no_cancel());
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"one\ntwo\nthree\nfour\n");
+    }
+
+    #[test]
+    fn edited_range_save_as_starts_at_the_range_offset() {
+        let (dir, path) = write_file("range-edited-save.txt", b"aaaaa\nbbbbb\nccccc\n");
+        let mut engine = open_range(&path, 6, 18);
+        // Split the first source block: the edited piece is no longer raw and
+        // its untouched prefix must still be read from the range offset.
+        engine.apply_edit(1, 0, "X").unwrap();
+        let target = dir.path().join("edited-part.txt");
+        let report = engine
+            .snapshot()
+            .write(&target, false, &AtomicU64::new(0), &no_cancel())
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"bXbbbb\nccccc\n");
+        assert_eq!(report.file_size(), 13);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"aaaaa\nbbbbb\nccccc\n",
+            "the source stays untouched"
+        );
+    }
+
+    #[test]
+    fn range_open_rejects_non_text_and_reloads_locally() {
+        let (_dir, binary) = write_file("range.bin", &[0, 1, 2, 0, 4, 5]);
+        assert!(
+            DiskEngine::open_range(&binary, 0, 4, &AtomicBool::new(false), &AtomicU64::new(0))
+                .is_err()
+        );
+
+        let (_dir, path) = write_file("range-reload.txt", b"one\ntwo\nthree\nfour\n");
+        let mut engine = open_range(&path, 4, 9);
+        engine.reload(&no_cancel(), &AtomicU64::new(0)).unwrap();
+        assert_eq!(engine.range(), Some(RangeSpec { start: 4, end: 14 }));
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "two\nthree\n"
+        );
     }
 }
