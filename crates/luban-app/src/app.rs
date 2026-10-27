@@ -6868,6 +6868,7 @@ impl LubanApp {
             .map(|d| d.language.clone())
             .unwrap_or_else(|| language::PLAIN_TEXT.to_string());
         let active_partial = self.active_doc().is_some_and(Document::is_partial);
+        let active_huge = self.active_doc().is_some_and(Document::is_huge);
 
         let weak_file = weak.clone();
         let weak_edit = weak.clone();
@@ -6972,7 +6973,7 @@ impl LubanApp {
                     .item(Self::menu_item(
                         &weak_file,
                         tr("menu.file.reload"),
-                        !has_doc || active_partial,
+                        !has_doc || (active_partial && !active_huge),
                         None,
                         |this, window, cx| {
                             this.reload_active(window, cx);

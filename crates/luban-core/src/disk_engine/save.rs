@@ -276,7 +276,7 @@ impl SaveSnapshot {
                     Error::Other(tr("core.disk_engine.corrupt_index").to_string())
                 })?;
                 let mut raw = vec![0u8; usize::try_from(block.src_len).unwrap_or(0)];
-                read_exact_at(&base.file, &mut raw, self.bom_len + block.src_offset)?;
+                read_exact_at(&base.file, &mut raw, self.body_start + block.src_offset)?;
                 let decoded = eol::to_lf_owned(decode_body(&raw, self.encoding));
                 let begin = usize::try_from(piece.offset)
                     .unwrap_or(0)

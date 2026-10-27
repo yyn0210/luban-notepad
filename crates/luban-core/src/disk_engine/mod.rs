@@ -2758,6 +2758,27 @@ mod tests {
     }
 
     #[test]
+    fn edited_range_save_as_starts_at_the_range_offset() {
+        let (dir, path) = write_file("range-edited-save.txt", b"aaaaa\nbbbbb\nccccc\n");
+        let mut engine = open_range(&path, 6, 18);
+        // Split the first source block: the edited piece is no longer raw and
+        // its untouched prefix must still be read from the range offset.
+        engine.apply_edit(1, 0, "X").unwrap();
+        let target = dir.path().join("edited-part.txt");
+        let report = engine
+            .snapshot()
+            .write(&target, false, &AtomicU64::new(0), &no_cancel())
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"bXbbbb\nccccc\n");
+        assert_eq!(report.file_size(), 13);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"aaaaa\nbbbbb\nccccc\n",
+            "the source stays untouched"
+        );
+    }
+
+    #[test]
     fn range_open_rejects_non_text_and_reloads_locally() {
         let (_dir, binary) = write_file("range.bin", &[0, 1, 2, 0, 4, 5]);
         assert!(
