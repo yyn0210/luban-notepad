@@ -15,7 +15,7 @@ use gpui_kit::component::input::{
     SelectAll, TabSize, Undo,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarMode};
 use gpui_kit::component::slider::SliderEvent;
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
@@ -58,7 +58,7 @@ use crate::i18n::{active_language_name, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
 use crate::logging;
 use crate::palette::{self, QuickTarget};
-use crate::preferences::PreferencesState;
+use crate::preferences::{matching_fonts, FontPickerState, PreferencesState};
 use crate::theme::apply_theme;
 use crate::util::{self, language_key};
 
@@ -495,9 +495,10 @@ pub struct LubanApp {
 /// columns instead of chars keeps CJK-heavy paths within the same budget.
 const RECENT_PATH_COLUMNS: usize = 48;
 
-/// Fixed tab width, so a drag can be translated into a slot without
-/// measuring every tab label.
-const TAB_WIDTH: f32 = 180.0;
+/// Tabs size to their title so short file names do not leave dead space,
+/// while the range keeps tiny and very long labels usable.
+const TAB_MIN_WIDTH: f32 = 80.0;
+const TAB_MAX_WIDTH: f32 = 180.0;
 
 /// Elide the middle of a string that is wider than `max_columns`, keeping
 /// both ends readable. Paths benefit from the trailing component, so the
@@ -629,7 +630,7 @@ impl LubanApp {
             large_file: LargeFilePanel::new(window, cx),
             large_loads: Vec::new(),
             next_load_generation: 1,
-            preferences: PreferencesState::new(window, cx),
+            preferences: PreferencesState::new(),
             file_dialog: None,
             file_path_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(tr("dialog.path_placeholder"))),
@@ -818,19 +819,6 @@ impl LubanApp {
                     }
                 }));
         }
-        app._subscriptions.push(
-            cx.subscribe(&app.preferences.font_input, |this, _, event, cx| {
-                if matches!(event, InputEvent::Change) {
-                    if let InputEvent::Change = event {
-                        let value = this.preferences.font_input.read(cx).value().to_string();
-                        if value != this.settings.font_family {
-                            cx.notify();
-                        }
-                    }
-                }
-            }),
-        );
-
         for (entity, field) in [
             (app.large_file.from_input.clone(), RangeField::From),
             (app.large_file.to_input.clone(), RangeField::To),
@@ -6694,14 +6682,15 @@ impl LubanApp {
             (self.find_in_files.query.clone(), "ff.query_placeholder"),
             (self.find_in_files.folder.clone(), "ff.folder_placeholder"),
             (self.find_in_files.masks.clone(), "ff.masks_placeholder"),
-            (
-                self.preferences.font_input.clone(),
-                "prefs.font_placeholder",
-            ),
         ];
         for (input, key) in inputs {
             input.update(cx, |state, cx| {
                 state.set_placeholder(tr(key), window, cx);
+            });
+        }
+        if let Some(picker) = &self.preferences.font_picker {
+            picker.filter.update(cx, |state, cx| {
+                state.set_placeholder(tr("prefs.font_search_placeholder"), window, cx);
             });
         }
         if let Some(state) = &self.go_to_line {
@@ -8257,8 +8246,15 @@ impl LubanApp {
                 cx.notify();
                 return true;
             }
+            if self.preferences.font_picker.is_some() {
+                self.preferences.font_picker = None;
+                self.focus_editor(window, cx);
+                cx.notify();
+                return true;
+            }
             if self.preferences.open {
                 self.preferences.open = false;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
@@ -9583,7 +9579,8 @@ impl LubanApp {
                 .items_center()
                 .gap_2()
                 .px_3()
-                .w(px(TAB_WIDTH))
+                .min_w(px(TAB_MIN_WIDTH))
+                .max_w(px(TAB_MAX_WIDTH))
                 .h_full()
                 .overflow_hidden()
                 .border_r_1()
@@ -9594,12 +9591,15 @@ impl LubanApp {
                 .child(
                     div()
                         .text_sm()
+                        .truncate()
+                        .min_w(px(0.))
                         .when(active, |this| this.font_weight(FontWeight::MEDIUM))
                         .child(label),
                 )
                 .child(
                     div()
                         .id(format!("tab-close:{id}"))
+                        .flex_shrink_0()
                         .px_1()
                         .rounded_sm()
                         .text_xs()
@@ -11755,6 +11755,9 @@ impl LubanApp {
         if self.preferences.open {
             overlays.push(self.render_preferences(window, cx));
         }
+        if self.preferences.font_picker.is_some() {
+            overlays.push(self.render_font_picker(window, cx));
+        }
         if self.palette.is_some() {
             overlays.push(self.render_palette(window, cx));
         }
@@ -12382,23 +12385,47 @@ impl LubanApp {
         self.overlay_card(520.0, Some(560.0), cx, content)
     }
 
-    fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_preferences(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.open = true;
-        let value = self.settings.font_family.clone();
-        self.preferences
-            .font_input
-            .update(cx, |input, cx| input.set_value(value, window, cx));
         cx.notify();
+    }
+
+    fn open_font_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &self.preferences.font_picker {
+            picker.filter.update(cx, |filter, cx| {
+                filter.set_value(String::new(), window, cx);
+                filter.focus(window, cx);
+            });
+            return;
+        }
+        if self.preferences.fonts.is_none() {
+            self.preferences.fonts = Some(cx.text_system().all_font_names());
+        }
+        let fonts = self.preferences.fonts.clone().unwrap_or_default();
+        let picker = FontPickerState::new(window, cx, fonts);
+        picker
+            .filter
+            .update(cx, |filter, cx| filter.focus(window, cx));
+        self.preferences.font_picker = Some(picker);
+        cx.notify();
+    }
+
+    fn select_font_family(&mut self, family: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.font_family = family;
+        self.preferences.font_picker = None;
+        // The picker owned focus through its filter input; hand it back so
+        // Escape and the global shortcuts keep reaching the app.
+        self.focus_editor(window, cx);
+        self.apply_settings(window, cx);
     }
 
     fn render_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
-        let font_input = self.preferences.font_input.clone();
         let settings = self.settings.clone();
         let weak_theme_light = cx.weak_entity();
         let weak_theme_dark = cx.weak_entity();
         let weak_close = cx.weak_entity();
-        let weak_apply_font = cx.weak_entity();
+        let weak_font_picker = cx.weak_entity();
         let weak_zoom_in = cx.weak_entity();
         let weak_zoom_out = cx.weak_entity();
         let weak_tab_in = cx.weak_entity();
@@ -12466,13 +12493,14 @@ impl LubanApp {
         let content = div()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_5()
+            .h_full()
+            .min_h(px(0.))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .p_5()
                     .child(
                         div()
                             .text_lg()
@@ -12483,9 +12511,11 @@ impl LubanApp {
                         Button::new("prefs-close")
                             .label(tr("common.close"))
                             .compact()
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 let _ = weak_close.update(cx, |this, cx| {
                                     this.preferences.open = false;
+                                    this.preferences.font_picker = None;
+                                    this.focus_editor(window, cx);
                                     cx.notify();
                                 });
                             }),
@@ -12493,306 +12523,72 @@ impl LubanApp {
             )
             .child(
                 div()
+                    .id("prefs-scroll")
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_3()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scrollbar()
+                    .px_5()
+                    .pb_5()
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(140.)).text_sm().child(tr("prefs.language")))
-                            .child(language_system)
-                            .child(language_en)
-                            .child(language_zh),
-                    )
-                    .when(settings.ui_language == "system", |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().colors.muted_foreground)
-                                .child(tr_args(
-                                    "prefs.language_current",
-                                    &[("language", active_language_name().to_string())],
-                                )),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().w(px(140.)).text_sm().child(tr("prefs.theme")))
-                    .child(
-                        Button::new("prefs-light")
-                            .label(tr("prefs.light"))
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_theme_light.update(cx, |this, cx| {
-                                    this.settings.theme = ThemeChoice::Light;
-                                    this.apply_settings(window, cx);
-                                });
-                            }),
-                    )
-                    .child(Button::new("prefs-dark").label(tr("prefs.dark")).on_click(
-                        move |_, window, cx| {
-                            let _ = weak_theme_dark.update(cx, |this, cx| {
-                                this.settings.theme = ThemeChoice::Dark;
-                                this.apply_settings(window, cx);
-                            });
-                        },
-                    ))
-                    .child(
-                        Button::new("prefs-system")
-                            .label(tr("prefs.system_theme"))
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_theme_system.update(cx, |this, cx| {
-                                    this.settings.theme = ThemeChoice::System;
-                                    this.apply_settings(window, cx);
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().w(px(140.)).text_sm().child(tr("prefs.font_size")))
-                    .child(
-                        Button::new("prefs-font-minus")
-                            .label("−")
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_zoom_out.update(cx, |this, cx| this.zoom(-1.0, cx));
-                            }),
-                    )
-                    .child(div().text_sm().child(tr_args(
-                        "prefs.pixels",
-                        &[("size", format!("{:.0}", settings.font_size))],
-                    )))
-                    .child(
-                        Button::new("prefs-font-plus")
-                            .label("+")
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_zoom_in.update(cx, |this, cx| this.zoom(1.0, cx));
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().w(px(140.)).text_sm().child(tr("prefs.font_family")))
-                    .child(div().flex_1().child(Input::new(&font_input).h(px(30.))))
-                    .child(
-                        Button::new("prefs-apply-font")
-                            .label(tr("prefs.apply"))
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_apply_font.update(cx, |this, cx| {
-                                    this.settings.font_family =
-                                        this.preferences.font_input.read(cx).value().to_string();
-                                    this.apply_settings(window, cx);
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().w(px(140.)).text_sm().child(tr("prefs.tab_size")))
-                    .child(
-                        Button::new("prefs-tab-minus")
-                            .label("−")
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_tab_out.update(cx, |this, cx| {
-                                    this.settings.tab_size =
-                                        this.settings.tab_size.saturating_sub(1).max(1);
-                                    this.apply_settings(window, cx);
-                                });
-                            }),
-                    )
-                    .child(div().text_sm().child(format!("{}", settings.tab_size)))
-                    .child(Button::new("prefs-tab-plus").label("+").compact().on_click(
-                        move |_, window, cx| {
-                            let _ = weak_tab_in.update(cx, |this, cx| {
-                                this.settings.tab_size = (this.settings.tab_size + 1).min(16);
-                                this.apply_settings(window, cx);
-                            });
-                        },
-                    ))
-                    .child(toggle_row(
-                        tr("prefs.insert_spaces"),
-                        settings.use_spaces,
-                        "prefs-spaces",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.use_spaces = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(tr("prefs.editor")),
-                    )
-                    .child(toggle_row(
-                        tr("prefs.line_numbers"),
-                        settings.show_line_numbers,
-                        "prefs-linenumbers",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.show_line_numbers = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    ))
-                    .child(toggle_row(
-                        tr("prefs.word_wrap"),
-                        settings.word_wrap,
-                        "prefs-wrap",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.word_wrap = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    ))
-                    .child(toggle_row(
-                        tr("prefs.match_brackets"),
-                        settings.highlight_matching_brackets,
-                        "prefs-brackets",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.highlight_matching_brackets = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    ))
-                    .child(toggle_row(
-                        tr("prefs.trim_on_save"),
-                        settings.trim_trailing_whitespace_on_save,
-                        "prefs-trim",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.trim_trailing_whitespace_on_save = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(tr("prefs.session")),
-                    )
-                    .child(toggle_row(
-                        tr("prefs.restore_session"),
-                        settings.restore_session,
-                        "prefs-restore",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.restore_session = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    ))
-                    .child(toggle_row(
-                        tr("prefs.autosave"),
-                        settings.autosave_session,
-                        "prefs-autosave",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.autosave_session = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    ))
-                    .child(toggle_row(
-                        tr("prefs.hidden_files"),
-                        settings.show_hidden_files,
-                        "prefs-hidden",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.show_hidden_files = checked;
-                            this.explorer.refresh();
-                            this.apply_settings(window, cx);
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(tr("prefs.local_history")),
-                    )
-                    .child(toggle_row(
-                        tr("prefs.local_history_enabled"),
-                        settings.local_history_enabled,
-                        "prefs-history-enabled",
-                        weak.clone(),
-                        |this, checked, window, cx| {
-                            this.settings.local_history_enabled = checked;
-                            this.apply_settings(window, cx);
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .w(px(140.))
-                                    .text_sm()
-                                    .child(tr("prefs.local_history_days")),
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(div().w(px(140.)).text_sm().child(tr("prefs.language")))
+                                    .child(language_system)
+                                    .child(language_en)
+                                    .child(language_zh),
                             )
+                            .when(settings.ui_language == "system", |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(tr_args(
+                                            "prefs.language_current",
+                                            &[("language", active_language_name().to_string())],
+                                        )),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().w(px(140.)).text_sm().child(tr("prefs.theme")))
                             .child(
-                                Button::new("prefs-history-days-down")
-                                    .label("−")
-                                    .compact()
+                                Button::new("prefs-light")
+                                    .label(tr("prefs.light"))
                                     .on_click(move |_, window, cx| {
-                                        let _ = weak_days_down.update(cx, |this, cx| {
-                                            this.settings.local_history_days = this
-                                                .settings
-                                                .local_history_days
-                                                .saturating_sub(1)
-                                                .max(1);
+                                        let _ = weak_theme_light.update(cx, |this, cx| {
+                                            this.settings.theme = ThemeChoice::Light;
                                             this.apply_settings(window, cx);
                                         });
                                     }),
                             )
+                            .child(Button::new("prefs-dark").label(tr("prefs.dark")).on_click(
+                                move |_, window, cx| {
+                                    let _ = weak_theme_dark.update(cx, |this, cx| {
+                                        this.settings.theme = ThemeChoice::Dark;
+                                        this.apply_settings(window, cx);
+                                    });
+                                },
+                            ))
                             .child(
-                                div()
-                                    .text_sm()
-                                    .child(settings.local_history_days.to_string()),
-                            )
-                            .child(
-                                Button::new("prefs-history-days-up")
-                                    .label("+")
-                                    .compact()
+                                Button::new("prefs-system")
+                                    .label(tr("prefs.system_theme"))
                                     .on_click(move |_, window, cx| {
-                                        let _ = weak_days_up.update(cx, |this, cx| {
-                                            this.settings.local_history_days =
-                                                (this.settings.local_history_days + 1).min(3650);
+                                        let _ = weak_theme_system.update(cx, |this, cx| {
+                                            this.settings.theme = ThemeChoice::System;
                                             this.apply_settings(window, cx);
                                         });
                                     }),
@@ -12803,65 +12599,436 @@ impl LubanApp {
                             .flex()
                             .items_center()
                             .gap_3()
+                            .child(div().w(px(140.)).text_sm().child(tr("prefs.font_size")))
                             .child(
-                                div()
-                                    .w(px(140.))
-                                    .text_sm()
-                                    .child(tr("prefs.local_history_size")),
-                            )
-                            .child(
-                                Button::new("prefs-history-mb-down")
+                                Button::new("prefs-font-minus")
                                     .label("−")
                                     .compact()
-                                    .on_click(move |_, window, cx| {
-                                        let _ = weak_mb_down.update(cx, |this, cx| {
-                                            this.settings.local_history_max_mb = this
-                                                .settings
-                                                .local_history_max_mb
-                                                .saturating_sub(1)
-                                                .max(1);
-                                            this.apply_settings(window, cx);
-                                        });
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_zoom_out
+                                            .update(cx, |this, cx| this.zoom(-1.0, cx));
+                                    }),
+                            )
+                            .child(div().text_sm().child(tr_args(
+                                "prefs.pixels",
+                                &[("size", format!("{:.0}", settings.font_size))],
+                            )))
+                            .child(
+                                Button::new("prefs-font-plus")
+                                    .label("+")
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ =
+                                            weak_zoom_in.update(cx, |this, cx| this.zoom(1.0, cx));
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().w(px(140.)).text_sm().child(tr("prefs.font_family")))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(if settings.font_family.is_empty() {
+                                        tr("prefs.font_default")
+                                    } else {
+                                        settings.font_family.clone()
                                     }),
                             )
                             .child(
-                                div()
-                                    .text_sm()
-                                    .child(settings.local_history_max_mb.to_string()),
-                            )
-                            .child(
-                                Button::new("prefs-history-mb-up")
-                                    .label("+")
+                                Button::new("prefs-choose-font")
+                                    .label(tr("prefs.choose_font"))
                                     .compact()
                                     .on_click(move |_, window, cx| {
-                                        let _ = weak_mb_up.update(cx, |this, cx| {
-                                            this.settings.local_history_max_mb =
-                                                (this.settings.local_history_max_mb + 1).min(4096);
-                                            this.apply_settings(window, cx);
+                                        let _ = weak_font_picker.update(cx, |this, cx| {
+                                            this.open_font_picker(window, cx);
                                         });
                                     }),
                             ),
                     )
                     .child(
-                        Button::new("prefs-shortcuts")
-                            .label(tr("shortcuts.customize"))
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_shortcuts.update(cx, |this, cx| {
-                                    this.open_shortcut_editor(cx);
-                                });
-                            }),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().w(px(140.)).text_sm().child(tr("prefs.tab_size")))
+                            .child(
+                                Button::new("prefs-tab-minus")
+                                    .label("−")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_tab_out.update(cx, |this, cx| {
+                                            this.settings.tab_size =
+                                                this.settings.tab_size.saturating_sub(1).max(1);
+                                            this.apply_settings(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(div().text_sm().child(format!("{}", settings.tab_size)))
+                            .child(Button::new("prefs-tab-plus").label("+").compact().on_click(
+                                move |_, window, cx| {
+                                    let _ = weak_tab_in.update(cx, |this, cx| {
+                                        this.settings.tab_size =
+                                            (this.settings.tab_size + 1).min(16);
+                                        this.apply_settings(window, cx);
+                                    });
+                                },
+                            ))
+                            .child(toggle_row(
+                                tr("prefs.insert_spaces"),
+                                settings.use_spaces,
+                                "prefs-spaces",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.use_spaces = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(tr("prefs.editor")),
+                            )
+                            .child(toggle_row(
+                                tr("prefs.line_numbers"),
+                                settings.show_line_numbers,
+                                "prefs-linenumbers",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.show_line_numbers = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            ))
+                            .child(toggle_row(
+                                tr("prefs.word_wrap"),
+                                settings.word_wrap,
+                                "prefs-wrap",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.word_wrap = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            ))
+                            .child(toggle_row(
+                                tr("prefs.match_brackets"),
+                                settings.highlight_matching_brackets,
+                                "prefs-brackets",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.highlight_matching_brackets = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            ))
+                            .child(toggle_row(
+                                tr("prefs.trim_on_save"),
+                                settings.trim_trailing_whitespace_on_save,
+                                "prefs-trim",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.trim_trailing_whitespace_on_save = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(tr("prefs.session")),
+                            )
+                            .child(toggle_row(
+                                tr("prefs.restore_session"),
+                                settings.restore_session,
+                                "prefs-restore",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.restore_session = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            ))
+                            .child(toggle_row(
+                                tr("prefs.autosave"),
+                                settings.autosave_session,
+                                "prefs-autosave",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.autosave_session = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            ))
+                            .child(toggle_row(
+                                tr("prefs.hidden_files"),
+                                settings.show_hidden_files,
+                                "prefs-hidden",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.show_hidden_files = checked;
+                                    this.explorer.refresh();
+                                    this.apply_settings(window, cx);
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(tr("prefs.local_history")),
+                            )
+                            .child(toggle_row(
+                                tr("prefs.local_history_enabled"),
+                                settings.local_history_enabled,
+                                "prefs-history-enabled",
+                                weak.clone(),
+                                |this, checked, window, cx| {
+                                    this.settings.local_history_enabled = checked;
+                                    this.apply_settings(window, cx);
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .w(px(140.))
+                                            .text_sm()
+                                            .child(tr("prefs.local_history_days")),
+                                    )
+                                    .child(
+                                        Button::new("prefs-history-days-down")
+                                            .label("−")
+                                            .compact()
+                                            .on_click(move |_, window, cx| {
+                                                let _ = weak_days_down.update(cx, |this, cx| {
+                                                    this.settings.local_history_days = this
+                                                        .settings
+                                                        .local_history_days
+                                                        .saturating_sub(1)
+                                                        .max(1);
+                                                    this.apply_settings(window, cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .child(settings.local_history_days.to_string()),
+                                    )
+                                    .child(
+                                        Button::new("prefs-history-days-up")
+                                            .label("+")
+                                            .compact()
+                                            .on_click(move |_, window, cx| {
+                                                let _ = weak_days_up.update(cx, |this, cx| {
+                                                    this.settings.local_history_days =
+                                                        (this.settings.local_history_days + 1)
+                                                            .min(3650);
+                                                    this.apply_settings(window, cx);
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .w(px(140.))
+                                            .text_sm()
+                                            .child(tr("prefs.local_history_size")),
+                                    )
+                                    .child(
+                                        Button::new("prefs-history-mb-down")
+                                            .label("−")
+                                            .compact()
+                                            .on_click(move |_, window, cx| {
+                                                let _ = weak_mb_down.update(cx, |this, cx| {
+                                                    this.settings.local_history_max_mb = this
+                                                        .settings
+                                                        .local_history_max_mb
+                                                        .saturating_sub(1)
+                                                        .max(1);
+                                                    this.apply_settings(window, cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .child(settings.local_history_max_mb.to_string()),
+                                    )
+                                    .child(
+                                        Button::new("prefs-history-mb-up")
+                                            .label("+")
+                                            .compact()
+                                            .on_click(move |_, window, cx| {
+                                                let _ = weak_mb_up.update(cx, |this, cx| {
+                                                    this.settings.local_history_max_mb =
+                                                        (this.settings.local_history_max_mb + 1)
+                                                            .min(4096);
+                                                    this.apply_settings(window, cx);
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                Button::new("prefs-shortcuts")
+                                    .label(tr("shortcuts.customize"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_shortcuts.update(cx, |this, cx| {
+                                            this.open_shortcut_editor(cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(tr("prefs.footer")),
                     ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().colors.muted_foreground)
-                    .child(tr("prefs.footer")),
             )
             .into_any_element();
         let _ = window;
         self.overlay_card(680.0, Some(640.0), cx, content)
+    }
+
+    fn render_font_picker(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(picker) = &self.preferences.font_picker else {
+            return div().into_any_element();
+        };
+        let filter = picker.filter.clone();
+        let filter_text = filter.read(cx).value().to_string();
+        let current = self.settings.font_family.clone();
+        let weak = cx.weak_entity();
+        let default_selected = current.is_empty();
+        let weak_default = weak.clone();
+        let mut list = vec![div()
+            .id("font-default")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .text_sm()
+            .cursor_pointer()
+            .when(default_selected, |this| {
+                this.bg(cx.theme().colors.secondary)
+            })
+            .hover(|this| this.bg(cx.theme().colors.secondary_hover))
+            .child(if default_selected { "•" } else { " " })
+            .child(tr("prefs.font_default"))
+            .on_click(move |_, window, cx| {
+                let _ = weak_default.update(cx, |this, cx| {
+                    this.select_font_family(String::new(), window, cx);
+                });
+            })
+            .into_any_element()];
+        for name in matching_fonts(&picker.fonts, &filter_text) {
+            let selected = name == current;
+            let name_owned = name.to_string();
+            let weak_item = weak.clone();
+            list.push(
+                div()
+                    .id(format!("font:{name_owned}"))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(cx.theme().colors.secondary))
+                    .hover(|this| this.bg(cx.theme().colors.secondary_hover))
+                    .child(if selected { "•" } else { " " })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(name_owned.clone()),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_item.update(cx, |this, cx| {
+                            this.select_font_family(name_owned.clone(), window, cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        let weak_close = cx.weak_entity();
+        let content = div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .min_h(px(0.))
+            .gap_2()
+            .p_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr("prefs.font_picker_title")),
+                    )
+                    .child(
+                        Button::new("font-picker-close")
+                            .label(tr("common.close"))
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_close.update(cx, |this, cx| {
+                                    this.preferences.font_picker = None;
+                                    this.focus_editor(window, cx);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(Input::new(&filter).h(px(30.)))
+            .child(
+                div()
+                    .id("font-list")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scrollbar()
+                    .children(list),
+            )
+            .into_any_element();
+        self.overlay_card(480.0, Some(560.0), cx, content)
     }
 }
 

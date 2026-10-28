@@ -595,12 +595,18 @@ prefs.font_size:
 prefs.font_family:
   en: "Font family"
   zh-CN: "字体"
-prefs.font_placeholder:
-  en: "Monospace font family (empty = theme default)"
-  zh-CN: "等宽字体（留空使用主题默认值）"
-prefs.apply:
-  en: "Apply"
-  zh-CN: "应用"
+prefs.font_default:
+  en: "Theme default (monospace)"
+  zh-CN: "主题默认（等宽）"
+prefs.choose_font:
+  en: "Choose…"
+  zh-CN: "选择…"
+prefs.font_picker_title:
+  en: "Choose font"
+  zh-CN: "选择字体"
+prefs.font_search_placeholder:
+  en: "Search installed fonts"
+  zh-CN: "搜索系统字体"
 prefs.tab_size:
   en: "Tab size"
   zh-CN: "制表符宽度"
