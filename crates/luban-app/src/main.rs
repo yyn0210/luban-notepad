@@ -10,6 +10,7 @@ mod dialogs;
 mod explorer;
 mod find;
 mod huge_file;
+mod huge_gutter;
 mod huge_scrollbar;
 mod i18n;
 mod icons;

@@ -43,9 +43,11 @@ use crate::dialogs::{
 use crate::explorer::ExplorerState;
 use crate::find::{FindInFilesPanel, FindPanel};
 use crate::huge_file::{
-    clamp_top_line, diff_bytes, max_top_line, window_max_top_line, HugeFileUi, SaveJob, SearchJob,
-    SearchKind, WindowJump, WindowRequest, WindowTarget, EDGE_LINES, PREFETCH_LINES,
+    clamp_top_line, diff_bytes, max_top_line, top_line_from_scroll, window_max_top_line,
+    HugeFileUi, SaveJob, SearchJob, SearchKind, WindowJump, WindowRequest, WindowTarget,
+    EDGE_LINES, PREFETCH_LINES,
 };
+use crate::huge_gutter::{self, HugeGutterProps};
 use crate::huge_scrollbar::{self, HugeScrollbarProps};
 use crate::i18n::{active_language_name, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
@@ -77,6 +79,10 @@ pub struct Tab {
     pub large_file: bool,
     decorations_key: Option<DecorationKey>,
     _subscription: Subscription,
+    /// Re-renders the app when the editor notifies without an `InputEvent`
+    /// (wheel scrolling, cursor motion), so the file scrollbar and the global
+    /// gutter follow the viewport.
+    _notification: Subscription,
 }
 
 type DecorationKey = (u64, usize, u64, bool, bool, bool);
@@ -664,7 +670,12 @@ impl LubanApp {
         huge_cursor: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (Entity<EditorState>, RangeDecorationCollection, Subscription) {
+    ) -> (
+        Entity<EditorState>,
+        RangeDecorationCollection,
+        Subscription,
+        Subscription,
+    ) {
         // Large documents are mounted by moving the decoded buffer into the
         // editor; the document then releases its own copy. Disk-engine
         // documents mount only their bounded window.
@@ -680,7 +691,9 @@ impl LubanApp {
         } else {
             language_key(&doc.language).to_string()
         };
-        let line_numbers = self.settings.show_line_numbers;
+        // Disk-engine tabs render a document-global gutter in the app, so the
+        // editor's window-local gutter stays off.
+        let line_numbers = self.settings.show_line_numbers && !doc.is_huge();
         let wrap = !large_file && self.settings.word_wrap;
         let tab_size = self.settings.tab_size;
         let use_spaces = self.settings.use_spaces;
@@ -748,7 +761,20 @@ impl LubanApp {
             cx.notify();
         });
 
-        (editor, decorations, subscription)
+        // Wheel and keyboard scrolling only notify the editor entity. A huge
+        // tab must re-render the app so the file-global scrollbar and gutter
+        // are recomputed from the fresh scroll offset.
+        let notification = cx.observe(&editor, |this, editor, cx| {
+            let follows_editor = this
+                .tabs
+                .get(this.active)
+                .is_some_and(|tab| tab.editor == editor && tab.huge.is_some());
+            if follows_editor {
+                cx.notify();
+            }
+        });
+
+        (editor, decorations, subscription, notification)
     }
 
     fn add_document(&mut self, doc: Document, window: &mut Window, cx: &mut Context<Self>) {
@@ -763,7 +789,7 @@ impl LubanApp {
             .as_ref()
             .map(|window| HugeFileUi::new(window.clone()));
         let huge_cursor = doc.huge().map(|huge| huge.cursor);
-        let (editor, decorations, subscription) =
+        let (editor, decorations, subscription, notification) =
             self.new_editor(&mut doc, large_file, initial, huge_cursor, window, cx);
         self.tabs.push(Tab {
             id,
@@ -776,6 +802,7 @@ impl LubanApp {
             large_file,
             decorations_key: None,
             _subscription: subscription,
+            _notification: notification,
         });
         self.active = self.tabs.len() - 1;
         self.focus_editor = true;
@@ -2436,6 +2463,9 @@ impl LubanApp {
         if let Some(ui) = self.tabs.get_mut(index).and_then(|tab| tab.huge.as_mut()) {
             if let Some(request) = ui.scroll.take_request() {
                 ui.scroll_target = Some(request);
+                // The pointer position supersedes the top line of a window
+                // that is still being laid out.
+                ui.pending_top_line = None;
                 // A newer pointer position wins over a jump that is still
                 // waiting for the in-flight read to finish.
                 ui.queued_window = None;
@@ -2449,7 +2479,7 @@ impl LubanApp {
         };
         let busy = ui.is_busy();
         let wants_text = tab.needs_sync;
-        let (text, cursor_byte, range, visible) = {
+        let (text, cursor_byte, range, scroll_offset_y, editor_line_height) = {
             let state = tab.editor.read(cx);
             let rope = state.text();
             let cursor = state.cursor().min(rope.len());
@@ -2461,7 +2491,8 @@ impl LubanApp {
                 },
                 cursor,
                 state.selected_range(),
-                state.visible_row_range(),
+                state.scroll_offset().y.as_f32(),
+                state.line_height().map(|height| height.as_f32()),
             )
         };
         let local_anchor = if cursor_byte <= range.start {
@@ -2571,9 +2602,39 @@ impl LubanApp {
                     true,
                 ),
             };
-            let scroll_top = visible
-                .as_ref()
-                .map(|rows| ui.global_line_of_local_line(rows.start as u64));
+            // A window swap installs a deferred scroll offset that the editor
+            // applies on its next layout. Until then the scroll handle still
+            // holds the previous window's offset, which would point at a very
+            // different global line; report the installed top line instead.
+            let scroll_top = match (ui.pending_top_line, editor_line_height) {
+                (Some(pending), Some(line_height)) => {
+                    let pending = pending.max(ui.window_line);
+                    let expected = -((pending - ui.window_line) as f32 * line_height);
+                    let applied = (scroll_offset_y - expected).abs() <= 0.5;
+                    let stale = ui.loaded_at.elapsed() >= Duration::from_millis(500);
+                    if applied || stale {
+                        ui.pending_top_line = None;
+                    }
+                    if applied {
+                        Some(top_line_from_scroll(
+                            scroll_offset_y,
+                            line_height,
+                            ui.window_line,
+                            ui.window_newlines,
+                        ))
+                    } else {
+                        Some(pending)
+                    }
+                }
+                (Some(pending), None) => Some(pending),
+                (None, Some(line_height)) => Some(top_line_from_scroll(
+                    scroll_offset_y,
+                    line_height,
+                    ui.window_line,
+                    ui.window_newlines,
+                )),
+                (None, None) => None,
+            };
             let scroll_line = scroll_top.unwrap_or(ui.window_line);
             (
                 cursor,
@@ -2625,7 +2686,7 @@ impl LubanApp {
         if ui.pending_window.is_some() || ui.is_busy() {
             return;
         }
-        let (cursor_byte, position_line, visible, line_height) = {
+        let (cursor_byte, position_line, scroll_offset_y, line_height) = {
             let state = tab.editor.read(cx);
             let rope = state.text();
             let cursor = state.cursor().min(rope.len());
@@ -2633,27 +2694,18 @@ impl LubanApp {
             (
                 cursor,
                 position.line as u64,
-                state.visible_row_range(),
+                state.scroll_offset().y.as_f32(),
                 state.line_height().map(|height| height.as_f32()),
             )
         };
-        let Some(visible) = visible else {
+        let Some(line_height) = line_height.filter(|height| *height > 0.0) else {
             return;
         };
+        let viewport_lines = self.huge_viewport_lines(index, cx).unwrap_or(1);
         let scroll_target = ui.scroll_target;
         let dragging = ui.scroll.is_dragging();
         if let Some(target) = scroll_target {
-            let viewport_lines = self
-                .huge_viewport_lines(index, cx)
-                .unwrap_or_else(|| visible.len().max(1) as u64);
-            self.huge_scroll_to(
-                index,
-                target,
-                viewport_lines,
-                line_height.unwrap_or(18.0),
-                window,
-                cx,
-            );
+            self.huge_scroll_to(index, target, viewport_lines, line_height, window, cx);
             return;
         }
         // While the thumb is held, a window edge must not start its own
@@ -2664,8 +2716,16 @@ impl LubanApp {
         let total_lines = tab.doc.line_count() as u64;
         let window_line = ui.window_line;
         let window_end = ui.window_end_line();
-        let top_global = window_line.saturating_add(visible.start as u64);
-        let bottom_global = window_line.saturating_add(visible.end as u64);
+        // `visible_row_range` comes from the previous layout, so a fast wheel
+        // gesture can reach the window edge before it catches up. The scroll
+        // offset is current, and rows are a uniform grid.
+        let top_global = top_line_from_scroll(
+            scroll_offset_y,
+            line_height,
+            window_line,
+            ui.window_newlines,
+        );
+        let bottom_global = top_global.saturating_add(viewport_lines.saturating_sub(1));
         let cursor_line = window_line.saturating_add(position_line);
         let local_cursor = cursor_byte as u64;
         // Byte-edge tracking only matters when one line fills the window;
@@ -2677,9 +2737,9 @@ impl LubanApp {
         let near_bytes_end = long_line_window
             && !ui.at_eof
             && local_cursor.saturating_add(edge_bytes) >= ui.window_len;
-        let left_edge = visible.start as u64 <= EDGE_LINES && ui.window_start > 0;
-        let right_edge = (visible.end as u64).saturating_add(EDGE_LINES) >= ui.window_newlines
-            && bottom_global < total_lines;
+        let left_edge = top_global.saturating_sub(window_line) <= EDGE_LINES && ui.window_start > 0;
+        let right_edge =
+            window_end.saturating_sub(bottom_global) <= EDGE_LINES && bottom_global < total_lines;
         // The editor only holds a local sentinel for an offscreen caret. Do not
         // treat that sentinel as a reason to chase the caret while the user is
         // scrolling the viewport somewhere else.
@@ -2774,12 +2834,18 @@ impl LubanApp {
             });
         if let Some(ui) = self.tabs[index].huge.as_mut() {
             ui.scroll_target = Some(target);
+            ui.pending_top_line = None;
         }
         if target >= window_line && target <= window_max_top {
             let local = target.saturating_sub(window_line) as f32;
-            editor.update(cx, |state, cx| {
-                state.set_scroll_offset(point(px(0.), px(-(local * line_height))), cx);
-            });
+            let desired = point(px(0.), px(-(local * line_height)));
+            // Avoid a notify/render loop when the viewport already sits on the
+            // requested line.
+            if editor.read(cx).scroll_offset() != desired {
+                editor.update(cx, |state, cx| {
+                    state.set_scroll_offset(desired, cx);
+                });
+            }
             return;
         }
         // Leave some scrollback above the target and keep the target off the
@@ -2966,6 +3032,9 @@ impl LubanApp {
                         Some((cursor_local as u64, request.cursor))
                     };
                     ui.scroll_top_line = top_line;
+                    // The editor applies the new scroll offset on its next
+                    // layout; keep the scrollbar on this top line until then.
+                    ui.pending_top_line = Some(top_line);
                     if target_visible && ui.scroll_target == Some(desired_top) {
                         ui.scroll_target = None;
                     }
@@ -5902,6 +5971,8 @@ impl LubanApp {
         };
         for index in 0..self.tabs.len() {
             let wrap = !self.tabs[index].large_file && wrap;
+            // Disk-engine tabs draw document-global numbers in the app.
+            let line_numbers = line_numbers && !self.tabs[index].doc.is_huge();
             self.tabs[index].editor.update(cx, |state, cx| {
                 state.set_line_number(line_numbers, window, cx);
                 state.set_soft_wrap(wrap, window, cx);
@@ -8044,7 +8115,7 @@ impl LubanApp {
     // Editor area
     // ------------------------------------------------------------------
 
-    fn render_editor_area(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_editor_area(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         let Some(tab) = self.tabs.get(self.active) else {
             return div().size_full().into_any_element();
@@ -8052,6 +8123,7 @@ impl LubanApp {
         let editor = tab.editor.clone();
         let font_size = self.settings.font_size;
         let font_family = self.settings.font_family.clone();
+        let show_line_numbers = self.settings.show_line_numbers;
         let _ = weak;
 
         // Disk-engine tabs mount only a bounded window, so the editor's own
@@ -8116,6 +8188,41 @@ impl LubanApp {
             ))
         });
 
+        // Disk-engine tabs hide the editor's window-local gutter and render a
+        // document-global one next to the editor. It is positioned from the
+        // same scroll offset as the file scrollbar, so both follow wheel
+        // scrolling and window swaps.
+        let global_gutter = tab.huge.as_ref().and_then(|ui| {
+            if !show_line_numbers {
+                return None;
+            }
+            let state = tab.editor.read(cx);
+            let line_height = state
+                .line_height()
+                .map(|height| height.as_f32())
+                .unwrap_or(0.0);
+            if line_height <= 0.0 {
+                return None;
+            }
+            let input = state.input_bounds();
+            let viewport_lines = (input.size.height.as_f32() / line_height).floor().max(1.0) as u64;
+            Some(huge_gutter::render(
+                HugeGutterProps {
+                    offset_y: state.scroll_offset().y.as_f32(),
+                    line_height,
+                    top_padding: padding_y.as_f32(),
+                    viewport_lines,
+                    window_line: ui.window_line,
+                    window_newlines: ui.window_newlines,
+                    total_lines: tab.doc.line_count() as u64,
+                    font_family: &font_family,
+                    font_size,
+                },
+                window,
+                cx,
+            ))
+        });
+
         div()
             .flex_1()
             .min_w(px(0.))
@@ -8129,15 +8236,24 @@ impl LubanApp {
                     .min_h(px(0.))
                     .p_1()
                     .child(
-                        Editor::new(&editor)
-                            .with_size(EDITOR_SIZE)
-                            .appearance(false)
-                            .bordered(false)
-                            .size_full()
-                            .text_size(px(font_size))
-                            .when(!font_family.is_empty(), |this| {
-                                this.font_family(font_family.clone())
-                            }),
+                        div()
+                            .flex()
+                            .h_full()
+                            .min_h(px(0.))
+                            .children(global_gutter)
+                            .child(
+                                div().flex_1().min_w(px(0.)).h_full().child(
+                                    Editor::new(&editor)
+                                        .with_size(EDITOR_SIZE)
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .size_full()
+                                        .text_size(px(font_size))
+                                        .when(!font_family.is_empty(), |this| {
+                                            this.font_family(font_family.clone())
+                                        }),
+                                ),
+                            ),
                     )
                     .children(global_scrollbar),
             )

@@ -108,6 +108,11 @@ pub struct HugeFileUi {
     pub history_trimmed_notified: bool,
     /// Global line currently shown at the top of the editor viewport.
     pub scroll_top_line: u64,
+    /// Top line a just-installed window will show once the editor applies its
+    /// deferred scroll offset. Sync reports this instead of deriving from the
+    /// previous window's offset, which is still in the scroll handle for one
+    /// frame after the swap.
+    pub pending_top_line: Option<u64>,
     /// Global line a file-global scrollbar drag wants to reach. Kept until the
     /// viewport arrives, so a pending window load cannot overwrite a newer
     /// pointer position.
@@ -137,6 +142,7 @@ impl HugeFileUi {
             loaded_at: Instant::now(),
             history_trimmed_notified: false,
             scroll_top_line: window.line,
+            pending_top_line: None,
             scroll_target: None,
             scroll: HugeScrollShared::default(),
         }
@@ -153,6 +159,7 @@ impl HugeFileUi {
         self.at_eof = window.at_eof;
         self.last_text = window.text;
         self.pending_window = None;
+        self.pending_top_line = None;
         self.loaded_at = Instant::now();
     }
 
@@ -165,10 +172,6 @@ impl HugeFileUi {
         global
             .checked_sub(self.window_start)
             .filter(|local| *local <= self.window_len)
-    }
-
-    pub fn global_line_of_local_line(&self, local_line: u64) -> u64 {
-        self.window_line.saturating_add(local_line)
     }
 
     pub fn window_end_line(&self) -> u64 {
@@ -189,6 +192,44 @@ impl HugeFileUi {
 
     pub fn is_busy(&self) -> bool {
         self.save.is_some() || self.search.is_some()
+    }
+}
+
+/// 1-based global line at the top of a viewport scrolled by `offset_y`.
+///
+/// The editor scrolls in whole rows and lays them out on a uniform
+/// `line_height` grid, so the top row follows from the offset alone. The
+/// offset is updated immediately by wheel input, while `visible_row_range`
+/// describes the previous layout; the scrollbar and gutter use this value to
+/// stay in step with the content.
+pub fn top_line_from_scroll(
+    offset_y: f32,
+    line_height: f32,
+    window_line: u64,
+    window_newlines: u64,
+) -> u64 {
+    if line_height <= 0.0 || !offset_y.is_finite() {
+        return window_line;
+    }
+    let rows = ((-offset_y).max(0.0) / line_height).floor();
+    let rows = if rows.is_finite() { rows as u64 } else { 0 };
+    window_line
+        .saturating_add(rows)
+        .min(window_line.saturating_add(window_newlines))
+}
+
+/// Part of a row hidden above the viewport top when the viewport is scrolled
+/// by `offset_y`. Whole-row scrolling leaves `0`.
+pub fn scroll_row_clip(offset_y: f32, line_height: f32) -> f32 {
+    if line_height <= 0.0 || !offset_y.is_finite() {
+        return 0.0;
+    }
+    let scrolled = (-offset_y).max(0.0);
+    let clip = scrolled % line_height;
+    if clip.is_finite() {
+        clip
+    } else {
+        0.0
     }
 }
 
@@ -376,5 +417,30 @@ mod tests {
             clamp_top_line(end - 5, window_line, newlines, viewport),
             end - 36
         );
+    }
+
+    #[test]
+    fn scroll_offset_yields_the_top_line() {
+        // No scroll, scrolled down three whole rows, and a positive offset
+        // (overscroll) all resolve inside the window.
+        assert_eq!(top_line_from_scroll(0.0, 18.0, 100, 500), 100);
+        assert_eq!(top_line_from_scroll(-54.0, 18.0, 100, 500), 103);
+        assert_eq!(top_line_from_scroll(9.0, 18.0, 100, 500), 100);
+        // A fractional offset still reports the row at the viewport top.
+        assert_eq!(top_line_from_scroll(-54.9, 18.0, 100, 500), 103);
+        // Never past the last line of the mounted window.
+        assert_eq!(top_line_from_scroll(-18.0 * 900.0, 18.0, 100, 500), 600);
+        // Before the first layout the caller keeps the window's first line.
+        assert_eq!(top_line_from_scroll(-54.0, 0.0, 100, 500), 100);
+        assert_eq!(top_line_from_scroll(f32::NAN, 18.0, 100, 500), 100);
+    }
+
+    #[test]
+    fn scroll_clip_is_the_hidden_part_of_the_top_row() {
+        assert_eq!(scroll_row_clip(0.0, 18.0), 0.0);
+        assert_eq!(scroll_row_clip(-18.0, 18.0), 0.0);
+        assert_eq!(scroll_row_clip(-27.0, 18.0), 9.0);
+        assert_eq!(scroll_row_clip(9.0, 18.0), 0.0);
+        assert_eq!(scroll_row_clip(-27.0, 0.0), 0.0);
     }
 }
