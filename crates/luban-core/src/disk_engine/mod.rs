@@ -23,16 +23,22 @@ use std::time::SystemTime;
 use crate::encoding::{self, TextEncoding};
 use crate::eol::{self, Eol};
 use crate::error::{Error, Result};
-use crate::i18n::tr;
+use crate::i18n::{tr, tr_args};
 use crate::search::SearchEngine;
 
 mod journal;
+mod recovery;
 mod save;
 
 pub use journal::cleanup_stale;
+pub use recovery::{
+    discard as discard_recovery_dir, read_ops, recovery_root, scan as scan_recovery, Checkpoint,
+    LoggedOp, RecoveryInfo, Splice, CHECKPOINT_NAME, JOURNAL_NAME, OPS_NAME, RETENTION,
+};
 pub use save::{SaveReport, SaveSnapshot};
 
 use journal::{read_exact_at, Journal};
+use recovery::Recovery;
 
 /// Target size of the editor window. It bounds the editor's rope while leaving
 /// roughly 20k lines of 100 characters on each side of the cursor.
@@ -150,8 +156,8 @@ pub struct ReplaceReport {
 }
 
 /// One indexed block of the base file.
-#[derive(Clone, Debug)]
-pub(super) struct Block {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Block {
     /// Byte offset in the base file body (after the BOM).
     pub src_offset: u64,
     /// Byte length in the base file.
@@ -166,15 +172,15 @@ pub(super) struct Block {
     pub newlines: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum PieceKind {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum PieceKind {
     Source { block: u32 },
     Journal { offset: u64 },
 }
 
 /// A contiguous run of the current logical text.
-#[derive(Clone, Debug)]
-pub(super) struct Piece {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Piece {
     pub kind: PieceKind,
     /// Logical byte offset inside the decoded block or the journal.
     pub offset: u64,
@@ -275,7 +281,15 @@ pub struct DiskEngine {
     base: Arc<BaseFile>,
     pub(super) blocks: Vec<Block>,
     pub(super) pieces: Vec<Piece>,
-    pub(super) journal: Journal,
+    journal: Option<Journal>,
+    recovery: Option<Recovery>,
+    /// The document was restored from recovery data and is still unsaved even
+    /// when its history stack is empty.
+    recovered: bool,
+    /// Logical caret and top line reported to recovery checkpoints. The app
+    /// keeps them current; they never affect editing.
+    recovery_cursor: u64,
+    recovery_scroll_line: u64,
     total_len: u64,
     total_chars: u64,
     total_newlines: u64,
@@ -357,7 +371,11 @@ impl DiskEngine {
             base,
             blocks,
             pieces: Vec::new(),
-            journal: Journal::create()?,
+            journal: None,
+            recovery: None,
+            recovered: false,
+            recovery_cursor: 0,
+            recovery_scroll_line: 1,
             total_len: 0,
             total_chars: 0,
             total_newlines: 0,
@@ -444,7 +462,11 @@ impl DiskEngine {
             base,
             blocks,
             pieces: Vec::new(),
-            journal: Journal::create()?,
+            journal: None,
+            recovery: None,
+            recovered: false,
+            recovery_cursor: 0,
+            recovery_scroll_line: 1,
             total_len: 0,
             total_chars: 0,
             total_newlines: 0,
@@ -529,7 +551,7 @@ impl DiskEngine {
     }
 
     pub fn is_modified(&self) -> bool {
-        self.history_pos > 0 || self.history_trimmed
+        self.recovered || self.history_pos > 0 || self.history_trimmed
     }
 
     /// Whether the oldest applied edits were dropped by the history limit.
@@ -550,7 +572,7 @@ impl DiskEngine {
     }
 
     pub fn journal_len(&self) -> u64 {
-        self.journal.len()
+        self.journal.as_ref().map_or(0, Journal::len)
     }
 
     /// Conservative upper bound for the saved file size.
@@ -572,15 +594,29 @@ impl DiskEngine {
 
     /// Whether the file changed on disk since it was opened or last saved.
     pub fn changed_on_disk(&self) -> bool {
-        let Ok(metadata) = fs::metadata(&self.path) else {
-            return false;
+        matches!(
+            self.disk_status(),
+            crate::document::DiskStatus::Changed | crate::document::DiskStatus::Missing
+        )
+    }
+
+    /// Compare the recorded source identity with the file on disk.
+    pub fn disk_status(&self) -> crate::document::DiskStatus {
+        let metadata = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return crate::document::DiskStatus::Missing;
+            }
+            Err(_) => return crate::document::DiskStatus::Changed,
         };
         if metadata.len() != self.base_len {
-            return true;
+            return crate::document::DiskStatus::Changed;
         }
         match (metadata.modified().ok(), self.base_modified) {
-            (Some(current), Some(known)) => current != known,
-            _ => false,
+            (Some(current), Some(known)) if current != known => {
+                crate::document::DiskStatus::Changed
+            }
+            _ => crate::document::DiskStatus::Unchanged,
         }
     }
 
@@ -767,7 +803,10 @@ impl DiskEngine {
                 Ok(text[begin..end].to_owned())
             }
             PieceKind::Journal { offset } => {
-                let bytes = self.journal.read(offset, piece.len)?;
+                let journal = self.journal.as_ref().ok_or_else(|| {
+                    Error::Other(tr("core.disk_engine.journal_corrupt").to_string())
+                })?;
+                let bytes = journal.read(offset, piece.len)?;
                 String::from_utf8(bytes)
                     .map_err(|_| Error::Other(tr("core.disk_engine.journal_corrupt").to_string()))
             }
@@ -992,14 +1031,21 @@ impl DiskEngine {
             });
         }
         let line = self.line_at(start)?;
+        self.ensure_recovery()?;
         let hunk = self.apply_hunk(start, removed, inserted)?;
         let inserted_len = inserted.len() as u64;
+        let splice = Splice {
+            start: hunk.start,
+            removed: hunk.before.iter().map(|piece| piece.len).sum(),
+            after: hunk.after.clone(),
+        };
         self.push_history(
             vec![hunk],
             start,
             start.saturating_add(inserted_len),
             inserted_len,
         );
+        self.log_operation(vec![splice], start.saturating_add(inserted_len));
         Ok(EditOutcome {
             start,
             removed_len: removed,
@@ -1009,6 +1055,32 @@ impl DiskEngine {
     }
 
     fn apply_hunk(&mut self, start: u64, removed: u64, inserted: &str) -> Result<Hunk> {
+        let after = if inserted.is_empty() {
+            Vec::new()
+        } else {
+            let journal = self
+                .journal
+                .as_mut()
+                .ok_or_else(|| Error::Other(tr("core.disk_engine.journal_corrupt").to_string()))?;
+            let offset = journal.append(inserted.as_bytes())?;
+            vec![Piece {
+                kind: PieceKind::Journal { offset },
+                offset: 0,
+                len: inserted.len() as u64,
+                chars: inserted.chars().count() as u64,
+                newlines: count_newlines(inserted),
+                logical_start: 0,
+                line: 0,
+                raw: false,
+            }]
+        };
+        self.replace_range(start, removed, after)
+    }
+
+    /// Replace `removed` logical bytes at `start` with already known pieces.
+    /// Used both by live edits (pieces newly appended to the journal) and by
+    /// recovery replay (pieces recorded in the operation log).
+    fn replace_range(&mut self, start: u64, removed: u64, after: Vec<Piece>) -> Result<Hunk> {
         let mut index = self.piece_index_at(start);
         if index < self.pieces.len() && start > self.pieces[index].logical_start {
             index = self.split_piece(index, start - self.pieces[index].logical_start)?;
@@ -1029,21 +1101,6 @@ impl DiskEngine {
                 remove_index += 1;
             }
         }
-        let after = if inserted.is_empty() {
-            Vec::new()
-        } else {
-            let offset = self.journal.append(inserted.as_bytes())?;
-            vec![Piece {
-                kind: PieceKind::Journal { offset },
-                offset: 0,
-                len: inserted.len() as u64,
-                chars: inserted.chars().count() as u64,
-                newlines: count_newlines(inserted),
-                logical_start: 0,
-                line: 0,
-                raw: false,
-            }]
-        };
         self.pieces
             .splice(index..remove_index, after.iter().cloned());
         self.recompute_from(index);
@@ -1131,20 +1188,25 @@ impl DiskEngine {
         if self.editing_locked || self.history_pos == 0 {
             return None;
         }
+        let _ = self.ensure_recovery();
         let op = self.history[self.history_pos - 1].clone();
+        let mut splices = Vec::new();
         for hunk in op.hunks.iter().rev() {
             if !self.splice_hunk(hunk, true) {
+                self.log_operation(splices, 0);
                 self.history.clear();
                 self.history_pos = 0;
                 self.history_bytes = 0;
                 return None;
             }
+            splices.push(logged_splice(hunk, true));
         }
         self.history_pos -= 1;
         self.revision = self.revision.wrapping_add(1);
         self.compact_pieces();
         let cursor = op.cursor_before.min(self.total_len);
         let line = self.line_at(cursor).unwrap_or(1);
+        self.log_operation(splices, cursor);
         Some(HistoryOutcome {
             offset: cursor,
             line,
@@ -1156,18 +1218,23 @@ impl DiskEngine {
         if self.editing_locked || self.history_pos >= self.history.len() {
             return None;
         }
+        let _ = self.ensure_recovery();
         let op = self.history[self.history_pos].clone();
+        let mut splices = Vec::new();
         for hunk in op.hunks.iter() {
             if !self.splice_hunk(hunk, false) {
+                self.log_operation(splices, 0);
                 self.history.truncate(self.history_pos);
                 return None;
             }
+            splices.push(logged_splice(hunk, false));
         }
         self.history_pos += 1;
         self.revision = self.revision.wrapping_add(1);
         self.compact_pieces();
         let cursor = op.cursor_after.min(self.total_len);
         let line = self.line_at(cursor).unwrap_or(1);
+        self.log_operation(splices, cursor);
         Some(HistoryOutcome {
             offset: cursor,
             line,
@@ -1532,6 +1599,7 @@ impl DiskEngine {
         if self.read_only {
             return Err(Error::Other(tr("core.document.read_only").to_string()));
         }
+        self.ensure_recovery()?;
         let mut hunks = Vec::new();
         let mut count = 0usize;
         let mut position = 0u64;
@@ -1596,7 +1664,16 @@ impl DiskEngine {
                 bytes_scanned: self.total_len,
             });
         }
+        let splices: Vec<Splice> = hunks
+            .iter()
+            .map(|hunk| logged_splice(hunk, false))
+            .collect();
+        let cursor = splices
+            .last()
+            .map(|splice| splice.start + splice.after.iter().map(|piece| piece.len).sum::<u64>())
+            .unwrap_or(0);
         self.push_history(hunks, 0, 0, 0);
+        self.log_operation(splices, cursor);
         Ok(ReplaceReport {
             count,
             cancelled: false,
@@ -1669,7 +1746,10 @@ impl DiskEngine {
         self.read_only = report.read_only;
         self.editing_locked = false;
         self.blocks = report.blocks;
-        self.journal.reset()?;
+        self.dispose_recovery();
+        self.recovered = false;
+        self.recovery_cursor = 0;
+        self.recovery_scroll_line = 1;
         self.history.clear();
         self.history_pos = 0;
         self.history_bytes = 0;
@@ -1750,7 +1830,10 @@ impl DiskEngine {
         };
         self.base = base;
         self.blocks = blocks;
-        self.journal.reset()?;
+        self.dispose_recovery();
+        self.recovered = false;
+        self.recovery_cursor = 0;
+        self.recovery_scroll_line = 1;
         self.history.clear();
         self.history_pos = 0;
         self.history_bytes = 0;
@@ -1774,6 +1857,305 @@ impl DiskEngine {
 
     pub(super) fn bom_len(&self) -> u64 {
         self.bom_len
+    }
+
+    // ------------------------------------------------------------------
+    // Crash recovery
+    // ------------------------------------------------------------------
+
+    /// Identifier of the live recovery directory, if this document has one.
+    /// Sessions record it so a crash-restored tab can be matched back.
+    pub fn recovery_id(&self) -> Option<&str> {
+        self.recovery.as_ref().map(Recovery::id)
+    }
+
+    /// Logical caret and top line recorded in recovery data.
+    pub fn recovery_position(&self) -> (u64, u64) {
+        (
+            self.recovery_cursor.min(self.total_len),
+            self.recovery_scroll_line.max(1),
+        )
+    }
+
+    /// Record the editor position with the next recovery checkpoint.
+    pub fn set_recovery_position(&mut self, cursor: u64, scroll_line: u64) {
+        self.recovery_cursor = cursor;
+        self.recovery_scroll_line = scroll_line.max(1);
+        // Persist scroll-only movement within the checkpoint interval; edits
+        // already carry the line in their operation records.
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(recovery::Recovery::should_checkpoint)
+        {
+            if let Err(error) = self.write_checkpoint() {
+                log::warn!("could not write recovery checkpoint: {error}");
+            }
+        }
+    }
+
+    /// Create recovery data before the first mutation so every committed
+    /// operation has a checkpoint to replay on top of. When the configuration
+    /// directory is not writable, editing still works with an ephemeral
+    /// journal and recovery is simply unavailable.
+    fn ensure_recovery(&mut self) -> Result<()> {
+        if self.recovery.is_some() && self.journal.is_some() {
+            return Ok(());
+        }
+        match self.start_recovery() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                log::warn!(
+                    "could not create crash recovery for {}: {error}",
+                    self.path.display()
+                );
+                if self.journal.is_none() {
+                    self.journal = Some(Journal::create()?);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn start_recovery(&mut self) -> Result<()> {
+        let (recovery, dir) = Recovery::create()?;
+        let journal = Journal::create_in(dir)?;
+        self.journal = Some(journal);
+        self.recovery = Some(recovery);
+        self.write_checkpoint()?;
+        Ok(())
+    }
+
+    fn checkpoint_data(&self, ops_applied: u64) -> Checkpoint {
+        Checkpoint {
+            version: recovery::CHECKPOINT_VERSION,
+            path: self.path.clone(),
+            range: self.range.map(|range| [range.start, range.end]),
+            encoding: self.encoding,
+            eol: self.eol,
+            bom_len: self.bom_len,
+            body_start: self.body_start,
+            base_len: self.base_len,
+            body_len: self.body_len,
+            base_modified: self
+                .base_modified
+                .and_then(recovery::Timestamp::from_system_time),
+            read_only: self.read_only,
+            blocks: self.blocks.clone(),
+            pieces: self.pieces.clone(),
+            total_len: self.total_len,
+            total_chars: self.total_chars,
+            total_newlines: self.total_newlines,
+            ops_applied,
+            modified: self.is_modified(),
+            cursor: self.recovery_cursor,
+            scroll_line: self.recovery_scroll_line,
+            saved_at: recovery::Timestamp::now(),
+        }
+    }
+
+    fn write_checkpoint(&mut self) -> Result<()> {
+        let Some(recovery) = self.recovery.as_ref() else {
+            return Ok(());
+        };
+        let checkpoint = self.checkpoint_data(recovery.ops());
+        if let Some(recovery) = self.recovery.as_mut() {
+            recovery.write_checkpoint(&checkpoint)?;
+        }
+        Ok(())
+    }
+
+    fn log_operation(&mut self, splices: Vec<Splice>, cursor: u64) {
+        if splices.is_empty() {
+            return;
+        }
+        if self.recovery.is_none() {
+            if let Err(error) = self.ensure_recovery() {
+                log::warn!("could not record recovery operation: {error}");
+                return;
+            }
+        }
+        self.recovery_cursor = cursor;
+        let Some(recovery) = self.recovery.as_mut() else {
+            return;
+        };
+        if let Err(error) = recovery.append(&LoggedOp {
+            cursor,
+            scroll_line: self.recovery_scroll_line.max(1),
+            splices,
+        }) {
+            log::warn!("could not append recovery operation: {error}");
+            return;
+        }
+        if recovery.should_checkpoint() {
+            if let Err(error) = self.write_checkpoint() {
+                log::warn!("could not write recovery checkpoint: {error}");
+            }
+        }
+    }
+
+    fn apply_logged_op(&mut self, op: &LoggedOp) -> Result<()> {
+        for splice in &op.splices {
+            if splice.start > self.total_len {
+                return Err(Error::Other(
+                    tr("core.disk_engine.recovery_corrupt").to_string(),
+                ));
+            }
+            self.replace_range(splice.start, splice.removed, splice.after.clone())?;
+        }
+        Ok(())
+    }
+
+    fn apply_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<()> {
+        if checkpoint.base_len != self.base_len
+            || checkpoint
+                .blocks
+                .iter()
+                .map(|block| block.src_len)
+                .sum::<u64>()
+                != self.body_len
+        {
+            return Err(Error::Other(
+                tr("core.disk_engine.recovery_corrupt").to_string(),
+            ));
+        }
+        self.encoding = checkpoint.encoding;
+        self.eol = checkpoint.eol;
+        self.bom_len = checkpoint.bom_len;
+        self.body_start = checkpoint.body_start;
+        self.body_len = checkpoint.body_len;
+        self.range = checkpoint
+            .range
+            .map(|[start, end]| RangeSpec { start, end });
+        self.base_modified = checkpoint
+            .base_modified
+            .map(recovery::Timestamp::to_system_time)
+            .or(self.base_modified);
+        self.read_only = checkpoint.read_only;
+        self.blocks = checkpoint.blocks.clone();
+        self.pieces = checkpoint.pieces.clone();
+        self.total_len = checkpoint.total_len;
+        self.total_chars = checkpoint.total_chars;
+        self.total_newlines = checkpoint.total_newlines;
+        self.recovery_cursor = checkpoint.cursor;
+        self.recovery_scroll_line = checkpoint.scroll_line.max(1);
+        self.recompute_from(0);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.map.clear();
+            cache.order.clear();
+        }
+        Ok(())
+    }
+
+    /// Rebuild an engine from recovery data. The source must still match the
+    /// checkpoint; otherwise the caller keeps the recovery directory and asks
+    /// the user what to do instead of replaying edits onto a different file.
+    pub fn recover(info: &RecoveryInfo, cancel: &AtomicBool, progress: &AtomicU64) -> Result<Self> {
+        verify_recovery_source(&info.checkpoint)?;
+        let mut engine = match info.checkpoint.range {
+            Some([from, to]) => {
+                Self::open_range(&info.checkpoint.path, from, to, cancel, progress)?
+            }
+            None => Self::open(&info.checkpoint.path, cancel, progress)?,
+        };
+        engine.dispose_recovery();
+        engine.apply_checkpoint(&info.checkpoint)?;
+        engine.journal = Some(Journal::open_existing(info.dir.clone())?);
+        let ops = recovery::read_ops(&info.dir.join(OPS_NAME))?;
+        let applied = usize::try_from(info.checkpoint.ops_applied).unwrap_or(usize::MAX);
+        if applied > ops.len() {
+            return Err(Error::Other(
+                tr("core.disk_engine.recovery_corrupt").to_string(),
+            ));
+        }
+        for op in ops.iter().skip(applied) {
+            engine.apply_logged_op(op)?;
+        }
+        if let Some(last) = ops.last() {
+            engine.recovery_cursor = last.cursor.min(engine.total_len);
+            if last.scroll_line > 0 {
+                engine.recovery_scroll_line = last.scroll_line;
+            }
+        }
+        engine.recovered = true;
+        engine.recovery = Some(Recovery::attach(
+            info.id.clone(),
+            info.dir.clone(),
+            ops.len() as u64,
+            info.checkpoint.ops_applied.min(ops.len() as u64),
+        )?);
+        if let Err(error) = engine.write_checkpoint() {
+            // The recovery data is already valid; failing to refresh the
+            // checkpoint only means replay starts from an older one.
+            log::warn!("could not refresh the recovered checkpoint: {error}");
+        }
+        Ok(engine)
+    }
+
+    /// Remove recovery data after a save, reload, close or explicit discard.
+    pub fn dispose_recovery(&mut self) {
+        // Close the journal first: Windows cannot delete an open file.
+        self.journal = None;
+        if let Some(recovery) = self.recovery.take() {
+            recovery.remove();
+        }
+        self.recovered = false;
+    }
+
+    /// Stop owning recovery data without deleting it. Used when a recovered
+    /// engine cannot be mounted, so the next start may try again.
+    pub fn preserve_recovery(&mut self) {
+        self.journal = None;
+        if let Some(recovery) = self.recovery.take() {
+            recovery.preserve();
+        }
+        self.recovered = false;
+    }
+}
+
+fn verify_recovery_source(checkpoint: &Checkpoint) -> Result<()> {
+    let metadata = fs::metadata(&checkpoint.path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::Other(tr_args(
+                "core.disk_engine.recovery_source_missing",
+                &[("path", checkpoint.path.display().to_string())],
+            ))
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    if metadata.len() != checkpoint.base_len {
+        return Err(Error::Other(tr_args(
+            "core.disk_engine.recovery_source_changed",
+            &[("path", checkpoint.path.display().to_string())],
+        )));
+    }
+    if let (Some(current), Some(known)) = (
+        metadata.modified().ok(),
+        checkpoint
+            .base_modified
+            .map(recovery::Timestamp::to_system_time),
+    ) {
+        if current != known {
+            return Err(Error::Other(tr_args(
+                "core.disk_engine.recovery_source_changed",
+                &[("path", checkpoint.path.display().to_string())],
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn logged_splice(hunk: &Hunk, undo: bool) -> Splice {
+    let (removed, after) = if undo {
+        (&hunk.after, &hunk.before)
+    } else {
+        (&hunk.before, &hunk.after)
+    };
+    Splice {
+        start: hunk.start,
+        removed: removed.iter().map(|piece| piece.len).sum(),
+        after: after.clone(),
     }
 }
 
@@ -2794,5 +3176,140 @@ mod tests {
             engine.read_text(0, engine.total_len()).unwrap(),
             "two\nthree\n"
         );
+    }
+
+    #[test]
+    fn edits_survive_a_simulated_crash() {
+        let (_dir, path) = write_file("recovery.txt", b"alpha\nbeta\ngamma\n");
+        let mut engine = open(&path);
+        engine.set_recovery_position(6, 2);
+        engine.apply_edit(6, 4, "BETA").unwrap();
+        let id = engine.recovery_id().expect("recovery id").to_string();
+        let before = engine.read_text(0, engine.total_len()).unwrap();
+        let info = scan_recovery(RETENTION)
+            .into_iter()
+            .find(|info| info.id == id)
+            .expect("recovery entry");
+        assert!(info.modified);
+        // No destructor runs after a kill; forget the engine so the recovery
+        // directory stays on disk.
+        std::mem::forget(engine);
+
+        let recovered = DiskEngine::recover(&info, &no_cancel(), &AtomicU64::new(0)).unwrap();
+        assert_eq!(
+            recovered.read_text(0, recovered.total_len()).unwrap(),
+            before
+        );
+        assert!(recovered.is_modified());
+        assert_eq!(recovered.recovery_position(), (10, 2));
+        let dir = info.dir.clone();
+        drop(recovered);
+        assert!(!dir.exists(), "discarding the recovered engine cleans up");
+    }
+
+    #[test]
+    fn recovery_replays_undo_and_redo() {
+        let (_dir, path) = write_file("undo-recovery.txt", b"one\ntwo\nthree\n");
+        let mut engine = open(&path);
+        engine.apply_edit(4, 3, "TWO").unwrap();
+        engine.undo().unwrap();
+        engine.redo().unwrap();
+        engine.apply_edit(0, 0, "TOP\n").unwrap();
+        let id = engine.recovery_id().unwrap().to_string();
+        let before = engine.read_text(0, engine.total_len()).unwrap();
+        let info = scan_recovery(RETENTION)
+            .into_iter()
+            .find(|info| info.id == id)
+            .unwrap();
+        std::mem::forget(engine);
+
+        let recovered = DiskEngine::recover(&info, &no_cancel(), &AtomicU64::new(0)).unwrap();
+        assert_eq!(
+            recovered.read_text(0, recovered.total_len()).unwrap(),
+            before
+        );
+        assert!(recovered.can_undo() || recovered.is_modified());
+    }
+
+    #[test]
+    fn recovery_keeps_the_scroll_line_of_the_last_edit() {
+        let (_dir, path) = write_file("scroll-recovery.txt", b"one\ntwo\nthree\n");
+        let mut engine = open(&path);
+        engine.set_recovery_position(0, 1);
+        engine.apply_edit(0, 0, "TOP\n").unwrap();
+        engine.set_recovery_position(10, 3);
+        engine.apply_edit(10, 0, "X").unwrap();
+        let id = engine.recovery_id().unwrap().to_string();
+        let info = scan_recovery(RETENTION)
+            .into_iter()
+            .find(|info| info.id == id)
+            .unwrap();
+        std::mem::forget(engine);
+        let recovered = DiskEngine::recover(&info, &no_cancel(), &AtomicU64::new(0)).unwrap();
+        assert_eq!(recovered.recovery_position(), (11, 3));
+    }
+
+    #[test]
+    fn recovery_refuses_a_changed_source() {
+        let (_dir, path) = write_file("changed.txt", b"alpha\nbeta\n");
+        let mut engine = open(&path);
+        engine.apply_edit(0, 0, "NEW\n").unwrap();
+        let id = engine.recovery_id().unwrap().to_string();
+        let info = scan_recovery(RETENTION)
+            .into_iter()
+            .find(|info| info.id == id)
+            .unwrap();
+        std::mem::forget(engine);
+        // Append after the checkpoint: size no longer matches.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"tail\n").unwrap();
+        drop(file);
+
+        let error = DiskEngine::recover(&info, &no_cancel(), &AtomicU64::new(0)).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert!(info.dir.exists(), "refused recovery keeps its data");
+        let _ = recovery::discard(&info.dir);
+    }
+
+    #[test]
+    fn saving_discards_recovery_data() {
+        let (_dir, path) = write_file("saved-recovery.txt", b"one\ntwo\n");
+        let mut engine = open(&path);
+        engine.apply_edit(0, 0, "zero\n").unwrap();
+        let id = engine.recovery_id().unwrap().to_string();
+        let info = scan_recovery(RETENTION)
+            .into_iter()
+            .find(|info| info.id == id)
+            .unwrap();
+        let report = engine
+            .snapshot()
+            .write(&path, true, &AtomicU64::new(0), &no_cancel())
+            .unwrap();
+        engine.adopt_saved(report, path.clone()).unwrap();
+        assert!(engine.recovery_id().is_none());
+        assert!(!info.dir.exists());
+        assert!(!engine.is_modified());
+    }
+
+    #[test]
+    fn clean_engines_leave_no_recovery_entry() {
+        let (_dir, path) = write_file("clean.txt", b"alpha\n");
+        let engine = open(&path);
+        assert!(engine.recovery_id().is_none());
+        assert!(!scan_recovery(RETENTION)
+            .iter()
+            .any(|info| info.path() == path.as_path()));
+    }
+
+    #[test]
+    fn closing_an_engine_discards_its_recovery() {
+        let (_dir, path) = write_file("closed.txt", b"alpha\nbeta\n");
+        let mut engine = open(&path);
+        engine.apply_edit(0, 0, "new\n").unwrap();
+        let id = engine.recovery_id().unwrap().to_string();
+        let dir = recovery_root().join(id);
+        assert!(dir.exists());
+        drop(engine);
+        assert!(!dir.exists(), "normal close removes recovery data");
     }
 }

@@ -1,8 +1,9 @@
 //! Append-only edit journal used by the disk engine's copy-on-write model.
 //!
 //! Inserted text never touches the source file. It is appended to a private
-//! temporary file and referenced by the piece table. The directory is removed
-//! when the engine (or the last snapshot sharing it) is dropped.
+//! journal file inside the document's recovery directory and referenced by the
+//! piece table. Normal close discards the directory through the recovery
+//! layer; a crash leaves it in place so the edits can be replayed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -18,8 +19,11 @@ const FILE_NAME: &str = "edits.bin";
 pub struct Journal {
     dir: PathBuf,
     path: PathBuf,
-    writer: File,
+    writer: Option<File>,
     len: u64,
+    /// A journal outside the recovery area (used only when the configuration
+    /// directory cannot be written) is removed on drop.
+    ephemeral: bool,
 }
 
 impl std::fmt::Debug for Journal {
@@ -32,12 +36,16 @@ impl std::fmt::Debug for Journal {
 }
 
 impl Journal {
+    /// Create a journal in the system temporary directory. Only used as a
+    /// fallback when durable recovery data cannot be created.
     pub fn create() -> io::Result<Self> {
         let dir = unique_dir()?;
-        Self::create_in(dir)
+        let mut journal = Self::create_in(dir)?;
+        journal.ephemeral = true;
+        Ok(journal)
     }
 
-    fn create_in(dir: PathBuf) -> io::Result<Self> {
+    pub(super) fn create_in(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         let path = dir.join(FILE_NAME);
         let writer = OpenOptions::new()
@@ -49,8 +57,30 @@ impl Journal {
         Ok(Self {
             dir,
             path,
-            writer,
+            writer: Some(writer),
             len: 0,
+            ephemeral: false,
+        })
+    }
+
+    /// Reopen an existing journal left by a crashed instance.
+    pub(super) fn open_existing(dir: PathBuf) -> io::Result<Self> {
+        let path = dir.join(FILE_NAME);
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let len = writer.metadata()?.len();
+        use std::io::Seek;
+        writer.seek(std::io::SeekFrom::End(0))?;
+        Ok(Self {
+            dir,
+            path,
+            writer: Some(writer),
+            len,
+            ephemeral: false,
         })
     }
 
@@ -58,7 +88,10 @@ impl Journal {
     pub fn append(&mut self, bytes: &[u8]) -> io::Result<u64> {
         use std::io::Write;
         let offset = self.len;
-        self.writer.write_all(bytes)?;
+        self.writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("journal is closed"))?
+            .write_all(bytes)?;
         self.len += bytes.len() as u64;
         Ok(offset)
     }
@@ -77,12 +110,17 @@ impl Journal {
         &self.path
     }
 
-    /// Drop every journal byte. Used after a successful save rebases the
-    /// document on the newly written file.
+    /// Drop every journal byte (tests only after recovery moved journal
+    /// ownership into the recovery directory).
+    #[cfg(test)]
     pub fn reset(&mut self) -> io::Result<()> {
-        self.writer.set_len(0)?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("journal is closed"))?;
+        writer.set_len(0)?;
         use std::io::Seek;
-        self.writer.seek(std::io::SeekFrom::Start(0))?;
+        writer.seek(std::io::SeekFrom::Start(0))?;
         self.len = 0;
         Ok(())
     }
@@ -99,7 +137,12 @@ impl Journal {
 
 impl Drop for Journal {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        // Close the file before removing its directory so the cleanup also
+        // works on Windows.
+        self.writer.take();
+        if self.ephemeral {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 

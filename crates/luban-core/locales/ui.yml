@@ -133,3 +133,12 @@ core.document.huge_save_flow:
 core.disk_engine.file_changed_during_index:
   en: "the file changed while it was being indexed; open it again"
   zh-CN: "文件在建立索引期间发生变化，请重新打开"
+core.disk_engine.recovery_source_missing:
+  en: "the file to recover is missing: %{path}"
+  zh-CN: "待恢复的文件不存在：%{path}"
+core.disk_engine.recovery_source_changed:
+  en: "the file changed after the recovery checkpoint; open the current file instead: %{path}"
+  zh-CN: "文件在恢复检查点之后发生变化，请改为打开当前文件：%{path}"
+core.disk_engine.recovery_corrupt:
+  en: "the recovery data is inconsistent and cannot be replayed"
+  zh-CN: "恢复数据不一致，无法重放"

@@ -8,6 +8,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 mod app;
 mod dialogs;
 mod explorer;
+mod file_watch;
 mod find;
 mod huge_file;
 mod huge_gutter;
@@ -60,6 +61,7 @@ fn parse_args() -> LaunchOptions {
         new_window,
         smoke_test,
         manual_window_chrome: manual_window_chrome(),
+        recoveries: Vec::new(),
     }
 }
 
@@ -177,7 +179,11 @@ fn main() {
     let settings = Settings::load();
     i18n::apply_language(&settings.ui_language);
 
-    let options = parse_args();
+    let mut options = parse_args();
+    // Collected before the window exists so a crash-recovery offer can be
+    // shown together with the restored session. Expired entries are removed;
+    // entries belonging to a running instance stay within the retention age.
+    options.recoveries = luban_core::disk_engine::scan_recovery(luban_core::disk_engine::RETENTION);
 
     gpui_kit::application()
         .with_assets(icons::AppAssets)

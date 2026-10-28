@@ -374,8 +374,11 @@ pub enum CloseIntent {
     Tab(u64),
     AllTabs,
     Exit,
-    /// A disk-engine save found the file changed on disk; "save" overwrites.
+    /// A disk-engine save found the file changed on disk; "save" overwrites
+    /// and the secondary action reloads.
     OverwriteExternal(u64),
+    /// A normal document save found the file changed on disk.
+    SaveConflict(u64),
     /// Reload a tab after discarding or saving its edits.
     ReloadTab(u64),
 }
@@ -404,6 +407,8 @@ pub enum SaveThen {
     CloseAll,
     /// Continue a queued Save All / Close All / Exit sequence.
     NextHugeSave,
+    /// Continue the queued normal-document part of a batch save.
+    NextNormalSave,
     /// Reload the tab after saving it.
     ReloadTab(u64),
 }

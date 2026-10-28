@@ -7,6 +7,7 @@
 
 rust_i18n::i18n!("locales", fallback = "en");
 
+pub mod atomic_write;
 pub mod disk_engine;
 pub mod document;
 pub mod encoding;
@@ -22,7 +23,7 @@ pub mod text;
 pub mod undo;
 pub mod workspace;
 
-pub use document::Document;
+pub use document::{DiskStatus, Document};
 pub use encoding::TextEncoding;
 pub use eol::Eol;
 pub use error::{Error, Result};

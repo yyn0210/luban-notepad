@@ -152,17 +152,18 @@ Luban Notepad 0.13 不是“功能少”，而是**能力结构偏科**：超大
 
 #### 交付物
 
-- [ ] **普通文档原子保存**：同目录临时文件 → `fsync` → 原子重命名；
+- [x] **普通文档原子保存**：同目录临时文件 → `fsync` → 原子重命名；
       保留权限；Windows 使用 `ReplaceFile`/`MoveFileEx` 语义；失败时保留
-      原文件；可选 `.bak` 备份；保存前检查可用空间。
+      原文件；符号链接写入实际目标并保留链接。（data-safety change 已实现；
+      `.bak` 备份和保存前可用空间检查仍待补。）
 - [ ] **故障注入测试**：模拟写入中断、磁盘满、权限不足，验证原文件不丢、
-      不出现半截文件。
-- [ ] **普通文档外部修改保护**：保存前调用 `changed_on_disk()`，弹出
-      “覆盖/重新加载/取消”；复用磁盘引擎已有的确认流程。
-- [ ] **实时文件监视**：引入 `notify` 做防抖监视；外部变化时显示非模态
+      不出现半截文件。（已覆盖权限不足和保存失败路径；磁盘满注入待补。）
+- [x] **普通文档外部修改保护**：保存前检查磁盘状态，弹出
+      “覆盖/重新加载/取消”；与磁盘引擎共用一致的用户选项。
+- [x] **实时文件监视**：引入 `notify` 做防抖监视；外部变化时显示非模态
       提示条，支持 Reload/Keep；忽略自身保存触发的事件；处理重命名/删除。
-- [ ] **磁盘引擎崩溃恢复**：把编辑日志路径和元数据写入会话；启动时检测
-      孤儿日志并提示恢复。
+- [x] **磁盘引擎崩溃恢复**：checkpoint + 追加操作日志写入配置目录；启动时
+      检测恢复项并提示恢复；源文件变化或缺失时安全拒绝；保存/关闭/放弃后清理。
 - [ ] **本地历史**：普通文档按时间或保存前生成快照，支持浏览和恢复；
       设置保留期限和空间上限。
 - [ ] **可诊断**：日志写文件并轮转；panic hook 写崩溃日志；帮助菜单加
@@ -367,22 +368,23 @@ Luban Notepad 0.13 不是“功能少”，而是**能力结构偏科**：超大
 
 ## 6. 立即可执行的任务
 
-以下任务按优先级排列，行号基于 0.13.0，可作为近期开发起点。
+以下任务按优先级排列，行号基于 0.13.0。第 1–4 项已在 `data-safety` change
+中实现，保留为后续核对和补充测试的索引。
 
 1. **普通文档原子保存**
-   - `crates/luban-core/src/document.rs`：`save_to_path`。
-   - 增加临时文件 + `fsync` + 重命名；Windows 处理替换语义。
-   - 增加故障注入测试。
+   - `crates/luban-core/src/atomic_write.rs`：临时文件 + `fsync` + 重命名。
+   - `crates/luban-core/src/document.rs`：`save_to_path` 使用原子替换。
+   - 权限不足测试已覆盖；磁盘满场景待补。
 2. **普通文档外部修改保护**
-   - `crates/luban-app/src/app.rs`：`save_tab_at`。
-   - 复用 `crates/luban-core/src/document.rs` 的 `changed_on_disk`。
-   - 复用 `app.rs:4019` 附近的确认流程。
+   - `crates/luban-app/src/app.rs`：`save_tab_at_with` 保存前检查。
+   - `crates/luban-core/src/document.rs`：`disk_status`。
+   - 覆盖/重新加载/取消与磁盘引擎共用确认流程。
 3. **实时文件监视**
-   - 新模块 `crates/luban-app/src/file_watch.rs`。
-   - 增加 `notify` 依赖；防抖；忽略自身保存。
+   - `crates/luban-app/src/file_watch.rs`。
+   - `notify` 依赖；500 毫秒防抖；忽略自身保存。
 4. **磁盘引擎崩溃恢复**
-   - `crates/luban-core/src/disk_engine/journal.rs`。
-   - `crates/luban-core/src/session.rs` 保存日志路径/元数据。
+   - `crates/luban-core/src/disk_engine/recovery.rs`。
+   - `crates/luban-core/src/session.rs` 保存恢复标识。
 5. **日志文件**
    - `crates/luban-app/src/main.rs` 初始化文件日志；panic hook。
 6. **命令注册表**

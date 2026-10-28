@@ -46,6 +46,10 @@ pub struct SessionTab {
     /// never written to the session.
     #[serde(default)]
     pub huge_modified: bool,
+    /// Recovery directory identifier for a disk-engine tab with unsaved
+    /// edits. `None` for clean tabs and for older sessions.
+    #[serde(default)]
+    pub recovery_id: Option<String>,
 }
 
 impl Default for SessionTab {
@@ -67,6 +71,7 @@ impl Default for SessionTab {
             huge_column: None,
             huge_scroll: None,
             huge_modified: false,
+            recovery_id: None,
         }
     }
 }
@@ -181,6 +186,7 @@ mod tests {
                 huge_column: Some(3),
                 huge_scroll: Some(1.5),
                 huge_modified: true,
+                recovery_id: Some("recovery-1".into()),
             }],
             active_tab: 0,
             workspace_root: Some(PathBuf::from("/tmp")),
@@ -199,6 +205,7 @@ mod tests {
         assert_eq!(loaded.tabs[0].huge_column, Some(3));
         assert_eq!(loaded.tabs[0].huge_scroll, Some(1.5));
         assert!(loaded.tabs[0].huge_modified);
+        assert_eq!(loaded.tabs[0].recovery_id.as_deref(), Some("recovery-1"));
         assert_eq!(loaded.workspace_root, Some(PathBuf::from("/tmp")));
     }
 

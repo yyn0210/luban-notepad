@@ -3703,6 +3703,7 @@ dependencies = [
  "libc",
  "log",
  "luban-core",
+ "notify",
  "raw-window-handle",
  "rust-i18n",
  "serde",

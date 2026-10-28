@@ -704,6 +704,12 @@ status.save_failed:
 status.saved_modified:
   en: "Saved modified documents"
   zh-CN: "已保存修改的文档"
+status.batch_unsaved:
+  en: "Close or exit cancelled: a document was edited while saving. Retry when the edits are saved."
+  zh-CN: "保存期间又有文档被修改，已取消关闭/退出，请重试。"
+status.save_all_failed:
+  en: "Saved with errors: %{count} document(s) could not be saved"
+  zh-CN: "保存完成，但有 %{count} 个文档保存失败"
 status.saved_path_lossy:
   en: "Saved %{path}, with unrepresentable characters replaced"
   zh-CN: "已保存 %{path}，无法表示的字符已被替换"
@@ -914,8 +920,8 @@ confirm.overwrite_external_title:
   en: "File changed on disk: %{name}"
   zh-CN: "文件已在磁盘上修改：%{name}"
 confirm.overwrite_external_detail:
-  en: "Saving overwrites the file on disk. Choose Overwrite to continue, or Cancel to stop and keep the original."
-  zh-CN: "继续保存会覆盖磁盘上的内容。选择“覆盖”继续，选择“取消”停止并保留原文件。"
+  en: "Saving overwrites the file on disk. Choose Overwrite to replace it, Reload to discard the buffer and read the file, or Cancel to keep both unchanged."
+  zh-CN: "继续保存会覆盖磁盘上的内容。选择“覆盖”替换磁盘文件，选择“重新加载”放弃缓冲区并读取磁盘内容，选择“取消”保持两者不变。"
 confirm.overwrite_yes:
   en: "Overwrite"
   zh-CN: "覆盖"
@@ -961,3 +967,54 @@ find.huge_result:
 status.huge_history_trimmed:
   en: "Undo history limit reached; the oldest edits can no longer be undone."
   zh-CN: "撤销历史已达上限，最早的修改将无法撤销。"
+common.reload:
+  en: "Reload"
+  zh-CN: "重新加载"
+confirm.reload_normal_detail:
+  en: "The document has unsaved changes. Save and reload, discard the changes and reload, or cancel."
+  zh-CN: "文档有未保存的修改。可以保存后重新加载、放弃修改后重新加载，或取消。"
+banner.external_changed:
+  en: "%{name} was modified on disk."
+  zh-CN: "%{name} 已在磁盘上被修改。"
+banner.external_missing:
+  en: "%{name} was deleted or renamed on disk."
+  zh-CN: "%{name} 已在磁盘上被删除或重命名。"
+banner.keep:
+  en: "Keep"
+  zh-CN: "保留"
+recovery.title:
+  en: "Recover unsaved changes?"
+  zh-CN: "恢复未保存的修改？"
+recovery.detail:
+  en: "A disk-engine document with unsaved edits was left by an earlier crash: %{path}. Restore it or discard the recovery data."
+  zh-CN: "上次异常退出时留在磁盘引擎文档中的未保存修改：%{path}。可以恢复内容或丢弃恢复数据。"
+recovery.restore:
+  en: "Restore"
+  zh-CN: "恢复"
+recovery.discard:
+  en: "Discard Recovery"
+  zh-CN: "丢弃恢复"
+recovery.discard_open:
+  en: "Discard and Open File"
+  zh-CN: "丢弃并打开原文件"
+recovery.open_current:
+  en: "Open Current File"
+  zh-CN: "打开当前文件"
+recovery.later:
+  en: "Later"
+  zh-CN: "稍后"
+status.recovering:
+  en: "Recovering unsaved edits…"
+  zh-CN: "正在恢复未保存的修改…"
+status.recovery_restored:
+  en: "Recovered unsaved edits from the last session"
+  zh-CN: "已恢复上次会话的未保存修改"
+status.recovery_failed:
+  en: "Could not recover the document: %{error}"
+  zh-CN: "无法恢复文档：%{error}"
+status.recovery_discard_failed:
+  en: "Could not remove the recovery data: %{error}"
+  zh-CN: "无法删除恢复数据：%{error}"
+status.recovery_source_missing:
+  en: "The source file no longer exists: %{path}"
+  zh-CN: "源文件已不存在：%{path}"

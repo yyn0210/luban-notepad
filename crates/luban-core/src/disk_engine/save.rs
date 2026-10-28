@@ -5,13 +5,14 @@
 //! same-directory temporary file. The temporary file is fsynced and renamed
 //! over the target, so the original file is never truncated in place.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::atomic_write::AtomicFile;
 use crate::encoding::TextEncoding;
 use crate::eol::{self, Eol};
 use crate::error::{Error, Result};
@@ -65,7 +66,7 @@ pub struct SaveSnapshot {
     pub(super) base_modified: Option<SystemTime>,
     pub(super) blocks: Vec<Block>,
     pub(super) pieces: Vec<Piece>,
-    pub(super) journal_path: PathBuf,
+    pub(super) journal_path: Option<PathBuf>,
     /// The file handle used to build the index. Keeping it lets an explicit
     /// overwrite read the bytes the index refers to even when the path was
     /// replaced on disk.
@@ -87,7 +88,10 @@ impl DiskEngine {
             base_modified: self.last_modified(),
             blocks: self.blocks.clone(),
             pieces: self.pieces.clone(),
-            journal_path: self.journal.path().to_path_buf(),
+            journal_path: self
+                .journal
+                .as_ref()
+                .map(|journal| journal.path().to_path_buf()),
             base: self.base.clone(),
         }
     }
@@ -114,24 +118,33 @@ impl SaveSnapshot {
         if !force {
             self.verify_source()?;
         }
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-        let temp_path = temp_path_for(target);
-        let mut guard = TempGuard::new(temp_path.clone());
+        let mut atomic = AtomicFile::create(target)?;
+        // Replacing the source keeps its permissions; a new save-as target
+        // uses the default mode so a read-only source does not leave the new
+        // document read-only.
+        let same_file = self.is_same_file(atomic.target_path());
+        let source_permissions = if same_file {
+            fs::metadata(&self.path)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        } else {
+            None
+        };
         let base = &self.base;
         let journal = if self
             .pieces
             .iter()
             .any(|piece| matches!(piece.kind, PieceKind::Journal { .. }))
         {
-            Some(File::open(&self.journal_path)?)
+            let path = self
+                .journal_path
+                .as_ref()
+                .ok_or_else(|| Error::Other(tr("core.disk_engine.journal_corrupt").to_string()))?;
+            Some(File::open(path)?)
         } else {
             None
         };
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)?;
+        let file = atomic.file_mut();
 
         let mut body_written = 0u64;
         let mut lossy = false;
@@ -197,23 +210,17 @@ impl SaveSnapshot {
         if let Some(block) = pending.take() {
             blocks.push(block);
         }
-
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
+        // The caller-provided permission snapshot (rather than a metadata read
+        // after writing) keeps the previous save-as semantics: a range view
+        // written to a new path is not made read-only by its source.
+        let _ = file;
+        if let Some(permissions) = source_permissions {
+            atomic.set_commit_permissions(permissions);
+        }
         if !force {
             self.verify_source()?;
         }
-        // Replacing the source keeps its permissions; a new save-as target
-        // uses the default mode so a read-only source does not leave the new
-        // document read-only.
-        if self.is_same_file(target) {
-            if let Ok(metadata) = fs::metadata(&self.path) {
-                let _ = fs::set_permissions(&temp_path, metadata.permissions());
-            }
-        }
-        replace_file(&temp_path, target)?;
-        guard.disarm();
+        atomic.commit()?;
         let metadata = fs::metadata(target)?;
         Ok(SaveReport {
             blocks,
@@ -323,81 +330,4 @@ fn clamp_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
-}
-
-fn temp_path_for(target: &Path) -> PathBuf {
-    let name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_string());
-    let unique = format!(
-        ".{name}.luban-save-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    );
-    target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(unique)
-}
-
-fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-        let from: Vec<u16> = temp
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let to: Vec<u16> = target
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let replaced = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if replaced == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(temp, target)
-    }
-}
-
-struct TempGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TempGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TempGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }

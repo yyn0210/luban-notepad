@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,8 +21,8 @@ use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
 use gpui_kit::component::{Selectable as _, Sizable as _, Size, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
-use luban_core::disk_engine::{DiskEngine, WindowText, WINDOW_BYTES};
-use luban_core::document::{Document, PartialRange};
+use luban_core::disk_engine::{DiskEngine, RecoveryInfo, WindowText, WINDOW_BYTES};
+use luban_core::document::{DiskStatus, Document, PartialRange};
 use luban_core::encoding::TextEncoding;
 use luban_core::eol::{self, Eol};
 use luban_core::i18n::language_display_name;
@@ -41,6 +42,7 @@ use crate::dialogs::{
     FileDialogState, FileFilter, GoToLineState, LanguagePickerState, SaveAsRequest, SaveThen,
 };
 use crate::explorer::ExplorerState;
+use crate::file_watch::{FileWatcher, WatchEventKind};
 use crate::find::{FindInFilesPanel, FindPanel};
 use crate::huge_file::{
     clamp_top_line, diff_bytes, max_top_line, top_line_from_scroll, window_max_top_line,
@@ -63,6 +65,31 @@ pub struct LaunchOptions {
     /// the application removes the window manager titlebar itself and draws the
     /// chrome for every window state.
     pub manual_window_chrome: bool,
+    /// Disk-engine documents left behind by a crash, in display order.
+    pub recoveries: Vec<RecoveryInfo>,
+}
+
+/// A file on disk no longer matches the buffer's recorded identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalNotice {
+    Changed,
+    Missing,
+}
+
+/// What happens after every queued tab has been saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchSaveKind {
+    SaveAll,
+    CloseAll,
+    Exit,
+}
+
+/// A crash-recovery offer shown at startup.
+#[derive(Clone, Debug)]
+pub struct RecoveryPrompt {
+    pub info: RecoveryInfo,
+    /// Set when the source changed or disappeared; restoring is refused.
+    pub problem: Option<String>,
 }
 
 pub struct Tab {
@@ -71,9 +98,14 @@ pub struct Tab {
     pub editor: Entity<EditorState>,
     pub decorations: RangeDecorationCollection,
     pub needs_sync: bool,
+    /// The editor emitted a real text change that has not been synced into
+    /// the document yet. Selection and focus events do not set this.
+    pub pending_edit: bool,
     /// Present when the tab is backed by the disk engine.
     pub huge: Option<HugeFileUi>,
     pub highlighted_revision: u64,
+    /// External change/deletion discovered by the file watcher.
+    pub external: Option<ExternalNotice>,
     /// Files at or above `Settings::large_file_threshold` open in a reduced
     /// mode: no syntax highlighting, wrapping, bracket matching or live find.
     pub large_file: bool,
@@ -311,9 +343,32 @@ pub struct LubanApp {
     pending_huge_saves: Vec<u64>,
     pending_huge_all: bool,
     pending_huge_exit: bool,
+    /// Normal tabs with paths queued by Save All / Close All / Exit. They are
+    /// saved one at a time so an external-change confirmation can pause the
+    /// batch instead of closing the tab behind the dialog.
+    pending_normal_saves: Vec<u64>,
+    pending_normal_all: bool,
+    pending_normal_close_all: bool,
+    pending_normal_exit: bool,
+    pending_normal_skipped_partial: bool,
+    /// Documents that failed during a Save All run and are reported together
+    /// after the queue drains.
+    pending_save_failures: Vec<String>,
+    /// The running batch ends by closing all tabs or quitting.
+    pending_batch_is_close: bool,
     /// A save waiting for the user to confirm overwriting an externally
     /// modified file.
     pending_huge_overwrite: Option<(u64, Option<PathBuf>, SaveThen)>,
+    /// A normal document save waiting for the same confirmation.
+    pending_normal_overwrite: Option<(u64, Option<PathBuf>, SaveThen)>,
+    /// Directory watcher for every open file.
+    watch: FileWatcher,
+    /// Crash recovery offers not yet shown.
+    recovery_queue: VecDeque<RecoveryInfo>,
+    /// The recovery offer currently displayed.
+    recovery_prompt: Option<RecoveryPrompt>,
+    /// Recovery entry currently being rebuilt in the background.
+    recovery_restoring: Option<RecoveryInfo>,
     /// Line/column to apply once a disk-engine open started from a search hit
     /// has finished indexing.
     pending_huge_at: Option<(PathBuf, u64, u64)>,
@@ -454,7 +509,19 @@ impl LubanApp {
             pending_huge_saves: Vec::new(),
             pending_huge_all: false,
             pending_huge_exit: false,
+            pending_normal_saves: Vec::new(),
+            pending_normal_all: false,
+            pending_normal_close_all: false,
+            pending_normal_exit: false,
+            pending_normal_skipped_partial: false,
+            pending_save_failures: Vec::new(),
+            pending_batch_is_close: false,
             pending_huge_overwrite: None,
+            pending_normal_overwrite: None,
+            watch: FileWatcher::new(),
+            recovery_queue: options.recoveries.into_iter().collect(),
+            recovery_prompt: None,
+            recovery_restoring: None,
             pending_huge_at: None,
             window_title: "Luban Notepad".to_string(),
             window_width: 1280.0,
@@ -601,6 +668,7 @@ impl LubanApp {
         } else {
             app.new_file(window, cx);
         }
+        app.advance_recovery_prompt();
 
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -620,6 +688,23 @@ impl LubanApp {
             if this
                 .update(cx, |app, _| {
                     app.autosave_session();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+
+        // Poll the watcher even while the window is idle so an external change
+        // is noticed without waiting for the next mouse or keyboard event.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            if this
+                .update(cx, |app, cx| {
+                    app.sync_file_watch(cx);
                 })
                 .is_err()
             {
@@ -751,11 +836,14 @@ impl LubanApp {
 
         let subscription = cx.subscribe(&editor, |this, editor, event, cx| {
             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.editor == editor) {
-                tab.needs_sync = true;
-                // Large documents never run the whole-buffer diff; the editor
-                // event is enough to track the modified state.
-                if tab.large_file && matches!(event, InputEvent::Change) {
-                    tab.doc.touch();
+                if matches!(event, InputEvent::Change) {
+                    tab.needs_sync = true;
+                    tab.pending_edit = true;
+                    // Large documents never run the whole-buffer diff; the
+                    // editor event is enough to track the modified state.
+                    if tab.large_file {
+                        tab.doc.touch();
+                    }
                 }
             }
             cx.notify();
@@ -797,8 +885,10 @@ impl LubanApp {
             editor,
             decorations,
             needs_sync: false,
+            pending_edit: false,
             huge: huge_ui,
             highlighted_revision: u64::MAX,
+            external: None,
             large_file,
             decorations_key: None,
             _subscription: subscription,
@@ -2101,9 +2191,25 @@ impl LubanApp {
         let active = session.active_tab;
         let max_size = self.settings.max_file_size_bytes();
         let threshold = self.settings.large_file_threshold as u64;
+        // Tabs whose unsaved edits are waiting in a recovery prompt are opened
+        // by the recovery flow instead of from the session snapshot.
+        let pending_recovery_ids: HashSet<&str> = self
+            .recovery_queue
+            .iter()
+            .chain(self.recovery_prompt.iter().map(|prompt| &prompt.info))
+            .map(|info| info.id.as_str())
+            .collect();
         let mut any_large = false;
         let mut specs = Vec::with_capacity(session.tabs.len());
         for tab in session.tabs {
+            if tab
+                .recovery_id
+                .as_deref()
+                .is_some_and(|id| pending_recovery_ids.contains(id))
+            {
+                any_large = true;
+                continue;
+            }
             let large = tab
                 .path
                 .as_ref()
@@ -2139,6 +2245,11 @@ impl LubanApp {
             });
         }
 
+        if specs.is_empty() {
+            // Everything in the session is handled by the recovery prompt.
+            self.new_file(window, cx);
+            return;
+        }
         if !any_large {
             for spec in specs {
                 let doc = spec.load(max_size);
@@ -2236,10 +2347,12 @@ impl LubanApp {
         if changed {
             tab.doc.set_text_from_widget(&normalized, cursor, anchor);
             tab.needs_sync = false;
+            tab.pending_edit = false;
             tab.highlighted_revision = u64::MAX;
         } else {
             tab.doc.set_selection(anchor, cursor);
             tab.needs_sync = false;
+            tab.pending_edit = false;
         }
         if changed {
             self.find.dirty = true;
@@ -2279,7 +2392,10 @@ impl LubanApp {
         let tab = &mut self.tabs[index];
         tab.doc.set_selection(anchor, cursor);
         if clear_pending {
+            // Large-file buffers live in the editor; the Change event already
+            // marked the document dirty, so this flag has served its purpose.
             tab.needs_sync = false;
+            tab.pending_edit = false;
         }
     }
 
@@ -2479,6 +2595,7 @@ impl LubanApp {
         };
         let busy = ui.is_busy();
         let wants_text = tab.needs_sync;
+        let apply_text = !busy;
         let (text, cursor_byte, range, scroll_offset_y, editor_line_height) = {
             let state = tab.editor.read(cx);
             let rope = state.text();
@@ -2650,6 +2767,7 @@ impl LubanApp {
             huge.cursor = cursor;
             huge.anchor = anchor;
             huge.scroll_line = scroll_line;
+            huge.write().set_recovery_position(cursor, scroll_line);
             if update_line {
                 huge.cursor_line = window_line.saturating_add(position_line as u64);
                 huge.cursor_column = if position_line == 0 {
@@ -2667,7 +2785,10 @@ impl LubanApp {
                 ui.scroll_target = None;
             }
         }
-        self.tabs[index].needs_sync = false;
+        if !wants_text || apply_text {
+            self.tabs[index].needs_sync = false;
+            self.tabs[index].pending_edit = false;
+        }
         self.maybe_schedule_huge_window(index, window, cx);
     }
 
@@ -4190,6 +4311,9 @@ impl LubanApp {
                     }
                 };
                 if let Err(err) = adopted {
+                    self.abort_pending_saves();
+                    let editor = self.tabs[index].editor.clone();
+                    editor.update(cx, |state, cx| state.set_readonly(restore_read_only, cx));
                     self.set_status(err.to_string(), cx);
                     return;
                 }
@@ -4200,6 +4324,9 @@ impl LubanApp {
                     tab.doc.last_modified = metadata.modified().ok();
                     tab.doc.read_only = metadata.permissions().readonly();
                 }
+                tab.external = None;
+                self.watch
+                    .note_saved(&target, tab.doc.file_size, tab.doc.last_modified);
                 // Saving a range view as a new file turns the tab into a
                 // whole-file engine over the target; the partial marker must
                 // not survive the transition.
@@ -4300,21 +4427,36 @@ impl LubanApp {
                 }
                 let editor = self.tabs[index].editor.clone();
                 editor.update(cx, |state, cx| state.set_readonly(restore_read_only, cx));
-                if matches!(err, luban_core::Error::Cancelled) {
+                let cancelled = matches!(err, luban_core::Error::Cancelled);
+                let name = self.tabs[index].doc.display_name();
+                let queued_then = self.tabs[index]
+                    .huge
+                    .as_ref()
+                    .and_then(|ui| ui.queued_save_then);
+                if cancelled {
                     self.set_status(tr("status.save_cancelled"), cx);
                 } else {
+                    self.pending_save_failures.push(format!("{name}: {err}"));
                     self.set_status(
                         tr_args("status.save_failed", &[("error", err.to_string())]),
                         cx,
                     );
                 }
-                self.pending_exit_saves.clear();
-                self.pending_close_saves.clear();
-                self.pending_huge_saves.clear();
-                self.pending_huge_all = false;
-                self.pending_huge_exit = false;
                 if let Some(ui) = self.tabs[index].huge.as_mut() {
                     ui.queued_save_then = None;
+                }
+                // Save All keeps going after a failure and reports the failed
+                // tabs at the end. Close All / Exit must stop so they never
+                // close the remaining tabs with an unresolved failure.
+                let save_all_continues = !cancelled
+                    && (job.then == SaveThen::NextHugeSave
+                        || queued_then == Some(SaveThen::NextHugeSave))
+                    && !self.pending_huge_all
+                    && !self.pending_huge_exit;
+                if save_all_continues {
+                    self.finish_save_flow(SaveThen::NextHugeSave, window, cx);
+                } else {
+                    self.abort_pending_saves();
                 }
             }
         }
@@ -4324,14 +4466,21 @@ impl LubanApp {
     fn finish_save_flow(&mut self, then: SaveThen, window: &mut Window, cx: &mut Context<Self>) {
         match then {
             SaveThen::Nothing => {
-                if !self.pending_huge_saves.is_empty() {
-                    self.save_next_huge(window, cx);
-                } else {
-                    self.focus_editor(window, cx);
-                }
+                // A standalone save must never drain a paused batch: doing so
+                // could close tabs or quit with an unresolved conflict.
+                self.focus_editor(window, cx);
             }
             SaveThen::NextHugeSave => {
                 if self.pending_huge_saves.is_empty() {
+                    // An in-flight save from an earlier batch can finish while
+                    // a new batch is waiting on an external-change dialog.
+                    // Never close or quit until that dialog is resolved.
+                    if !self.batch_can_finalize() {
+                        return;
+                    }
+                    if self.unsaved_blocks_close(cx) {
+                        return;
+                    }
                     if self.pending_huge_exit {
                         self.pending_huge_exit = false;
                         if self.pending_exit_saves.is_empty() {
@@ -4347,15 +4496,22 @@ impl LubanApp {
                             self.prompt_next_batch_save(window, cx);
                         }
                     } else {
-                        self.set_status(tr("status.saved_modified"), cx);
+                        self.report_save_all_result(cx);
                     }
                 } else {
                     self.save_next_huge(window, cx);
                 }
             }
+            SaveThen::NextNormalSave => {
+                self.save_next_normal(window, cx);
+            }
             SaveThen::ReloadTab(id) => {
                 if let Some(index) = self.tab_index_by_id(id) {
-                    self.start_huge_reload(index, window, cx);
+                    if self.tabs[index].doc.is_huge() {
+                        self.start_huge_reload(index, window, cx);
+                    } else {
+                        self.reload_tab_now(index, window, cx);
+                    }
                 }
             }
             SaveThen::CloseTab(id) => {
@@ -4365,6 +4521,9 @@ impl LubanApp {
             }
             SaveThen::Exit => {
                 if self.pending_exit_saves.is_empty() {
+                    if self.unsaved_blocks_close(cx) {
+                        return;
+                    }
                     self.request_quit(window, cx);
                 } else {
                     self.prompt_next_batch_save(window, cx);
@@ -4372,6 +4531,9 @@ impl LubanApp {
             }
             SaveThen::CloseAll => {
                 if self.pending_close_saves.is_empty() {
+                    if self.unsaved_blocks_close(cx) {
+                        return;
+                    }
                     self.close_all_now(window, cx);
                 } else {
                     self.prompt_next_batch_save(window, cx);
@@ -4392,6 +4554,12 @@ impl LubanApp {
             self.start_huge_save(index, None, SaveThen::NextHugeSave, false, window, cx);
             return;
         }
+        if !self.batch_can_finalize() {
+            return;
+        }
+        if self.unsaved_blocks_close(cx) {
+            return;
+        }
         if self.pending_huge_exit {
             self.pending_huge_exit = false;
             if self.pending_exit_saves.is_empty() {
@@ -4407,7 +4575,7 @@ impl LubanApp {
                 self.prompt_next_batch_save(window, cx);
             }
         } else {
-            self.set_status(tr("status.saved_modified"), cx);
+            self.report_save_all_result(cx);
         }
     }
 
@@ -4517,6 +4685,8 @@ impl LubanApp {
                     tab.doc.read_only = read_only;
                     tab.doc.file_size = size;
                     tab.doc.last_modified = last_modified;
+                    tab.external = None;
+                    self.watch.note_saved(&path, size, last_modified);
                     tab.doc.set_partial_range(range.map(|range| PartialRange {
                         start: range.start,
                         end: range.end,
@@ -4584,6 +4754,22 @@ impl LubanApp {
     }
 
     fn save_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_tab_at_with(index, SaveThen::Nothing, false, window, cx);
+    }
+
+    /// Save a tab, optionally resuming a close/exit flow afterwards.
+    ///
+    /// Unless `force` is set, a file whose size or modification time changed
+    /// since it was opened shows an Overwrite/Reload/Cancel confirmation
+    /// instead of being overwritten silently.
+    fn save_tab_at_with(
+        &mut self,
+        index: usize,
+        then: SaveThen,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.tabs.len() {
             return;
         }
@@ -4592,10 +4778,27 @@ impl LubanApp {
             return;
         }
         if self.tabs[index].doc.is_huge() {
-            self.start_huge_save(index, None, SaveThen::Nothing, false, window, cx);
+            self.start_huge_save(index, None, then, force, window, cx);
             return;
         }
+        let path = self.tabs[index].doc.path.clone();
+        if !force && path.is_some() {
+            let status = self.tabs[index].doc.disk_status();
+            if matches!(status, DiskStatus::Changed | DiskStatus::Missing) {
+                let id = self.tabs[index].id;
+                let name = self.tabs[index].doc.display_name();
+                self.pending_normal_overwrite = Some((id, path, then));
+                self.confirm = Some(ConfirmState::new(
+                    CloseIntent::SaveConflict(id),
+                    tr_args("confirm.overwrite_external_title", &[("name", name)]),
+                    tr("confirm.overwrite_external_detail"),
+                ));
+                cx.notify();
+                return;
+            }
+        }
         if !self.ensure_tab_text(index, cx) {
+            self.abort_pending_saves();
             return;
         }
         let large_file = self.tabs[index].large_file;
@@ -4631,7 +4834,12 @@ impl LubanApp {
         };
         self.release_tab_text(index);
         if let Some(path) = path {
-            self.settings.add_recent(path);
+            self.settings.add_recent(path.clone());
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.external = None;
+                self.watch
+                    .note_saved(&path, tab.doc.file_size, tab.doc.last_modified);
+            }
         }
         let _ = self.settings.save();
         match (saved, error) {
@@ -4644,43 +4852,228 @@ impl LubanApp {
             ),
             (Some(_), _) => self.set_status(tr_args("status.saved", &[("name", name)]), cx),
             (None, Some(err)) => {
-                self.set_status(tr_args("status.save_failed", &[("error", err)]), cx)
+                if self.pending_normal_all {
+                    // Save All continues with the remaining tabs and reports
+                    // the failures at the end, matching the existing flow.
+                    self.pending_save_failures.push(format!("{name}: {err}"));
+                    self.set_status(tr_args("status.save_failed", &[("error", err)]), cx);
+                    self.save_next_normal(window, cx);
+                } else {
+                    // Close All / Exit must stop: continuing could close tabs
+                    // while this document is still unsaved.
+                    self.abort_pending_saves();
+                    self.set_status(tr_args("status.save_failed", &[("error", err)]), cx);
+                }
             }
             (None, None) => {}
+        }
+        if saved.is_some() && then != SaveThen::Nothing {
+            self.finish_save_flow(then, window, cx);
         }
         cx.notify();
     }
 
     pub fn save_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
-        let mut skipped_partial = false;
+        self.start_batch_save(BatchSaveKind::SaveAll, window, cx);
+    }
+
+    /// Queue every modified tab for a Save All / Close All / Exit flow.
+    ///
+    /// Normal documents with paths are saved one at a time. A save conflict
+    /// pauses the batch instead of letting the caller close the tab or quit,
+    /// and only an explicit Overwrite/Save resumes it.
+    fn start_batch_save(
+        &mut self,
+        kind: BatchSaveKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.abort_pending_saves();
+        self.pending_batch_is_close = matches!(kind, BatchSaveKind::CloseAll | BatchSaveKind::Exit);
+        let ids = self.modified_tabs();
         let mut huge = Vec::new();
-        for index in 0..self.tabs.len() {
-            if !self.tabs[index].doc.is_modified() || self.tabs[index].doc.path.is_none() {
+        for id in ids {
+            let Some(index) = self.tab_index_by_id(id) else {
+                continue;
+            };
+            let tab = &self.tabs[index];
+            if tab.doc.is_partial() {
+                match kind {
+                    BatchSaveKind::SaveAll => self.pending_normal_skipped_partial = true,
+                    BatchSaveKind::CloseAll => {
+                        self.pending_close_saves.push(id);
+                        self.pending_close_all_after_saves = true;
+                    }
+                    BatchSaveKind::Exit => self.pending_exit_saves.push(id),
+                }
                 continue;
             }
-            if self.tabs[index].doc.is_partial() {
-                skipped_partial = true;
+            if tab.doc.is_huge() {
+                huge.push(id);
                 continue;
             }
-            if self.tabs[index].doc.is_huge() {
-                huge.push(self.tabs[index].id);
-                continue;
+            if tab.doc.path.is_some() {
+                self.pending_normal_saves.push(id);
+            } else {
+                match kind {
+                    BatchSaveKind::SaveAll => {}
+                    BatchSaveKind::CloseAll => {
+                        self.pending_close_saves.push(id);
+                        self.pending_close_all_after_saves = true;
+                    }
+                    BatchSaveKind::Exit => self.pending_exit_saves.push(id),
+                }
             }
-            self.save_tab_at(index, window, cx);
+        }
+        match kind {
+            BatchSaveKind::SaveAll => self.pending_normal_all = true,
+            BatchSaveKind::CloseAll => self.pending_normal_close_all = true,
+            BatchSaveKind::Exit => self.pending_normal_exit = true,
         }
         if !huge.is_empty() {
             self.pending_huge_saves = huge;
-            self.pending_huge_all = false;
-            self.pending_huge_exit = false;
-            self.save_next_huge(window, cx);
+            match kind {
+                BatchSaveKind::SaveAll => {
+                    self.pending_huge_all = false;
+                    self.pending_huge_exit = false;
+                }
+                BatchSaveKind::CloseAll => self.pending_huge_all = true,
+                BatchSaveKind::Exit => self.pending_huge_exit = true,
+            }
+        }
+        self.save_next_normal(window, cx);
+    }
+
+    /// Save the next queued normal document, or finish the batch.
+    fn save_next_normal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while !self.pending_normal_saves.is_empty() {
+            let id = self.pending_normal_saves.remove(0);
+            let Some(index) = self.tab_index_by_id(id) else {
+                continue;
+            };
+            let tab = &self.tabs[index];
+            if !tab.doc.is_modified() || tab.doc.path.is_none() || tab.doc.is_partial() {
+                continue;
+            }
+            self.save_tab_at_with(index, SaveThen::NextNormalSave, false, window, cx);
             return;
         }
-        if skipped_partial {
-            self.set_status(tr("status.save_partial_as"), cx);
-        } else {
-            self.set_status(tr("status.saved_modified"), cx);
+        self.finish_normal_batch(window, cx);
+    }
+
+    fn finish_normal_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_normal_all {
+            self.pending_normal_all = false;
+            if !self.pending_huge_saves.is_empty() {
+                self.save_next_huge(window, cx);
+            } else if self.pending_save_failures.is_empty() && self.pending_normal_skipped_partial {
+                self.pending_normal_skipped_partial = false;
+                self.set_status(tr("status.save_partial_as"), cx);
+            } else {
+                self.pending_normal_skipped_partial = false;
+                self.report_save_all_result(cx);
+            }
+            return;
         }
+        if self.pending_normal_close_all {
+            self.pending_normal_close_all = false;
+            if !self.pending_huge_saves.is_empty() {
+                self.save_next_huge(window, cx);
+            } else if self.pending_close_saves.is_empty() {
+                if self.unsaved_blocks_close(cx) {
+                    return;
+                }
+                self.close_all_now(window, cx);
+            } else {
+                self.prompt_next_batch_save(window, cx);
+            }
+            return;
+        }
+        if self.pending_normal_exit {
+            self.pending_normal_exit = false;
+            if !self.pending_huge_saves.is_empty() {
+                self.save_next_huge(window, cx);
+            } else if self.pending_exit_saves.is_empty() {
+                if self.unsaved_blocks_close(cx) {
+                    return;
+                }
+                self.request_quit(window, cx);
+            } else {
+                self.prompt_next_batch_save(window, cx);
+            }
+        }
+    }
+
+    /// A disk-engine save job is still writing a tab.
+    fn huge_save_in_flight(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.huge.as_ref().is_some_and(|ui| ui.save.is_some()))
+    }
+
+    fn has_unsaved_tabs(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.doc.is_modified() || tab.pending_edit)
+    }
+
+    /// Refuse to close or quit when a document was edited after the batch
+    /// started. The user must retry so the new edits enter the queue.
+    fn unsaved_blocks_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.pending_batch_is_close || !self.has_unsaved_tabs() {
+            return false;
+        }
+        self.abort_pending_saves();
+        self.set_status(tr("status.batch_unsaved"), cx);
+        true
+    }
+
+    /// Whether no batch is waiting on a user decision, an unsaved normal tab,
+    /// or an in-flight disk-engine save.
+    fn batch_can_finalize(&self) -> bool {
+        self.confirm.is_none()
+            && self.pending_normal_overwrite.is_none()
+            && self.pending_huge_overwrite.is_none()
+            && !self.pending_normal_all
+            && !self.pending_normal_close_all
+            && !self.pending_normal_exit
+            && self.pending_normal_saves.is_empty()
+            && !self.huge_save_in_flight()
+    }
+
+    fn report_save_all_result(&mut self, cx: &mut Context<Self>) {
+        if self.pending_save_failures.is_empty() {
+            self.set_status(tr("status.saved_modified"), cx);
+            return;
+        }
+        let count = self.pending_save_failures.len();
+        self.pending_save_failures.clear();
+        self.set_status(
+            tr_args("status.save_all_failed", &[("count", count.to_string())]),
+            cx,
+        );
+    }
+
+    /// Drop every queued save/close/exit continuation. Used when the user
+    /// cancels a confirmation, so no background flow closes tabs or quits.
+    fn abort_pending_saves(&mut self) {
+        self.confirm = None;
+        self.pending_normal_saves.clear();
+        self.pending_normal_all = false;
+        self.pending_normal_close_all = false;
+        self.pending_normal_exit = false;
+        self.pending_normal_skipped_partial = false;
+        self.pending_exit_saves.clear();
+        self.pending_close_saves.clear();
+        self.pending_close_all_after_saves = false;
+        self.pending_huge_saves.clear();
+        self.pending_huge_all = false;
+        self.pending_huge_exit = false;
+        self.pending_huge_overwrite = None;
+        self.pending_normal_overwrite = None;
+        self.pending_save_failures.clear();
+        self.pending_batch_is_close = false;
     }
 
     pub fn save_active_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4723,6 +5116,7 @@ impl LubanApp {
             return;
         }
         if !self.ensure_tab_text(index, cx) {
+            self.abort_pending_saves();
             return;
         }
         let lossy = match self.tabs[index].doc.save_as(&request.path) {
@@ -4733,12 +5127,18 @@ impl LubanApp {
                     tr_args("status.save_failed", &[("error", err.to_string())]),
                     cx,
                 );
-                self.pending_exit_saves.clear();
-                self.pending_close_saves.clear();
+                self.abort_pending_saves();
                 return;
             }
         };
         self.release_tab_text(index);
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.external = None;
+        }
+        if let Some(tab) = self.tabs.get(index) {
+            self.watch
+                .note_saved(&request.path, tab.doc.file_size, tab.doc.last_modified);
+        }
         self.settings.add_recent(request.path.clone());
         let _ = self.settings.save();
         if lossy {
@@ -5295,6 +5695,25 @@ impl LubanApp {
             }
             return;
         }
+        if tab.doc.is_modified() {
+            self.confirm = Some(ConfirmState::new(
+                CloseIntent::ReloadTab(tab.id),
+                tr("confirm.reload_title"),
+                tr("confirm.reload_normal_detail"),
+            ));
+            cx.notify();
+            return;
+        }
+        self.reload_tab_now(index, window, cx);
+    }
+
+    /// Reload a normal document from disk without asking (the caller has
+    /// already confirmed discarding unsaved changes).
+    fn reload_tab_now(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let path = tab.doc.path.clone();
         let tab = &mut self.tabs[index];
         match tab.doc.reload() {
             Ok(()) => {
@@ -5306,6 +5725,7 @@ impl LubanApp {
                 };
                 tab.highlighted_revision = u64::MAX;
                 tab.decorations_key = None;
+                tab.external = None;
                 tab.editor.update(cx, |state, cx| {
                     state.set_value(text, window, cx);
                     let total = state.text().len_chars();
@@ -5314,6 +5734,10 @@ impl LubanApp {
                     state.set_selected_range(b0..b1, cx);
                 });
                 tab.needs_sync = false;
+                if let Some(path) = path {
+                    self.watch
+                        .note_saved(&path, tab.doc.file_size, tab.doc.last_modified);
+                }
                 self.set_status(tr("status.reloaded"), cx);
             }
             Err(err) => self.set_status(
@@ -5321,6 +5745,7 @@ impl LubanApp {
                 cx,
             ),
         }
+        cx.notify();
     }
 
     // ------------------------------------------------------------------
@@ -5417,6 +5842,7 @@ impl LubanApp {
     }
 
     fn close_all_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_batch_is_close = false;
         for index in 0..self.tabs.len() {
             self.cancel_tab_jobs(index);
         }
@@ -5512,10 +5938,38 @@ impl LubanApp {
                 };
                 self.start_huge_save(index, target, then, true, window, cx);
             }
+            CloseIntent::SaveConflict(id) => {
+                let Some((tab_id, target, then)) = self.pending_normal_overwrite.take() else {
+                    return;
+                };
+                if tab_id != id {
+                    return;
+                }
+                let Some(index) = self.tab_index_by_id(id) else {
+                    return;
+                };
+                if let Some(target) = target {
+                    self.save_as_request(
+                        SaveAsRequest {
+                            tab_id: id,
+                            path: target,
+                            then,
+                        },
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.save_tab_at_with(index, then, true, window, cx);
+                }
+            }
             CloseIntent::ReloadTab(id) => {
                 let Some(index) = self.tab_index_by_id(id) else {
                     return;
                 };
+                if !self.tabs[index].doc.is_huge() {
+                    self.save_tab_at_with(index, SaveThen::ReloadTab(id), false, window, cx);
+                    return;
+                }
                 if self.tabs[index].doc.is_partial() {
                     let (dir, name) = {
                         let tab = &self.tabs[index];
@@ -5552,10 +6006,7 @@ impl LubanApp {
                     return;
                 }
                 if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
-                    self.save_tab_at(index, window, cx);
-                    if !self.tabs[index].doc.is_modified() {
-                        self.close_tab_at(index, window, cx);
-                    }
+                    self.save_tab_at_with(index, SaveThen::CloseTab(id), false, window, cx);
                 } else {
                     let (dir, name) = {
                         let tab = &self.tabs[index];
@@ -5584,59 +6035,10 @@ impl LubanApp {
                 }
             }
             CloseIntent::AllTabs => {
-                let ids = self.modified_tabs();
-                let mut huge = Vec::new();
-                for id in ids {
-                    let Some(index) = self.tab_index_by_id(id) else {
-                        continue;
-                    };
-                    if self.tabs[index].doc.is_huge() && !self.tabs[index].doc.is_partial() {
-                        huge.push(id);
-                    } else if self.tabs[index].doc.path.is_some()
-                        && !self.tabs[index].doc.is_partial()
-                    {
-                        self.save_tab_at(index, window, cx);
-                    } else {
-                        self.pending_close_saves.push(id);
-                    }
-                }
-                if !huge.is_empty() {
-                    self.pending_huge_saves = huge;
-                    self.pending_huge_all = true;
-                    self.save_next_huge(window, cx);
-                } else if self.pending_close_saves.is_empty() {
-                    self.close_all_now(window, cx);
-                } else {
-                    self.pending_close_all_after_saves = true;
-                    self.prompt_next_batch_save(window, cx);
-                }
+                self.start_batch_save(BatchSaveKind::CloseAll, window, cx);
             }
             CloseIntent::Exit => {
-                let ids = self.modified_tabs();
-                let mut huge = Vec::new();
-                for id in ids {
-                    let Some(index) = self.tab_index_by_id(id) else {
-                        continue;
-                    };
-                    if self.tabs[index].doc.is_huge() && !self.tabs[index].doc.is_partial() {
-                        huge.push(id);
-                    } else if self.tabs[index].doc.path.is_some()
-                        && !self.tabs[index].doc.is_partial()
-                    {
-                        self.save_tab_at(index, window, cx);
-                    } else {
-                        self.pending_exit_saves.push(id);
-                    }
-                }
-                if !huge.is_empty() {
-                    self.pending_huge_saves = huge;
-                    self.pending_huge_exit = true;
-                    self.save_next_huge(window, cx);
-                } else if self.pending_exit_saves.is_empty() {
-                    self.request_quit(window, cx);
-                } else {
-                    self.prompt_next_batch_save(window, cx);
-                }
+                self.start_batch_save(BatchSaveKind::Exit, window, cx);
             }
         }
     }
@@ -5645,14 +6047,49 @@ impl LubanApp {
         let Some(confirm) = self.confirm.take() else {
             return;
         };
+        // Discarding one document must not let a queued Close All / Exit
+        // continuation run with a different decision.
+        self.abort_pending_saves();
         match confirm.intent {
-            CloseIntent::OverwriteExternal(_) => {
+            CloseIntent::OverwriteExternal(id) => {
                 self.pending_huge_overwrite = None;
-                self.set_status(tr("status.save_cancelled"), cx);
+                let Some(index) = self.tab_index_by_id(id) else {
+                    return;
+                };
+                if self.tabs[index].doc.is_modified() {
+                    self.confirm = Some(ConfirmState::new(
+                        CloseIntent::ReloadTab(id),
+                        tr("confirm.reload_title"),
+                        tr("confirm.reload_detail"),
+                    ));
+                    cx.notify();
+                } else {
+                    self.start_huge_reload(index, window, cx);
+                }
+            }
+            CloseIntent::SaveConflict(id) => {
+                self.pending_normal_overwrite = None;
+                let Some(index) = self.tab_index_by_id(id) else {
+                    return;
+                };
+                if self.tabs[index].doc.is_modified() {
+                    self.confirm = Some(ConfirmState::new(
+                        CloseIntent::ReloadTab(id),
+                        tr("confirm.reload_title"),
+                        tr("confirm.reload_normal_detail"),
+                    ));
+                    cx.notify();
+                } else {
+                    self.reload_tab_now(index, window, cx);
+                }
             }
             CloseIntent::ReloadTab(id) => {
                 if let Some(index) = self.tab_index_by_id(id) {
-                    self.start_huge_reload(index, window, cx);
+                    if self.tabs[index].doc.is_huge() {
+                        self.start_huge_reload(index, window, cx);
+                    } else {
+                        self.reload_tab_now(index, window, cx);
+                    }
                 }
             }
             CloseIntent::Tab(id) => {
@@ -5667,13 +6104,7 @@ impl LubanApp {
 
     fn confirm_cancel(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
-        self.pending_exit_saves.clear();
-        self.pending_close_saves.clear();
-        self.pending_close_all_after_saves = false;
-        self.pending_huge_saves.clear();
-        self.pending_huge_all = false;
-        self.pending_huge_exit = false;
-        self.pending_huge_overwrite = None;
+        self.abort_pending_saves();
         cx.notify();
     }
 
@@ -5688,6 +6119,7 @@ impl LubanApp {
     }
 
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_batch_is_close = false;
         for index in 0..self.tabs.len() {
             self.cancel_tab_jobs(index);
         }
@@ -5750,6 +6182,13 @@ impl LubanApp {
                     huge_column,
                     huge_scroll,
                     huge_modified: huge && tab.doc.is_modified(),
+                    recovery_id: tab.doc.huge().and_then(|state| {
+                        state
+                            .engine
+                            .try_read()
+                            .ok()
+                            .and_then(|engine| engine.recovery_id().map(str::to_string))
+                    }),
                 }
             })
             .collect();
@@ -8674,10 +9113,11 @@ impl LubanApp {
 
     fn cancel_overwrite(&mut self, cx: &mut Context<Self>) {
         if let Some(request) = self.overwrite_save.take() {
-            if matches!(request.then, SaveThen::Exit | SaveThen::CloseAll) {
-                self.pending_exit_saves.clear();
-                self.pending_close_saves.clear();
-                self.pending_close_all_after_saves = false;
+            if matches!(
+                request.then,
+                SaveThen::Exit | SaveThen::CloseAll | SaveThen::NextNormalSave
+            ) {
+                self.abort_pending_saves();
             }
             self.set_status(tr("status.save_cancelled"), cx);
         }
@@ -8753,9 +9193,7 @@ impl LubanApp {
                 ..
             } = dialog.purpose
             {
-                self.pending_exit_saves.clear();
-                self.pending_close_saves.clear();
-                self.pending_close_all_after_saves = false;
+                self.abort_pending_saves();
                 self.set_status(tr("status.save_cancelled_close"), cx);
             }
         }
@@ -9121,6 +9559,369 @@ impl LubanApp {
         self.overlay_card(820.0, Some(620.0), cx, body.into_any_element())
     }
 
+    // ------------------------------------------------------------------
+    // External change notices and crash recovery
+    // ------------------------------------------------------------------
+
+    /// Refresh the watched directories and turn due events into notices.
+    fn sync_file_watch(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.doc.path.clone())
+            .collect();
+        self.watch.sync(&paths);
+        let events = self.watch.poll();
+        if events.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for event in events {
+            for index in 0..self.tabs.len() {
+                let matching = self.tabs[index]
+                    .doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| util::same_path(path, &event.path));
+                if !matching {
+                    continue;
+                }
+                // A running save replaces the file itself; its events are not
+                // external changes.
+                if self.tabs[index]
+                    .huge
+                    .as_ref()
+                    .is_some_and(|ui| ui.is_busy())
+                {
+                    continue;
+                }
+                let notice = match event.kind {
+                    WatchEventKind::Removed => Some(ExternalNotice::Missing),
+                    WatchEventKind::Changed => match self.tabs[index].doc.disk_status() {
+                        DiskStatus::Changed => Some(ExternalNotice::Changed),
+                        DiskStatus::Missing => Some(ExternalNotice::Missing),
+                        DiskStatus::Unchanged | DiskStatus::Untracked => None,
+                    },
+                };
+                if self.tabs[index].external != notice {
+                    self.tabs[index].external = notice;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn render_external_banner(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tab = self.active_tab()?;
+        let notice = tab.external?;
+        let id = tab.id;
+        let name = tab.doc.display_name();
+        let (message_key, action_key) = match notice {
+            ExternalNotice::Changed => ("banner.external_changed", "common.reload"),
+            ExternalNotice::Missing => ("banner.external_missing", "menu.file.save_as"),
+        };
+        let weak_reload = cx.weak_entity();
+        let weak_keep = cx.weak_entity();
+        let banner = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().colors.border)
+            .bg(cx.theme().colors.secondary)
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .child(tr_args(message_key, &[("name", name)])),
+            )
+            .child(
+                Button::new("external-reload")
+                    .label(tr(action_key))
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_reload.update(cx, |this, cx| {
+                            this.external_action(id, window, cx);
+                        });
+                    }),
+            )
+            .child(
+                Button::new("external-keep")
+                    .label(tr("banner.keep"))
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_keep.update(cx, |this, cx| {
+                            if let Some(index) = this.tab_index_by_id(id) {
+                                this.tabs[index].external = None;
+                            }
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element();
+        Some(banner)
+    }
+
+    /// Reload (for a modification) or open Save As (for a deletion) from the
+    /// external-change banner.
+    fn external_action(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tab_index_by_id(id) else {
+            return;
+        };
+        self.active = index;
+        let missing = self.tabs[index].external == Some(ExternalNotice::Missing);
+        if missing {
+            self.save_active_as(window, cx);
+        } else {
+            self.reload_active(window, cx);
+        }
+    }
+
+    fn advance_recovery_prompt(&mut self) {
+        if self.recovery_prompt.is_none() {
+            if let Some(info) = self.recovery_queue.pop_front() {
+                self.recovery_prompt = Some(RecoveryPrompt {
+                    info,
+                    problem: None,
+                });
+            }
+        }
+    }
+
+    /// Rebuild a disk-engine document from its recovery data on a background
+    /// executor so startup stays responsive.
+    fn start_recovery_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.recovery_prompt.take() else {
+            return;
+        };
+        if prompt.problem.is_some() {
+            self.recovery_prompt = Some(prompt);
+            return;
+        }
+        let info = prompt.info;
+        self.recovery_restoring = Some(info.clone());
+        self.set_status(tr("status.recovering"), cx);
+        let task = cx.background_executor().spawn(async move {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let progress = std::sync::atomic::AtomicU64::new(0);
+            DiskEngine::recover(&info, &cancel, &progress)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_recovery_restore(result, window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_recovery_restore(
+        &mut self,
+        result: luban_core::Result<DiskEngine>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let info = self.recovery_restoring.take();
+        match result {
+            Ok(engine) => match Document::from_recovered_engine(engine) {
+                Ok(doc) => {
+                    let path = doc.path.clone();
+                    if let Some(index) = self.tabs.iter().position(|tab| {
+                        path.as_ref().is_some_and(|path| {
+                            tab.doc
+                                .path
+                                .as_ref()
+                                .is_some_and(|open| util::same_path(open, path))
+                        })
+                    }) {
+                        if !self.tabs[index].doc.is_modified() {
+                            self.close_tab_at(index, window, cx);
+                        }
+                    }
+                    self.add_document(doc, window, cx);
+                    self.set_status(tr("status.recovery_restored"), cx);
+                    self.advance_recovery_prompt();
+                }
+                Err(error) => {
+                    self.restore_recovery_problem(info, error.to_string(), cx);
+                }
+            },
+            Err(error) => {
+                self.restore_recovery_problem(info, error.to_string(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn restore_recovery_problem(
+        &mut self,
+        info: Option<RecoveryInfo>,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_status(
+            tr_args("status.recovery_failed", &[("error", message.clone())]),
+            cx,
+        );
+        if let Some(info) = info {
+            self.recovery_prompt = Some(RecoveryPrompt {
+                info,
+                problem: Some(message),
+            });
+        }
+    }
+
+    /// Discard a recovery entry. When `open_source` is set the current file on
+    /// disk is opened afterwards, matching the "Open current file" choice.
+    fn discard_recovery_prompt(
+        &mut self,
+        open_source: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = self.recovery_prompt.take() else {
+            return;
+        };
+        let info = prompt.info;
+        if let Err(error) = luban_core::disk_engine::discard_recovery_dir(&info.dir) {
+            self.recovery_prompt = Some(RecoveryPrompt {
+                info,
+                problem: Some(error.to_string()),
+            });
+            self.set_status(
+                tr_args(
+                    "status.recovery_discard_failed",
+                    &[("error", error.to_string())],
+                ),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        if open_source {
+            let path = info.path().to_path_buf();
+            if path.exists() {
+                let line = info.scroll_line().max(1);
+                let range = info.range().map(|[start, end]| (start, end));
+                self.start_huge_job(path, line, range, None, false, window, cx);
+            } else {
+                self.set_status(
+                    tr_args(
+                        "status.recovery_source_missing",
+                        &[("path", info.path().display().to_string())],
+                    ),
+                    cx,
+                );
+            }
+        }
+        self.advance_recovery_prompt();
+        cx.notify();
+    }
+
+    fn render_recovery_prompt(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(prompt) = &self.recovery_prompt else {
+            return div().into_any_element();
+        };
+        let path = prompt.info.path().display().to_string();
+        let problem = prompt.problem.clone();
+        let title = tr("recovery.title");
+        let detail = match &problem {
+            Some(problem) => problem.clone(),
+            None => tr_args("recovery.detail", &[("path", path.clone())]),
+        };
+        let weak_restore = cx.weak_entity();
+        let weak_open = cx.weak_entity();
+        let weak_discard = cx.weak_entity();
+        let weak_later = cx.weak_entity();
+        let has_problem = problem.is_some();
+        let mut actions = div().flex().justify_end().gap_2().child(
+            Button::new("recovery-later")
+                .label(tr("recovery.later"))
+                .on_click(move |_, _, cx| {
+                    let _ = weak_later.update(cx, |this, cx| {
+                        this.recovery_prompt = None;
+                        this.advance_recovery_prompt();
+                        cx.notify();
+                    });
+                }),
+        );
+        if has_problem {
+            actions = actions
+                .child(
+                    Button::new("recovery-open-current")
+                        .label(tr("recovery.open_current"))
+                        .primary()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_restore.update(cx, |this, cx| {
+                                this.discard_recovery_prompt(true, window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("recovery-discard")
+                        .label(tr("recovery.discard"))
+                        .danger()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_discard.update(cx, |this, cx| {
+                                this.discard_recovery_prompt(false, window, cx);
+                            });
+                        }),
+                );
+        } else {
+            actions = actions
+                .child(
+                    Button::new("recovery-discard")
+                        .label(tr("recovery.discard_open"))
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_discard.update(cx, |this, cx| {
+                                // Discarding a normal recovery offer also opens
+                                // the unchanged file on disk.
+                                this.discard_recovery_prompt(true, window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("recovery-restore")
+                        .label(tr("recovery.restore"))
+                        .primary()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_open.update(cx, |this, cx| {
+                                this.start_recovery_restore(window, cx);
+                            });
+                        }),
+                );
+        }
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(detail),
+            )
+            .child(actions)
+            .into_any_element();
+        let _ = window;
+        self.overlay_card(520.0, None, cx, content)
+    }
+
     fn render_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut overlays = Vec::new();
         if self.find_in_files.open {
@@ -9131,6 +9932,9 @@ impl LubanApp {
         }
         if self.confirm.is_some() {
             overlays.push(self.render_confirm(window, cx));
+        }
+        if self.recovery_prompt.is_some() {
+            overlays.push(self.render_recovery_prompt(window, cx));
         }
         if self.go_to_line.is_some() {
             overlays.push(self.render_go_to_line(window, cx));
@@ -9193,11 +9997,17 @@ impl LubanApp {
         let detail = confirm.detail.clone();
         let exit = matches!(confirm.intent, CloseIntent::Exit);
         let (save_key, discard_key) = match confirm.intent {
-            CloseIntent::OverwriteExternal(_) => ("confirm.overwrite_yes", "confirm.overwrite_no"),
+            CloseIntent::OverwriteExternal(_) | CloseIntent::SaveConflict(_) => {
+                ("confirm.overwrite_yes", "common.reload")
+            }
             CloseIntent::ReloadTab(_) => ("confirm.reload_save", "confirm.reload_discard"),
             _ if exit => ("confirm.save_exit", "confirm.discard_exit"),
             _ => ("confirm.save_close", "confirm.discard"),
         };
+        let discard_is_danger = !matches!(
+            confirm.intent,
+            CloseIntent::OverwriteExternal(_) | CloseIntent::SaveConflict(_)
+        );
         let weak_save = cx.weak_entity();
         let weak_discard = cx.weak_entity();
         let weak_cancel = cx.weak_entity();
@@ -9230,15 +10040,19 @@ impl LubanApp {
                                 let _ = weak_cancel.update(cx, |this, cx| this.confirm_cancel(cx));
                             }),
                     )
-                    .child(
-                        Button::new("confirm-discard")
+                    .child({
+                        let button = Button::new("confirm-discard")
                             .label(tr(discard_key))
-                            .danger()
                             .on_click(move |_, window, cx| {
                                 let _ = weak_discard
                                     .update(cx, |this, cx| this.confirm_discard(window, cx));
-                            }),
-                    )
+                            });
+                        if discard_is_danger {
+                            button.danger()
+                        } else {
+                            button
+                        }
+                    })
                     .child(
                         Button::new("confirm-save")
                             .label(tr(save_key))
@@ -10045,6 +10859,7 @@ impl Render for LubanApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_enter_actions(window, cx);
         self.sync_active(window, cx);
+        self.sync_file_watch(cx);
         self.sync_large_file_panel(window, cx);
         self.autosave_session();
         self.refresh_find(cx);
@@ -10088,6 +10903,7 @@ impl Render for LubanApp {
             None
         };
         let tabs = self.render_tabs(window, cx);
+        let banner = self.render_external_banner(cx);
         let editor = self.render_editor_area(window, cx);
         let find_bar = if show_find {
             Some(self.render_find_bar(window, cx))
@@ -10150,7 +10966,11 @@ impl Render for LubanApp {
         if let Some(toolbar) = toolbar {
             root = root.child(toolbar);
         }
-        root = root.child(tabs).child(
+        root = root.child(tabs);
+        if let Some(banner) = banner {
+            root = root.child(banner);
+        }
+        root = root.child(
             div()
                 .flex_1()
                 .min_h(px(0.))

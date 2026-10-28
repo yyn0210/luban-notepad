@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Instant, SystemTime};
 
+use crate::atomic_write::AtomicFile;
 use crate::disk_engine::{DiskEngine, WindowText};
 use crate::encoding::{self, TextEncoding};
 use crate::eol::{self, Eol};
@@ -29,6 +30,20 @@ pub struct PartialRange {
     pub end: u64,
     /// Size of the complete source file.
     pub total: u64,
+}
+
+/// Relationship between the in-memory document and the file on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskStatus {
+    /// The file exists with the size and modification time recorded at
+    /// open/save time.
+    Unchanged,
+    /// The file exists but its size or modification time differs.
+    Changed,
+    /// The file no longer exists (deleted or renamed).
+    Missing,
+    /// The document has never been saved to a path.
+    Untracked,
 }
 
 /// State of a document backed by the disk engine.
@@ -265,6 +280,77 @@ impl Document {
         doc.huge = Some(huge);
         doc.revision = 1;
         doc.saved_revision = 1;
+        Ok(doc)
+    }
+
+    /// Build a document from an engine restored out of recovery data.
+    ///
+    /// The engine is already marked modified; the caret and top line come from
+    /// the recovery checkpoint so the tab looks like it did before the crash.
+    pub fn from_recovered_engine(mut engine: DiskEngine) -> Result<Self> {
+        let (cursor, scroll_line) = engine.recovery_position();
+        let total_chars = engine.total_chars();
+        let total_lines = engine.total_lines();
+        let mut doc = Self::new_untitled("new 1");
+        doc.path = Some(engine.path().to_path_buf());
+        doc.encoding = engine.encoding();
+        doc.eol = engine.eol();
+        doc.language = crate::large_file::language_for(engine.path());
+        doc.file_size = engine.source_size();
+        doc.last_modified = engine.last_modified();
+        doc.read_only = engine.is_read_only();
+        doc.cached_chars = Some(usize::try_from(total_chars).unwrap_or(usize::MAX));
+        doc.text_detached = true;
+        if let Some(range) = engine.range() {
+            doc.partial = Some(PartialRange {
+                start: range.start,
+                end: range.end,
+                total: engine.source_size(),
+            });
+        }
+        let line = scroll_line.clamp(1, total_lines.max(1));
+        let window = match engine.read_window_from_line(line, crate::disk_engine::WINDOW_BYTES) {
+            Ok(window) => window,
+            Err(error) => {
+                // The rebuilt engine cannot be mounted, but the recovery data
+                // may still be the only copy of the edits.
+                engine.preserve_recovery();
+                return Err(error);
+            }
+        };
+        let cursor = if cursor >= window.start && cursor <= window.start.saturating_add(window.len)
+        {
+            cursor
+        } else {
+            window.start
+        };
+        let (cursor_line, cursor_column) = {
+            let offset = cursor.min(window.start.saturating_add(window.len));
+            let (line, column) = engine
+                .line_col_at(offset)
+                .unwrap_or((window.line, window.start_column));
+            (line, column)
+        };
+        let huge = HugeFileState {
+            engine: Arc::new(RwLock::new(engine)),
+            cursor,
+            anchor: cursor,
+            scroll_line: window.line,
+            cursor_line,
+            cursor_column,
+            initial_window: Some(window),
+            total_chars: AtomicU64::new(total_chars),
+            total_lines: AtomicU64::new(total_lines),
+            modified: AtomicBool::new(true),
+            revision: AtomicU64::new(1),
+        };
+        {
+            let engine = huge.read();
+            huge.refresh_metadata(&engine);
+        }
+        doc.huge = Some(huge);
+        doc.revision = 1;
+        doc.saved_revision = 0;
         Ok(doc)
     }
 
@@ -931,21 +1017,21 @@ impl Document {
         if self.text_detached {
             return Err(Error::Other("document text is not materialized".into()));
         }
-        let mut file = fs::File::create(path)?;
+        let mut atomic = AtomicFile::create(path)?;
         let lossy = if self.non_text {
             // Non-text buffers were decoded reversibly and keep their original
             // line endings; write them back without normalization so untouched
             // bytes stay identical.
             let (bytes, lossy) = encoding::encode(&self.text, self.encoding);
-            file.write_all(&bytes)?;
+            atomic.file_mut().write_all(&bytes)?;
             lossy
         } else if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom)
             && self.eol == Eol::Lf
             && !self.text.as_bytes().contains(&b'\r')
         {
             // Fast path: LF UTF-8 is already the on-disk representation.
-            file.write_all(self.encoding.bom())?;
-            file.write_all(self.text.as_bytes())?;
+            atomic.file_mut().write_all(self.encoding.bom())?;
+            atomic.file_mut().write_all(self.text.as_bytes())?;
             false
         } else {
             let with_eol = eol::normalize(&self.text, self.eol);
@@ -958,10 +1044,10 @@ impl Document {
                 } else {
                     encoding::encode(&with_eol, self.encoding)
                 };
-            file.write_all(&bytes)?;
+            atomic.file_mut().write_all(&bytes)?;
             lossy
         };
-        drop(file);
+        atomic.commit()?;
         let metadata = fs::metadata(path)?;
         self.file_size = metadata.len();
         self.last_modified = metadata.modified().ok();
@@ -1006,24 +1092,42 @@ impl Document {
 
     /// Whether the file on disk appears to have changed since opening/saving.
     pub fn changed_on_disk(&self) -> bool {
+        matches!(
+            self.disk_status(),
+            DiskStatus::Changed | DiskStatus::Missing
+        )
+    }
+
+    /// Compare the recorded file identity with the file currently on disk.
+    pub fn disk_status(&self) -> DiskStatus {
         if let Some(huge) = &self.huge {
             return huge
                 .engine
                 .try_read()
-                .map(|engine| engine.changed_on_disk())
-                .unwrap_or(false);
+                .map(|engine| engine.disk_status())
+                .unwrap_or(DiskStatus::Unchanged);
         }
         let Some(path) = &self.path else {
-            return false;
+            return DiskStatus::Untracked;
         };
-        let Ok(metadata) = fs::metadata(path) else {
-            return false;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return DiskStatus::Missing;
+            }
+            // An unreadable file is treated as changed so a save never
+            // silently overwrites something we could not inspect.
+            Err(_) => return DiskStatus::Changed,
         };
         let modified_changed = match (metadata.modified().ok(), self.last_modified) {
-            (Some(current), Some(known)) => current > known,
+            (Some(current), Some(known)) => current != known,
             _ => false,
         };
-        modified_changed || metadata.len() != self.file_size
+        if modified_changed || metadata.len() != self.file_size {
+            DiskStatus::Changed
+        } else {
+            DiskStatus::Unchanged
+        }
     }
 
     pub fn replace_selection(&mut self, replacement: &str) -> bool {
@@ -1299,6 +1403,55 @@ mod tests {
         doc.reload().unwrap();
         assert_eq!(doc.text, "second");
         assert!(!doc.is_modified());
+    }
+
+    #[test]
+    fn disk_status_tracks_modification_and_deletion() {
+        let (_dir, path) = temp_file("status.txt", b"initial");
+        let doc = Document::open(&path).unwrap();
+        assert_eq!(doc.disk_status(), DiskStatus::Unchanged);
+        assert!(!doc.changed_on_disk());
+
+        fs::write(&path, b"external edit").unwrap();
+        assert_eq!(doc.disk_status(), DiskStatus::Changed);
+        assert!(doc.changed_on_disk());
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(doc.disk_status(), DiskStatus::Missing);
+        assert!(doc.changed_on_disk());
+    }
+
+    #[test]
+    fn saving_replaces_the_file_atomically_and_refreshes_metadata() {
+        let (_dir, path) = temp_file("save.txt", b"old content");
+        let mut doc = Document::open(&path).unwrap();
+        doc.attach_text("new content".to_string());
+        doc.touch();
+        doc.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+        assert_eq!(doc.file_size, 11);
+        assert_eq!(doc.disk_status(), DiskStatus::Unchanged);
+        assert!(!doc.is_modified());
+        let leftovers = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".luban-save-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_keeps_the_original_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = temp_file("locked.txt", b"protected");
+        let mut doc = Document::open(&path).unwrap();
+        doc.attach_text("replacement".to_string());
+        doc.touch();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(doc.save().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "protected");
+        assert!(doc.is_modified());
     }
 
     #[test]
