@@ -6,7 +6,6 @@
 //! over the target, so the original file is never truncated in place.
 
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -144,15 +143,13 @@ impl SaveSnapshot {
         } else {
             None
         };
-        let file = atomic.file_mut();
-
         let mut body_written = 0u64;
         let mut lossy = false;
         let mut blocks: Vec<Block> = Vec::new();
         let mut pending: Option<Block> = None;
 
         if self.bom_len > 0 {
-            file.write_all(self.encoding.bom())?;
+            atomic.write(self.encoding.bom())?;
         }
         for piece in &self.pieces {
             if cancel.load(Ordering::Relaxed) {
@@ -169,7 +166,7 @@ impl SaveSnapshot {
                 encode_body(&normalized, self.encoding)
             };
             lossy |= piece_lossy;
-            file.write_all(&actual)?;
+            atomic.write(&actual)?;
             let written = actual.len() as u64;
             let start = body_written;
             body_written += written;
@@ -213,7 +210,6 @@ impl SaveSnapshot {
         // The caller-provided permission snapshot (rather than a metadata read
         // after writing) keeps the previous save-as semantics: a range view
         // written to a new path is not made read-only by its source.
-        let _ = file;
         if let Some(permissions) = source_permissions {
             atomic.set_commit_permissions(permissions);
         }

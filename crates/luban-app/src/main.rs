@@ -6,6 +6,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 mod app;
+mod commands;
 mod dialogs;
 mod explorer;
 mod file_watch;
@@ -16,6 +17,8 @@ mod huge_scrollbar;
 mod i18n;
 mod icons;
 mod large_file;
+mod logging;
+mod palette;
 mod preferences;
 mod theme;
 mod util;
@@ -167,10 +170,7 @@ fn main() {
     // Remove journals left behind by terminated instances. Only directories
     // older than a day are touched so another running instance is unaffected.
     let _ = luban_core::disk_engine::cleanup_stale(std::time::Duration::from_secs(24 * 3600));
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("luban_notepad=info,gpui=warn"),
-    )
-    .init();
+    logging::init();
 
     // Resolve the UI language before parsing arguments so that `--help` is
     // localized too. `LubanApp::new` loads the same settings again for its own
@@ -178,6 +178,15 @@ fn main() {
     // through the launch options.
     let settings = Settings::load();
     i18n::apply_language(&settings.ui_language);
+    // Expired snapshots are cheap to remove and must disappear even when the
+    // window is never opened.
+    let history = luban_core::local_history::HistoryStore::system();
+    if let Err(error) = history.prune(
+        std::time::Duration::from_secs(settings.local_history_days.saturating_mul(24 * 3600)),
+        settings.local_history_max_mb.saturating_mul(1024 * 1024),
+    ) {
+        log::warn!("could not prune local history: {error}");
+    }
 
     let mut options = parse_args();
     // Collected before the window exists so a crash-recovery offer can be

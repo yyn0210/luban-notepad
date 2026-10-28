@@ -1018,3 +1018,196 @@ status.recovery_discard_failed:
 status.recovery_source_missing:
   en: "The source file no longer exists: %{path}"
   zh-CN: "源文件已不存在：%{path}"
+
+common.restore:
+  en: "Restore"
+  zh-CN: "恢复"
+menu.file.local_history:
+  en: "Local History…"
+  zh-CN: "本地历史…"
+menu.view.system_theme:
+  en: "System Theme"
+  zh-CN: "跟随系统主题"
+menu.view.command_palette:
+  en: "Command Palette…"
+  zh-CN: "命令面板…"
+menu.view.quick_open:
+  en: "Quick Open…"
+  zh-CN: "快速打开…"
+menu.view.fullscreen:
+  en: "Full Screen"
+  zh-CN: "全屏"
+menu.tabs.close:
+  en: "Close"
+  zh-CN: "关闭"
+menu.tabs.close_others:
+  en: "Close Others"
+  zh-CN: "关闭其他"
+menu.tabs.close_right:
+  en: "Close to the Right"
+  zh-CN: "关闭右侧"
+menu.tabs.copy_path:
+  en: "Copy Path"
+  zh-CN: "复制路径"
+menu.tabs.reveal:
+  en: "Show in File Manager"
+  zh-CN: "在文件管理器中显示"
+menu.tabs.reopen_closed:
+  en: "Reopen Closed Tab"
+  zh-CN: "恢复关闭的标签页"
+menu.tabs.next:
+  en: "Next Tab"
+  zh-CN: "下一个标签页"
+menu.tabs.previous:
+  en: "Previous Tab"
+  zh-CN: "上一个标签页"
+menu.help.open_logs:
+  en: "Open Log Directory"
+  zh-CN: "打开日志目录"
+command.category.file:
+  en: "File"
+  zh-CN: "文件"
+command.category.edit:
+  en: "Edit"
+  zh-CN: "编辑"
+command.category.search:
+  en: "Search"
+  zh-CN: "搜索"
+command.category.view:
+  en: "View"
+  zh-CN: "视图"
+command.category.tabs:
+  en: "Tabs"
+  zh-CN: "标签页"
+command.category.navigation:
+  en: "Navigation"
+  zh-CN: "导航"
+command.category.settings:
+  en: "Settings"
+  zh-CN: "设置"
+command.category.help:
+  en: "Help"
+  zh-CN: "帮助"
+command.palette:
+  en: "Command Palette"
+  zh-CN: "命令面板"
+command.palette.placeholder:
+  en: "Type a command name"
+  zh-CN: "输入命令名称"
+command.quick_open:
+  en: "Quick Open"
+  zh-CN: "快速打开"
+command.quick_open.placeholder:
+  en: "Search open tabs and recent files"
+  zh-CN: "搜索打开的标签页和最近文件"
+command.quick_open.tabs:
+  en: "Open Tabs"
+  zh-CN: "打开的标签页"
+command.quick_open.recent:
+  en: "Recent Files"
+  zh-CN: "最近文件"
+history.title:
+  en: "Local History: %{name}"
+  zh-CN: "本地历史：%{name}"
+history.restore:
+  en: "Restore"
+  zh-CN: "恢复"
+history.clear:
+  en: "Clear History"
+  zh-CN: "清空历史"
+history.empty:
+  en: "No local-history snapshots for this file"
+  zh-CN: "此文件没有本地历史快照"
+confirm.trim_title:
+  en: "Close these tabs?"
+  zh-CN: "关闭这些标签页？"
+confirm.trim_detail:
+  en: "Some of them have unsaved changes. Save them before closing, or discard those changes."
+  zh-CN: "其中包含未保存的修改。可以先保存再关闭，或放弃这些修改。"
+confirm.history_restore_title:
+  en: "Replace unsaved changes?"
+  zh-CN: "替换未保存的修改？"
+confirm.history_restore_detail:
+  en: "Restoring this snapshot replaces the current buffer. The file on disk is not changed until you save."
+  zh-CN: "恢复该快照会替换当前缓冲区内容，保存前不会修改磁盘文件。"
+status.history_failed:
+  en: "Could not update local history: %{error}"
+  zh-CN: "无法更新本地历史：%{error}"
+status.history_unavailable:
+  en: "Local history is not available for this document"
+  zh-CN: "此文档不支持本地历史"
+status.history_restored:
+  en: "Restored a local history snapshot (unsaved)"
+  zh-CN: "已恢复本地历史快照（未保存）"
+status.no_closed_tabs:
+  en: "No closed tabs to reopen"
+  zh-CN: "没有可恢复的关闭标签页"
+status.tab_restored:
+  en: "Reopened a closed tab"
+  zh-CN: "已恢复关闭的标签页"
+status.path_copied:
+  en: "Path copied to the clipboard"
+  zh-CN: "路径已复制到剪贴板"
+status.open_path_failed:
+  en: "Could not open: %{error}"
+  zh-CN: "无法打开：%{error}"
+status.file_size:
+  en: "Size: %{size}"
+  zh-CN: "大小：%{size}"
+status.file_size_unavailable:
+  en: "Size: —"
+  zh-CN: "大小：—"
+status.words:
+  en: "Words: %{count}"
+  zh-CN: "词数：%{count}"
+status.words_unavailable:
+  en: "Words: —"
+  zh-CN: "词数：—"
+status.indent_spaces:
+  en: "Spaces: %{size}"
+  zh-CN: "空格：%{size}"
+status.indent_tab:
+  en: "Tab: %{size}"
+  zh-CN: "制表符：%{size}"
+status.read_only:
+  en: "Read-only"
+  zh-CN: "只读"
+status.document_read_only:
+  en: "The document is read-only"
+  zh-CN: "文档为只读状态"
+shortcuts.edit_title:
+  en: "Keyboard Shortcuts"
+  zh-CN: "键盘快捷键"
+shortcuts.customize:
+  en: "Customize…"
+  zh-CN: "自定义…"
+shortcuts.change:
+  en: "Change"
+  zh-CN: "修改"
+shortcuts.press_key:
+  en: "Press a key…"
+  zh-CN: "请按键…"
+shortcuts.reset:
+  en: "Default"
+  zh-CN: "默认"
+shortcuts.reset_all:
+  en: "Reset All"
+  zh-CN: "全部恢复默认"
+shortcuts.conflicts:
+  en: "%{count} shortcut conflict(s). Resolve them before closing."
+  zh-CN: "有 %{count} 个快捷键冲突，请先解决。"
+prefs.system_theme:
+  en: "System"
+  zh-CN: "跟随系统"
+prefs.local_history:
+  en: "Local History"
+  zh-CN: "本地历史"
+prefs.local_history_enabled:
+  en: "Keep snapshots before saving"
+  zh-CN: "保存前保留快照"
+prefs.local_history_days:
+  en: "Keep days"
+  zh-CN: "保留天数"
+prefs.local_history_size:
+  en: "Max MB per file"
+  zh-CN: "每文件上限（MB）"

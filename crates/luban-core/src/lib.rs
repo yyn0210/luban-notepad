@@ -16,6 +16,7 @@ pub mod error;
 pub mod i18n;
 pub mod language;
 pub mod large_file;
+pub mod local_history;
 pub mod search;
 pub mod session;
 pub mod settings;

@@ -1,4 +1,72 @@
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+
+/// A platform launcher invocation, kept separate from running it so the
+/// argument construction can be tested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl OpenCommand {
+    pub fn spawn(&self) -> std::io::Result<()> {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        command.spawn().map(|_| ())
+    }
+}
+
+/// Open a directory in the platform file manager.
+pub fn open_directory_command(directory: &Path) -> OpenCommand {
+    #[cfg(windows)]
+    {
+        OpenCommand {
+            program: "explorer".to_string(),
+            args: vec![directory.to_string_lossy().into_owned()],
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        OpenCommand {
+            program: "open".to_string(),
+            args: vec![directory.to_string_lossy().into_owned()],
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        OpenCommand {
+            program: "xdg-open".to_string(),
+            args: vec![directory.to_string_lossy().into_owned()],
+        }
+    }
+}
+
+/// Reveal a file in the platform file manager, selecting it when supported.
+pub fn reveal_file_command(path: &Path) -> OpenCommand {
+    #[cfg(windows)]
+    {
+        OpenCommand {
+            program: "explorer".to_string(),
+            args: vec!["/select,".to_string(), path.to_string_lossy().into_owned()],
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        OpenCommand {
+            program: "open".to_string(),
+            args: vec!["-R".to_string(), path.to_string_lossy().into_owned()],
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let parent = path.parent().unwrap_or(path);
+        OpenCommand {
+            program: "xdg-open".to_string(),
+            args: vec![parent.to_string_lossy().into_owned()],
+        }
+    }
+}
 
 /// Map a Notepad++-style language name to the token used by GPUI Component's
 /// syntect highlighter.
@@ -119,5 +187,47 @@ mod tests {
         let abs = absolutize(&p);
         assert!(abs.ends_with("b"));
         assert!(!abs.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn open_directory_command_uses_the_platform_launcher() {
+        let dir = PathBuf::from("/tmp/example");
+        let command = open_directory_command(&dir);
+        #[cfg(windows)]
+        {
+            assert_eq!(command.program, "explorer");
+            assert_eq!(command.args, vec!["/tmp/example".to_string()]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.program, "open");
+            assert_eq!(command.args, vec!["/tmp/example".to_string()]);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(command.program, "xdg-open");
+            assert_eq!(command.args, vec!["/tmp/example".to_string()]);
+        }
+    }
+
+    #[test]
+    fn reveal_file_command_selects_or_opens_the_parent() {
+        let path = PathBuf::from("/tmp/example/note.txt");
+        let command = reveal_file_command(&path);
+        #[cfg(windows)]
+        {
+            assert_eq!(command.program, "explorer");
+            assert_eq!(command.args[0], "/select,");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.program, "open");
+            assert_eq!(command.args[0], "-R");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(command.program, "xdg-open");
+            assert_eq!(command.args, vec!["/tmp/example".to_string()]);
+        }
     }
 }

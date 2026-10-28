@@ -11,6 +11,21 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    /// Number of bytes a test write should accept before failing with ENOSPC.
+    static WRITE_FAILURE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Arm a one-shot, thread-local write failure for the next [`AtomicFile::write`].
+#[cfg(test)]
+pub fn arm_write_failure(after_bytes: usize) {
+    WRITE_FAILURE.with(|failure| failure.set(Some(after_bytes)));
+}
+
 const TEMP_MARKER: &str = ".luban-save-";
 /// Stale temporary files from a killed process are only removed after this
 /// age, so a concurrent instance is never disturbed.
@@ -77,6 +92,28 @@ impl AtomicFile {
         self.file.as_mut().expect("temporary file is open")
     }
 
+    /// Append bytes to the temporary file.
+    ///
+    /// All save paths use this instead of [`Self::file_mut`], so a test build
+    /// can inject a short write followed by ENOSPC without changing anything
+    /// in production.
+    pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(limit) = WRITE_FAILURE.with(|failure| failure.replace(None)) {
+            let accepted = limit.min(bytes.len());
+            self.file_mut().write_all(&bytes[..accepted])?;
+            self.file_mut().flush()?;
+            #[cfg(unix)]
+            return Err(io::Error::from_raw_os_error(28));
+            #[cfg(not(unix))]
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected disk full (ENOSPC)",
+            ));
+        }
+        self.file_mut().write_all(bytes)
+    }
+
     /// Apply these permissions to the temporary file at commit time instead of
     /// the target's current permissions.
     pub fn set_commit_permissions(&mut self, permissions: Permissions) {
@@ -130,7 +167,7 @@ impl Drop for AtomicFile {
 /// Write `bytes` to `target` through a same-directory temporary file.
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut atomic = AtomicFile::create(target)?;
-    atomic.file_mut().write_all(bytes)?;
+    atomic.write(bytes)?;
     atomic.commit()
 }
 
@@ -261,12 +298,49 @@ mod tests {
         fs::write(&path, "original").unwrap();
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         let mut atomic = AtomicFile::create(&path).unwrap();
-        atomic.file_mut().write_all(b"partial").unwrap();
+        atomic.write(b"partial").unwrap();
         let temp = atomic.temp_path().to_path_buf();
         drop(atomic);
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         assert!(!temp.exists());
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn injected_disk_full_keeps_the_original_and_removes_the_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, "original").unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        arm_write_failure(3);
+        let error = write_atomic(&path, b"replacement").unwrap_err();
+        #[cfg(unix)]
+        assert_eq!(error.raw_os_error(), Some(28));
+        #[cfg(not(unix))]
+        assert!(error.to_string().contains("ENOSPC"));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(TEMP_MARKER))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary file left behind");
+    }
+
+    #[test]
+    fn injected_failure_interrupts_multiple_writes_without_replacing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, "original").unwrap();
+        let mut atomic = AtomicFile::create(&path).unwrap();
+        atomic.write(b"hello ").unwrap();
+        arm_write_failure(2);
+        assert!(atomic.write(b"world").is_err());
+        drop(atomic);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
     }
 
     #[test]

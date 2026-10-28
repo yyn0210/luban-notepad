@@ -16,6 +16,8 @@ pub enum ThemeChoice {
     Dark,
     #[default]
     Light,
+    /// Follow the operating system's light/dark appearance.
+    System,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +65,31 @@ pub struct Settings {
     /// supported tag such as `"en"` or `"zh-CN"`.
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
+    /// Keep a snapshot of the previous on-disk content before each save.
+    #[serde(default = "default_true")]
+    pub local_history_enabled: bool,
+    /// Snapshot retention in days.
+    #[serde(default = "default_history_days")]
+    pub local_history_days: u64,
+    /// Upper bound for one file's stored snapshots, in MiB.
+    #[serde(default = "default_history_max_mb")]
+    pub local_history_max_mb: u64,
+    /// Per-command shortcut overrides, keyed by command ID. The value uses
+    /// `+`-separated modifiers and a key name, e.g. `ctrl+shift+p`.
+    #[serde(default)]
+    pub keybindings: std::collections::BTreeMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_history_days() -> u64 {
+    30
+}
+
+fn default_history_max_mb() -> u64 {
+    200
 }
 
 fn default_ui_language() -> String {
@@ -102,6 +129,10 @@ impl Default for Settings {
             default_encoding: TextEncoding::Utf8,
             default_eol: Eol::native(),
             ui_language: default_ui_language(),
+            local_history_enabled: true,
+            local_history_days: 30,
+            local_history_max_mb: 200,
+            keybindings: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -162,6 +193,13 @@ impl Settings {
             .large_file_partial_size
             .clamp(1024 * 1024, 4096 * 1024 * 1024);
         self.max_file_size_mb = self.max_file_size_mb.clamp(1, 4096);
+        self.local_history_days = self.local_history_days.clamp(1, 3650);
+        self.local_history_max_mb = self.local_history_max_mb.clamp(1, 4096);
+        self.keybindings
+            .retain(|id, binding| !id.trim().is_empty() && !binding.trim().is_empty());
+        for binding in self.keybindings.values_mut() {
+            *binding = binding.trim().to_lowercase();
+        }
         if self.syntax_theme.is_empty() {
             self.syntax_theme = "InspiredGitHub".to_string();
         }
@@ -386,6 +424,45 @@ mod tests {
         );
         s.remove_recent(Path::new("/c"));
         assert!(!s.recent_files.contains(&PathBuf::from("/c")));
+    }
+
+    #[test]
+    fn local_history_and_keybindings_default_and_clamp() {
+        let s = Settings::default();
+        assert!(s.local_history_enabled);
+        assert_eq!(s.local_history_days, 30);
+        assert_eq!(s.local_history_max_mb, 200);
+        assert!(s.keybindings.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"local_history_days": 0, "local_history_max_mb": 0,
+                "keybindings": {"save": " Ctrl+S ", "empty": "  "}}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.local_history_days, 1);
+        assert_eq!(loaded.local_history_max_mb, 1);
+        assert_eq!(
+            loaded.keybindings.get("save").map(String::as_str),
+            Some("ctrl+s")
+        );
+        assert!(!loaded.keybindings.contains_key("empty"));
+    }
+
+    #[test]
+    fn theme_round_trips_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let s = Settings {
+            theme: ThemeChoice::System,
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path).theme, ThemeChoice::System);
+        assert!(fs::read_to_string(&path).unwrap().contains("\"system\""));
     }
 
     #[test]

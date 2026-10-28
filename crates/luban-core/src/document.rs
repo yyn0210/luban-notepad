@@ -1,7 +1,6 @@
 //! The editor document: text, file metadata, selection and undo history.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -542,6 +541,11 @@ impl Document {
         self.non_text
     }
 
+    /// Mark a recreated buffer as non-text so saving keeps its raw bytes.
+    pub fn mark_non_text(&mut self) {
+        self.non_text = true;
+    }
+
     /// The byte range when only a portion of the source file is loaded.
     pub fn partial_range(&self) -> Option<PartialRange> {
         self.partial
@@ -1023,15 +1027,15 @@ impl Document {
             // line endings; write them back without normalization so untouched
             // bytes stay identical.
             let (bytes, lossy) = encoding::encode(&self.text, self.encoding);
-            atomic.file_mut().write_all(&bytes)?;
+            atomic.write(&bytes)?;
             lossy
         } else if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom)
             && self.eol == Eol::Lf
             && !self.text.as_bytes().contains(&b'\r')
         {
             // Fast path: LF UTF-8 is already the on-disk representation.
-            atomic.file_mut().write_all(self.encoding.bom())?;
-            atomic.file_mut().write_all(self.text.as_bytes())?;
+            atomic.write(self.encoding.bom())?;
+            atomic.write(self.text.as_bytes())?;
             false
         } else {
             let with_eol = eol::normalize(&self.text, self.eol);
@@ -1044,7 +1048,7 @@ impl Document {
                 } else {
                     encoding::encode(&with_eol, self.encoding)
                 };
-            atomic.file_mut().write_all(&bytes)?;
+            atomic.write(&bytes)?;
             lossy
         };
         atomic.commit()?;

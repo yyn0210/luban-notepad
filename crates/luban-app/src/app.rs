@@ -3,31 +3,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, Indent, Input, InputEvent, InputState, Outdent, Paste,
     RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo, RopeExt, Search,
     SelectAll, TabSize, Undo,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::slider::SliderEvent;
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
-use gpui_kit::component::{Selectable as _, Sizable as _, Size, TitleBar};
+use gpui_kit::component::{Disableable as _, Selectable as _, Sizable as _, Size, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use luban_core::disk_engine::{DiskEngine, RecoveryInfo, WindowText, WINDOW_BYTES};
 use luban_core::document::{DiskStatus, Document, PartialRange};
-use luban_core::encoding::TextEncoding;
+use luban_core::encoding::{self, TextEncoding};
 use luban_core::eol::{self, Eol};
 use luban_core::i18n::language_display_name;
 use luban_core::language;
 use luban_core::large_file::{format_bytes, RangeMode, SizeUnit};
+use luban_core::local_history::{HistoryEntry, HistoryStore};
 use luban_core::search::{ByteMatch, Match};
 use luban_core::session::{Session, SessionTab};
 use luban_core::settings::{Settings, ThemeChoice};
@@ -37,6 +39,7 @@ use luban_core::workspace::{
     list_directory, FileEntry, FileMatch, FindInFilesOptions, FindInFilesOutcome,
 };
 
+use crate::commands::{self, CommandContext, Keymap};
 use crate::dialogs::{
     next_listing_generation, CloseIntent, ConfirmState, FileDialogMode, FileDialogPurpose,
     FileDialogState, FileFilter, GoToLineState, LanguagePickerState, SaveAsRequest, SaveThen,
@@ -53,6 +56,8 @@ use crate::huge_gutter::{self, HugeGutterProps};
 use crate::huge_scrollbar::{self, HugeScrollbarProps};
 use crate::i18n::{active_language_name, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
+use crate::logging;
+use crate::palette::{self, QuickTarget};
 use crate::preferences::PreferencesState;
 use crate::theme::apply_theme;
 use crate::util::{self, language_key};
@@ -92,6 +97,95 @@ pub struct RecoveryPrompt {
     pub problem: Option<String>,
 }
 
+/// Local-history overlay for the active file.
+struct HistoryDialogState {
+    path: PathBuf,
+    entries: Vec<HistoryEntry>,
+    error: Option<String>,
+}
+
+/// Command palette or quick-open overlay.
+struct PaletteOverlay {
+    kind: PaletteKind,
+    state: Entity<CommandState>,
+    /// Flat command IDs for the command palette, grouped for quick open.
+    command_groups: Vec<Vec<&'static str>>,
+    quick_targets: Vec<Vec<QuickTarget>>,
+}
+
+/// Rows backing the quick-open overlay, kept separate from the palette state
+/// so rendering does not need to rebuild them.
+type QuickOpenRows = (Vec<(u64, String, String)>, Vec<(PathBuf, String, String)>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteKind {
+    Commands,
+    QuickOpen,
+}
+
+/// A tab closed during this session, available through Ctrl+Shift+T.
+#[derive(Clone)]
+struct ClosedTab {
+    path: Option<PathBuf>,
+    name: String,
+    text: Option<String>,
+    encoding: TextEncoding,
+    eol: Eol,
+    language: String,
+    cursor: usize,
+    anchor: usize,
+    modified: bool,
+    huge: bool,
+    huge_line: Option<u64>,
+    huge_column: Option<u64>,
+    /// Byte range of a partially opened tab.
+    range: Option<[u64; 2]>,
+    non_text: bool,
+    file_size: u64,
+    last_modified: Option<SystemTime>,
+}
+
+/// Keyboard shortcut editor overlay state.
+#[derive(Default)]
+struct ShortcutEditorState {
+    /// Command waiting for its next keystroke.
+    waiting_for: Option<String>,
+    error: Option<String>,
+}
+
+/// Sequential close-other/close-right plan. Each modified tab goes through the
+/// normal per-tab save/discard confirmation before the next one is attempted.
+struct TrimPlan {
+    keep_id: u64,
+    /// Tabs that will be closed after the save phase.
+    queue: Vec<u64>,
+    /// Modified tabs among the queue, saved before anything is closed.
+    save_queue: Vec<u64>,
+}
+
+/// Drag payload for reordering tabs.
+#[derive(Clone)]
+struct TabDrag {
+    id: u64,
+    label: SharedString,
+}
+
+struct TabDragPreview {
+    label: SharedString,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .bg(_cx.theme().colors.secondary)
+            .text_sm()
+            .child(self.label.clone())
+    }
+}
+
 pub struct Tab {
     pub id: u64,
     pub doc: Document,
@@ -101,6 +195,8 @@ pub struct Tab {
     /// The editor emitted a real text change that has not been synced into
     /// the document yet. Selection and focus events do not set this.
     pub pending_edit: bool,
+    /// Cached word count and the document revision it was computed for.
+    word_count: Option<(u64, usize)>,
     /// Present when the tab is backed by the disk engine.
     pub huge: Option<HugeFileUi>,
     pub highlighted_revision: u64,
@@ -325,6 +421,19 @@ pub struct LubanApp {
     pub language_picker: Option<LanguagePickerState>,
     pub about_open: bool,
     pub shortcuts_open: bool,
+    history_dialog: Option<HistoryDialogState>,
+    palette: Option<PaletteOverlay>,
+    quick_open_rows: Option<QuickOpenRows>,
+    shortcut_editor: Option<ShortcutEditorState>,
+    /// Snapshot waiting for the user to confirm replacing a modified buffer.
+    pending_history_restore: Option<HistoryEntry>,
+    /// Tabs closed during this session, newest last.
+    closed_tabs: Vec<ClosedTab>,
+    /// Active close-other/close-right sequence.
+    trim_plan: Option<TrimPlan>,
+    /// Effective command shortcuts, rebuilt whenever settings change.
+    keymap: Keymap,
+    history: HistoryStore,
     pub status: String,
     pub workspace_root: Option<PathBuf>,
     last_session_save: Instant,
@@ -385,6 +494,10 @@ pub struct LubanApp {
 /// a full path would otherwise paint past the menu background. Counting
 /// columns instead of chars keeps CJK-heavy paths within the same budget.
 const RECENT_PATH_COLUMNS: usize = 48;
+
+/// Fixed tab width, so a drag can be translated into a slot without
+/// measuring every tab label.
+const TAB_WIDTH: f32 = 180.0;
 
 /// Elide the middle of a string that is wider than `max_columns`, keeping
 /// both ends readable. Paths benefit from the trailing component, so the
@@ -459,9 +572,46 @@ fn char_columns(ch: char) -> usize {
     }
 }
 
+/// Destination index after moving one item, or `None` for a no-op move.
+fn reorder_index(len: usize, from: usize, target: usize) -> Option<usize> {
+    if from >= len || target > len || from == target || from + 1 == target {
+        return None;
+    }
+    Some((if from < target { target - 1 } else { target }).min(len.saturating_sub(1)))
+}
+
+/// Indices closed by "Close Others" or "Close to the Right".
+fn trim_queue(len: usize, keep: usize, right: bool) -> Vec<usize> {
+    if keep >= len {
+        return Vec::new();
+    }
+    if right {
+        (keep + 1..len).collect()
+    } else {
+        (0..len).filter(|index| *index != keep).collect()
+    }
+}
+
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
 impl LubanApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, options: LaunchOptions) -> Self {
-        let settings = Settings::load();
+        let mut settings = Settings::load();
+        // Drop entries for commands this build no longer knows about, and
+        // entries that cannot be parsed. Conflicts stay visible in the editor
+        // rather than silently changing which command wins.
+        settings.keybindings.retain(|id, text| {
+            let valid = commands::spec(id).is_some()
+                && commands::parse_binding(text)
+                    .is_ok_and(|binding| commands::binding_allowed(&binding));
+            if !valid {
+                log::warn!("ignoring invalid shortcut override for {id}");
+            }
+            valid
+        });
+        let keybindings = settings.keybindings.clone();
         crate::i18n::apply_language(&settings.ui_language);
         apply_theme(&settings, Some(window), cx);
 
@@ -492,6 +642,15 @@ impl LubanApp {
             language_picker: None,
             about_open: false,
             shortcuts_open: false,
+            history_dialog: None,
+            palette: None,
+            quick_open_rows: None,
+            shortcut_editor: None,
+            pending_history_restore: None,
+            closed_tabs: Vec::new(),
+            trim_plan: None,
+            keymap: Keymap::build(&keybindings),
+            history: HistoryStore::system(),
             status: String::new(),
             workspace_root: None,
             last_session_save: Instant::now(),
@@ -529,12 +688,64 @@ impl LubanApp {
             _subscriptions: Vec::new(),
         };
 
-        // The editor binds Ctrl+Z/Y and Ctrl+Home/End itself. Intercept them
-        // before action dispatch so disk-engine tabs use the engine history
-        // and the global document rather than the mounted window.
+        // The shortcut editor captures keystrokes even when no input owns the
+        // focus; the disk-engine history shortcuts must run before the
+        // editor's own bound actions. Both are handled globally here.
         let weak_shortcuts = cx.weak_entity();
         app._subscriptions
             .push(cx.intercept_keystrokes(move |event, window, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                    let handled = weak_shortcuts
+                        .update(cx, |app, cx| {
+                            if app.overwrite_save.is_some() {
+                                app.cancel_overwrite(cx);
+                                true
+                            } else if app.file_dialog.is_some() {
+                                app.cancel_file_dialog(cx);
+                                true
+                            } else if app.confirm.is_some() {
+                                app.confirm_cancel(cx);
+                                true
+                            } else if app.palette.is_some() {
+                                app.close_palette(window, cx);
+                                true
+                            } else if app.history_dialog.is_some() {
+                                app.history_dialog = None;
+                                app.pending_history_restore = None;
+                                app.focus_editor = true;
+                                cx.notify();
+                                true
+                            } else if app.trim_plan.is_some() {
+                                app.trim_plan = None;
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if handled {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                let waiting = weak_shortcuts
+                    .update(cx, |app, _| {
+                        app.shortcut_editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.waiting_for.is_some())
+                    })
+                    .unwrap_or(false);
+                if waiting {
+                    let handled = weak_shortcuts
+                        .update(cx, |app, cx| {
+                            app.capture_shortcut(&event.keystroke, window, cx)
+                        })
+                        .unwrap_or(false);
+                    if handled {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 let modifiers = event.keystroke.modifiers;
                 if !(modifiers.secondary() || modifiers.control) {
                     return;
@@ -724,6 +935,16 @@ impl LubanApp {
             .detach();
         }
 
+        // A System theme follows live appearance changes; explicit Light/Dark
+        // choices ignore them.
+        app._subscriptions
+            .push(cx.observe_window_appearance(window, |this, window, cx| {
+                if matches!(this.settings.theme, ThemeChoice::System) {
+                    apply_theme(&this.settings, Some(window), cx);
+                    cx.notify();
+                }
+            }));
+
         app
     }
 
@@ -886,6 +1107,7 @@ impl LubanApp {
             decorations,
             needs_sync: false,
             pending_edit: false,
+            word_count: None,
             huge: huge_ui,
             highlighted_revision: u64::MAX,
             external: None,
@@ -4133,7 +4355,7 @@ impl LubanApp {
             return;
         }
         if save_to_source && self.tabs[index].doc.read_only {
-            self.set_status(tr("core.document.read_only"), cx);
+            self.set_status(tr("status.document_read_only"), cx);
             return;
         }
         let target = target.unwrap_or(path);
@@ -4505,6 +4727,9 @@ impl LubanApp {
             SaveThen::NextNormalSave => {
                 self.save_next_normal(window, cx);
             }
+            SaveThen::NextTrimSave => {
+                self.save_next_trim(window, cx);
+            }
             SaveThen::ReloadTab(id) => {
                 if let Some(index) = self.tab_index_by_id(id) {
                     if self.tabs[index].doc.is_huge() {
@@ -4820,6 +5045,11 @@ impl LubanApp {
                 tab.needs_sync = false;
             }
         }
+        if let Some(target) = path.as_deref() {
+            if !non_text {
+                self.snapshot_before_save(target, cx);
+            }
+        }
         let (name, encoding, saved, path, error) = {
             let tab = &mut self.tabs[index];
             let name = tab.doc.display_name();
@@ -5074,6 +5304,7 @@ impl LubanApp {
         self.pending_normal_overwrite = None;
         self.pending_save_failures.clear();
         self.pending_batch_is_close = false;
+        self.trim_plan = None;
     }
 
     pub fn save_active_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5118,6 +5349,9 @@ impl LubanApp {
         if !self.ensure_tab_text(index, cx) {
             self.abort_pending_saves();
             return;
+        }
+        if !self.tabs[index].doc.is_non_text() {
+            self.snapshot_before_save(&request.path, cx);
         }
         let lossy = match self.tabs[index].doc.save_as(&request.path) {
             Ok(lossy) => lossy,
@@ -5797,9 +6031,14 @@ impl LubanApp {
     }
 
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_at_inner(index, window, cx);
+    }
+
+    fn close_tab_at_inner(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
+        self.record_closed_tab(index, cx);
         self.cancel_tab_jobs(index);
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -6040,6 +6279,12 @@ impl LubanApp {
             CloseIntent::Exit => {
                 self.start_batch_save(BatchSaveKind::Exit, window, cx);
             }
+            CloseIntent::RestoreHistory => {
+                self.apply_pending_history_restore(window, cx);
+            }
+            CloseIntent::TrimTabs => {
+                self.save_next_trim(window, cx);
+            }
         }
     }
 
@@ -6048,8 +6293,11 @@ impl LubanApp {
             return;
         };
         // Discarding one document must not let a queued Close All / Exit
-        // continuation run with a different decision.
-        self.abort_pending_saves();
+        // continuation run with a different decision. A trim plan is the
+        // decision itself and is executed below.
+        if confirm.intent != CloseIntent::TrimTabs {
+            self.abort_pending_saves();
+        }
         match confirm.intent {
             CloseIntent::OverwriteExternal(id) => {
                 self.pending_huge_overwrite = None;
@@ -6099,11 +6347,19 @@ impl LubanApp {
             }
             CloseIntent::AllTabs => self.close_all_now(window, cx),
             CloseIntent::Exit => self.request_quit(window, cx),
+            CloseIntent::RestoreHistory => {
+                self.pending_history_restore = None;
+                cx.notify();
+            }
+            CloseIntent::TrimTabs => {
+                self.close_trim_now(true, window, cx);
+            }
         }
     }
 
     fn confirm_cancel(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
+        self.pending_history_restore = None;
         self.abort_pending_saves();
         cx.notify();
     }
@@ -6402,6 +6658,7 @@ impl LubanApp {
 
     pub fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(&self.settings, Some(window), cx);
+        self.keymap = Keymap::build(&self.settings.keybindings);
         let line_numbers = self.settings.show_line_numbers;
         let wrap = self.settings.word_wrap;
         let tab = TabSize {
@@ -7092,6 +7349,846 @@ impl LubanApp {
     }
 
     // ------------------------------------------------------------------
+    // Commands, local history and shortcuts
+    // ------------------------------------------------------------------
+
+    fn command_context(&self) -> CommandContext {
+        let tab = self.active_tab();
+        let (can_undo, can_redo) = match tab {
+            Some(tab) => match tab.doc.huge() {
+                Some(state) => state
+                    .engine
+                    .try_read()
+                    .map(|engine| (engine.can_undo(), engine.can_redo()))
+                    .unwrap_or((false, false)),
+                None => (tab.doc.undo.can_undo(), tab.doc.undo.can_redo()),
+            },
+            None => (false, false),
+        };
+        CommandContext {
+            has_document: tab.is_some(),
+            has_path: tab.is_some_and(|tab| tab.doc.path.is_some()),
+            can_save: tab.is_some(),
+            can_undo,
+            can_redo,
+        }
+    }
+
+    /// Execute a registered command. Menu items, the toolbar, shortcuts and
+    /// the command palette all end up here.
+    pub fn run_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(spec) = commands::spec(id) else {
+            log::warn!("unknown command {id}");
+            return false;
+        };
+        if !spec.enabled(&self.command_context()) {
+            return false;
+        }
+        match id {
+            "file.new" => self.new_file(window, cx),
+            "file.open" => self.open_file_dialog(window, cx),
+            "file.open-folder" => self.open_folder_dialog(window, cx),
+            "file.save" => self.save_active(window, cx),
+            "file.save-as" => self.save_active_as(window, cx),
+            "file.save-all" => self.save_all(window, cx),
+            "file.reload" => self.reload_active(window, cx),
+            "file.local-history" => self.open_local_history(window, cx),
+            "file.close" => self.request_close_active(window, cx),
+            "file.close-all" => self.request_close_all(window, cx),
+            "file.exit" => self.request_exit(window, cx),
+            "edit.undo" => self.undo_or_editor(false, window, cx),
+            "edit.redo" => self.undo_or_editor(true, window, cx),
+            "edit.cut" => self.editor_action(Box::new(Cut), window, cx),
+            "edit.copy" => self.editor_action(Box::new(Copy), window, cx),
+            "edit.paste" => self.editor_action(Box::new(Paste), window, cx),
+            "edit.select-all" => self.editor_action(Box::new(SelectAll), window, cx),
+            "edit.indent" => self.editor_action(Box::new(Indent), window, cx),
+            "edit.outdent" => self.editor_action(Box::new(Outdent), window, cx),
+            "edit.duplicate-line" => self.duplicate_line(window, cx),
+            "edit.delete-line" => self.delete_line(window, cx),
+            "edit.toggle-comment" => self.toggle_comment(window, cx),
+            "edit.trim-whitespace" => self.trim_trailing(window, cx),
+            "edit.uppercase" => self.transform_case(textutil::CaseMode::Upper, window, cx),
+            "edit.lowercase" => self.transform_case(textutil::CaseMode::Lower, window, cx),
+            "edit.title-case" => self.transform_case(textutil::CaseMode::Title, window, cx),
+            "edit.sort-asc" => self.sort_selection(true, window, cx),
+            "edit.sort-desc" => self.sort_selection(false, window, cx),
+            "search.find" => self.open_find(false, window, cx),
+            "search.replace" => self.open_find(true, window, cx),
+            "search.find-next" => self.find_next(true, window, cx),
+            "search.find-previous" => self.find_next(false, window, cx),
+            "search.go-to-line" => self.open_go_to_line(window, cx),
+            "search.find-in-files" => self.open_find_in_files(window, cx),
+            "search.clear-highlights" => {
+                self.find.clear();
+                cx.notify();
+            }
+            "view.word-wrap" => {
+                self.settings.word_wrap = !self.settings.word_wrap;
+                self.apply_settings(window, cx);
+            }
+            "view.line-numbers" => {
+                self.settings.show_line_numbers = !self.settings.show_line_numbers;
+                self.apply_settings(window, cx);
+            }
+            "view.toolbar" => {
+                self.settings.show_toolbar = !self.settings.show_toolbar;
+                self.apply_settings(window, cx);
+            }
+            "view.status-bar" => {
+                self.settings.show_status_bar = !self.settings.show_status_bar;
+                self.apply_settings(window, cx);
+            }
+            "view.explorer" => {
+                self.settings.show_file_explorer = !self.settings.show_file_explorer;
+                self.apply_settings(window, cx);
+            }
+            "view.large-file-controller" => self.toggle_large_file_controller(window, cx),
+            "view.zoom-in" => self.zoom(1.0, cx),
+            "view.zoom-out" => self.zoom(-1.0, cx),
+            "view.zoom-reset" => self.reset_zoom(cx),
+            "view.theme-light" => {
+                self.settings.theme = ThemeChoice::Light;
+                self.apply_settings(window, cx);
+            }
+            "view.theme-dark" => {
+                self.settings.theme = ThemeChoice::Dark;
+                self.apply_settings(window, cx);
+            }
+            "view.theme-system" => {
+                self.settings.theme = ThemeChoice::System;
+                self.apply_settings(window, cx);
+            }
+            "view.toggle-theme" => {
+                self.settings.theme = if self.settings.theme == ThemeChoice::Light {
+                    ThemeChoice::Dark
+                } else {
+                    ThemeChoice::Light
+                };
+                self.apply_settings(window, cx);
+            }
+            "view.fullscreen" => {
+                log::info!("toggling fullscreen");
+                window.toggle_fullscreen();
+                cx.notify();
+            }
+            "view.choose-language" => self.open_language_picker(window, cx),
+            "tabs.close-others" => self.request_trim_tabs(false, window, cx),
+            "tabs.close-right" => self.request_trim_tabs(true, window, cx),
+            "tabs.copy-path" => self.copy_active_path(cx),
+            "tabs.reveal" => self.reveal_active_in_file_manager(cx),
+            "tabs.reopen-closed" => self.reopen_closed_tab(window, cx),
+            "tabs.next" => self.next_tab(1, window, cx),
+            "tabs.previous" => self.next_tab(-1, window, cx),
+            "palette.commands" => self.open_command_palette(window, cx),
+            "palette.quick-open" => self.open_quick_open(window, cx),
+            "settings.preferences" => self.open_preferences(window, cx),
+            "help.shortcuts" => {
+                self.shortcuts_open = true;
+                cx.notify();
+            }
+            "help.about" => {
+                self.about_open = true;
+                cx.notify();
+            }
+            "help.open-log-dir" => {
+                let directory = logging::log_dir();
+                match util::open_directory_command(&directory).spawn() {
+                    Ok(()) => {}
+                    Err(error) => self.set_status(
+                        tr_args(
+                            "status.open_path_failed",
+                            &[("error", format!("{}: {error}", directory.display()))],
+                        ),
+                        cx,
+                    ),
+                }
+            }
+            other => {
+                log::warn!("command {other} has no implementation");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Take a local-history snapshot of the file a save is about to replace.
+    fn snapshot_before_save(&mut self, target: &Path, cx: &mut Context<Self>) {
+        if !self.settings.local_history_enabled {
+            return;
+        }
+        match self.history.snapshot(target) {
+            Ok(Some(_)) => {
+                let keep = Duration::from_secs(self.settings.local_history_days.max(1) * 24 * 3600);
+                let limit = self.settings.local_history_max_mb.max(1) * 1024 * 1024;
+                if let Err(error) = self.history.prune(keep, limit) {
+                    log::warn!("could not prune local history: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("could not snapshot {}: {error}", target.display());
+                self.set_status(
+                    tr_args("status.history_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn open_local_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(path) = tab.doc.path.clone() else {
+            return;
+        };
+        if tab.doc.is_huge() || tab.doc.is_partial() || tab.doc.is_non_text() {
+            self.set_status(tr("status.history_unavailable"), cx);
+            return;
+        }
+        match self.history.list(&path) {
+            Ok(entries) => {
+                self.history_dialog = Some(HistoryDialogState {
+                    path,
+                    entries,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                self.history_dialog = Some(HistoryDialogState {
+                    path,
+                    entries: Vec::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+        let _ = window;
+        cx.notify();
+    }
+
+    fn restore_history_entry(
+        &mut self,
+        entry: HistoryEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
+            return;
+        };
+        let bytes = match self.history.read(&entry) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.set_status(
+                    tr_args("status.history_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+                return;
+            }
+        };
+        let tab = &self.tabs[index];
+        let decoded = encoding::decode_with(&bytes, tab.doc.encoding);
+        let text = if tab.doc.is_non_text() {
+            decoded
+        } else {
+            eol::to_lf(&decoded)
+        };
+        if tab.doc.is_modified() {
+            self.pending_history_restore = Some(entry);
+            self.confirm = Some(ConfirmState::new(
+                CloseIntent::RestoreHistory,
+                tr("confirm.history_restore_title"),
+                tr("confirm.history_restore_detail"),
+            ));
+            cx.notify();
+            return;
+        }
+        self.apply_history_restore(index, text, window, cx);
+    }
+
+    fn apply_pending_history_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.pending_history_restore.take() else {
+            return;
+        };
+        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
+            return;
+        };
+        let bytes = match self.history.read(&entry) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.set_status(
+                    tr_args("status.history_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+                return;
+            }
+        };
+        let tab = &self.tabs[index];
+        let decoded = encoding::decode_with(&bytes, tab.doc.encoding);
+        let text = if tab.doc.is_non_text() {
+            decoded
+        } else {
+            eol::to_lf(&decoded)
+        };
+        self.apply_history_restore(index, text, window, cx);
+    }
+
+    fn apply_history_restore(
+        &mut self,
+        index: usize,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.doc.replace_all_text(&text, EditKind::Other);
+        tab.doc.touch();
+        tab.doc.cursor = 0;
+        tab.doc.anchor = 0;
+        tab.highlighted_revision = u64::MAX;
+        tab.needs_sync = false;
+        tab.pending_edit = false;
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.set_selected_range(0..0, cx);
+            state.focus(window, cx);
+        });
+        self.history_dialog = None;
+        self.focus_editor = true;
+        self.set_status(tr("status.history_restored"), cx);
+        cx.notify();
+    }
+
+    fn clear_local_history(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.history_dialog.as_mut() else {
+            return;
+        };
+        match self.history.clear(&dialog.path) {
+            Ok(()) => {
+                dialog.entries.clear();
+                dialog.error = None;
+            }
+            Err(error) => dialog.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
+        let groups = palette::command_groups();
+        let command_groups: Vec<Vec<&'static str>> = groups
+            .iter()
+            .map(|(_, commands)| commands.iter().map(|command| command.id).collect())
+            .collect();
+        let state = cx.new(|cx| CommandState::new(window, cx));
+        state.update(cx, |state, cx| state.focus(window, cx));
+        self.palette = Some(PaletteOverlay {
+            kind: PaletteKind::Commands,
+            state,
+            command_groups,
+            quick_targets: Vec::new(),
+        });
+        cx.notify();
+    }
+
+    fn open_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
+        let infos: Vec<palette::OpenTabInfo<'_>> = self
+            .tabs
+            .iter()
+            .map(|tab| palette::OpenTabInfo {
+                id: tab.id,
+                name: tab.doc.display_name(),
+                path: tab.doc.path.as_ref(),
+                modified: tab.doc.is_modified(),
+            })
+            .collect();
+        let entries = palette::quick_entries(&infos, &self.settings.recent_files);
+        let mut tab_targets = Vec::new();
+        let mut file_targets = Vec::new();
+        for entry in entries {
+            match entry.target {
+                QuickTarget::Tab(id) => {
+                    tab_targets.push((id, entry.label, entry.detail));
+                }
+                QuickTarget::File(path) => {
+                    file_targets.push((path, entry.label, entry.detail));
+                }
+            }
+        }
+        let mut quick_targets = Vec::new();
+        let mut rows = (Vec::new(), Vec::new());
+        if !tab_targets.is_empty() {
+            quick_targets.push(
+                tab_targets
+                    .iter()
+                    .map(|(id, _, _)| QuickTarget::Tab(*id))
+                    .collect(),
+            );
+            rows.0 = tab_targets;
+        }
+        if !file_targets.is_empty() {
+            quick_targets.push(
+                file_targets
+                    .iter()
+                    .map(|(path, _, _)| QuickTarget::File(path.clone()))
+                    .collect(),
+            );
+            rows.1 = file_targets;
+        }
+        let state = cx.new(|cx| CommandState::new(window, cx));
+        state.update(cx, |state, cx| state.focus(window, cx));
+        self.palette = Some(PaletteOverlay {
+            kind: PaletteKind::QuickOpen,
+            state,
+            command_groups: Vec::new(),
+            quick_targets,
+        });
+        // Store labels/details for rendering by reusing the same ordered
+        // lists; keep them out of `PaletteOverlay` to avoid a third copy.
+        self.quick_open_rows = Some(rows);
+        cx.notify();
+    }
+
+    fn confirm_palette(
+        &mut self,
+        kind: PaletteKind,
+        index: gpui_kit::component::IndexPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(overlay) = self.palette.take() else {
+            return;
+        };
+        self.quick_open_rows = None;
+        match kind {
+            PaletteKind::Commands => {
+                let id = overlay
+                    .command_groups
+                    .get(index.section)
+                    .and_then(|group| group.get(index.row))
+                    .copied();
+                if let Some(id) = id {
+                    self.run_command(id, window, cx);
+                }
+            }
+            PaletteKind::QuickOpen => {
+                let target = overlay
+                    .quick_targets
+                    .get(index.section)
+                    .and_then(|group| group.get(index.row))
+                    .cloned();
+                match target {
+                    Some(QuickTarget::Tab(id)) => {
+                        if let Some(index) = self.tab_index_by_id(id) {
+                            self.activate_tab_index(index, window, cx);
+                        }
+                    }
+                    Some(QuickTarget::File(path)) => {
+                        self.open_path(&path, window, cx);
+                    }
+                    None => {}
+                }
+            }
+        }
+        self.focus_editor(window, cx);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = None;
+        self.quick_open_rows = None;
+        self.focus_editor(window, cx);
+        cx.notify();
+    }
+
+    fn open_shortcut_editor(&mut self, cx: &mut Context<Self>) {
+        self.shortcut_editor = Some(ShortcutEditorState::default());
+        self.shortcuts_open = false;
+        cx.notify();
+    }
+
+    /// Capture the next keystroke for a command waiting in the shortcut
+    /// editor. Returns true when the event was consumed.
+    fn capture_shortcut(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut editor) = self.shortcut_editor.take() else {
+            return false;
+        };
+        let Some(id) = editor.waiting_for.clone() else {
+            self.shortcut_editor = Some(editor);
+            return false;
+        };
+        let key = keystroke.key.to_ascii_lowercase();
+        if key == "escape" {
+            editor.waiting_for = None;
+            self.shortcut_editor = Some(editor);
+            cx.notify();
+            return true;
+        }
+        let modifiers = keystroke.modifiers;
+        let mut parts = Vec::new();
+        if modifiers.secondary() || modifiers.control {
+            parts.push("ctrl".to_string());
+        }
+        if modifiers.shift {
+            parts.push("shift".to_string());
+        }
+        if modifiers.alt {
+            parts.push("alt".to_string());
+        }
+        let key = match key.as_str() {
+            " " => "space".to_string(),
+            "+" => "plus".to_string(),
+            "-" => "minus".to_string(),
+            "/" => "slash".to_string(),
+            other => other.to_string(),
+        };
+        parts.push(key);
+        let text = parts.join("+");
+        match commands::validate_override(&id, &text, &self.settings.keybindings) {
+            Ok(binding) => {
+                self.settings.keybindings.insert(id, binding);
+                editor.waiting_for = None;
+                editor.error = None;
+                self.apply_settings(window, cx);
+            }
+            Err(error) => {
+                editor.waiting_for = None;
+                editor.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+        self.shortcut_editor = Some(editor);
+        true
+    }
+
+    fn reset_shortcut(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.keybindings.remove(id);
+        if let Some(editor) = self.shortcut_editor.as_mut() {
+            editor.error = None;
+        }
+        self.apply_settings(window, cx);
+    }
+
+    fn reset_all_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.keybindings.clear();
+        if let Some(editor) = self.shortcut_editor.as_mut() {
+            editor.error = None;
+        }
+        self.apply_settings(window, cx);
+    }
+
+    fn record_closed_tab(&mut self, index: usize, cx: &Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let huge = tab.doc.is_huge();
+        let (huge_line, huge_column) = if huge {
+            tab.doc
+                .huge()
+                .and_then(|state| {
+                    let cursor = state.cursor;
+                    state
+                        .engine
+                        .try_read()
+                        .ok()
+                        .and_then(|engine| engine.line_col_at(cursor).ok())
+                })
+                .unwrap_or((1, 1))
+        } else {
+            (1, 1)
+        };
+        let modified = tab.doc.is_modified();
+        // Keep the exact buffer for every normal tab so reopening restores
+        // what was closed even when the file changes afterwards.
+        let range = tab
+            .doc
+            .partial_range()
+            .map(|range| [range.start, range.end]);
+        let non_text = tab.doc.is_non_text();
+        let text = if huge || range.is_some() {
+            None
+        } else {
+            Some(tab.editor.read(cx).text().to_string())
+        };
+        let name = tab.doc.display_name();
+        let closed = ClosedTab {
+            path: tab.doc.path.clone(),
+            name,
+            text,
+            encoding: tab.doc.encoding,
+            eol: tab.doc.eol,
+            language: tab.doc.language.clone(),
+            cursor: tab.doc.cursor,
+            anchor: tab.doc.anchor,
+            modified,
+            huge,
+            huge_line: huge.then_some(huge_line),
+            huge_column: huge.then_some(huge_column),
+            range,
+            non_text,
+            file_size: tab.doc.file_size,
+            last_modified: tab.doc.last_modified,
+        };
+        self.closed_tabs.push(closed);
+        if self.closed_tabs.len() > 20 {
+            self.closed_tabs.remove(0);
+        }
+    }
+
+    fn reopen_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(closed) = self.closed_tabs.last().cloned() else {
+            self.set_status(tr("status.no_closed_tabs"), cx);
+            return;
+        };
+        if let Some(path) = &closed.path {
+            if let Some(index) = self.tabs.iter().position(|tab| {
+                tab.doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|open| util::same_path(open, path))
+            }) {
+                self.closed_tabs.pop();
+                self.activate_tab_index(index, window, cx);
+                return;
+            }
+            if let Some([from, to]) = closed.range {
+                let cancel = AtomicBool::new(false);
+                let progress = AtomicU64::new(0);
+                match Document::open_range(
+                    path,
+                    from,
+                    to,
+                    self.settings.max_file_size_bytes(),
+                    &cancel,
+                    &progress,
+                ) {
+                    Ok(mut doc) => {
+                        doc.cursor = closed.cursor.min(doc.char_count());
+                        doc.anchor = closed.anchor.min(doc.char_count());
+                        self.closed_tabs.pop();
+                        self.add_document(doc, window, cx);
+                        self.set_status(tr("status.tab_restored"), cx);
+                    }
+                    Err(error) => {
+                        self.set_status(
+                            tr_args("status.reload_failed", &[("error", error.to_string())]),
+                            cx,
+                        );
+                    }
+                }
+                return;
+            }
+            if closed.text.is_none() {
+                if self.open_path(path, window, cx) {
+                    if closed.huge {
+                        self.pending_huge_at = Some((
+                            path.clone(),
+                            closed.huge_line.unwrap_or(1),
+                            closed.huge_column.unwrap_or(1),
+                        ));
+                    }
+                    // The entry is consumed once the open request is accepted;
+                    // a failed open leaves it on the stack.
+                    self.closed_tabs.pop();
+                }
+                return;
+            }
+        }
+        let mut doc = Document::new_untitled(closed.name);
+        doc.attach_text(closed.text.unwrap_or_default());
+        doc.encoding = closed.encoding;
+        doc.eol = closed.eol;
+        doc.language = closed.language;
+        doc.path = closed.path;
+        doc.file_size = closed.file_size;
+        doc.last_modified = closed.last_modified;
+        doc.cursor = closed.cursor;
+        doc.anchor = closed.anchor;
+        if closed.non_text {
+            doc.mark_non_text();
+        }
+        if closed.modified {
+            doc.touch();
+        } else {
+            doc.mark_saved();
+        }
+        self.closed_tabs.pop();
+        self.add_document(doc, window, cx);
+        self.set_status(tr("status.tab_restored"), cx);
+    }
+
+    fn copy_active_path(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_doc().and_then(|doc| doc.path.clone()) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        self.set_status(tr("status.path_copied"), cx);
+    }
+
+    fn reveal_active_in_file_manager(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_doc().and_then(|doc| doc.path.clone()) else {
+            return;
+        };
+        if let Err(error) = util::reveal_file_command(&path).spawn() {
+            self.set_status(
+                tr_args("status.open_path_failed", &[("error", error.to_string())]),
+                cx,
+            );
+        }
+    }
+
+    /// Close every tab except the active one, or every tab to its right.
+    ///
+    /// Modified targets are saved before any tab is closed, so cancelling the
+    /// save phase leaves the whole tab set intact.
+    fn request_trim_tabs(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
+            return;
+        };
+        let keep_id = self.tabs[index].id;
+        let queue: Vec<u64> = trim_queue(self.tabs.len(), index, right)
+            .into_iter()
+            .filter_map(|index| self.tabs.get(index).map(|tab| tab.id))
+            .collect();
+        if queue.is_empty() {
+            return;
+        }
+        let save_queue: Vec<u64> = queue
+            .iter()
+            .filter(|id| {
+                self.tab_index_by_id(**id)
+                    .is_some_and(|index| self.tabs[index].doc.is_modified())
+            })
+            .copied()
+            .collect();
+        self.trim_plan = Some(TrimPlan {
+            keep_id,
+            queue,
+            save_queue,
+        });
+        if self
+            .trim_plan
+            .as_ref()
+            .is_some_and(|plan| plan.save_queue.is_empty())
+        {
+            self.close_trim_now(false, window, cx);
+            return;
+        }
+        self.confirm = Some(ConfirmState::new(
+            CloseIntent::TrimTabs,
+            tr("confirm.trim_title"),
+            tr("confirm.trim_detail"),
+        ));
+        cx.notify();
+    }
+
+    /// Save the modified targets of a trim plan, one at a time.
+    fn save_next_trim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let id = {
+                let Some(plan) = self.trim_plan.as_mut() else {
+                    return;
+                };
+                match plan.save_queue.first().copied() {
+                    Some(id) => {
+                        plan.save_queue.remove(0);
+                        id
+                    }
+                    None => break,
+                }
+            };
+            let Some(index) = self.tab_index_by_id(id) else {
+                continue;
+            };
+            if !self.tabs[index].doc.is_modified() {
+                continue;
+            }
+            if self.tabs[index].doc.is_huge() && !self.tabs[index].doc.is_partial() {
+                self.start_huge_save(index, None, SaveThen::NextTrimSave, false, window, cx);
+                return;
+            }
+            if self.tabs[index].doc.path.is_some() && !self.tabs[index].doc.is_partial() {
+                self.save_tab_at_with(index, SaveThen::NextTrimSave, false, window, cx);
+                return;
+            }
+            let (dir, name) = {
+                let tab = &self.tabs[index];
+                let name = if tab.doc.is_partial() {
+                    tab.doc
+                        .path
+                        .as_deref()
+                        .map(luban_core::large_file::partial_save_name)
+                        .unwrap_or_else(|| tab.doc.display_name())
+                } else {
+                    tab.doc.display_name()
+                };
+                (util::default_save_directory(tab.doc.path.as_deref()), name)
+            };
+            self.show_file_dialog(
+                FileDialogMode::Save,
+                FileDialogPurpose::SaveAs {
+                    tab_id: id,
+                    then: SaveThen::NextTrimSave,
+                },
+                dir,
+                name,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.close_trim_now(false, window, cx);
+    }
+
+    /// Close every tab in the plan. `discard` allows modified buffers to be
+    /// dropped; otherwise a late edit aborts instead of losing data.
+    fn close_trim_now(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan) = self.trim_plan.take() else {
+            return;
+        };
+        if !discard {
+            let changed = plan.queue.iter().any(|id| {
+                self.tab_index_by_id(*id)
+                    .is_some_and(|index| self.tabs[index].doc.is_modified())
+            });
+            if changed {
+                self.abort_pending_saves();
+                self.set_status(tr("status.batch_unsaved"), cx);
+                return;
+            }
+        }
+        for id in plan.queue {
+            if let Some(index) = self.tab_index_by_id(id) {
+                self.close_tab_at_inner(index, window, cx);
+            }
+        }
+        self.finish_trim(plan.keep_id, cx);
+    }
+
+    fn finish_trim(&mut self, keep_id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.tab_index_by_id(keep_id) {
+            self.active = index;
+            self.focus_editor = true;
+        }
+        self.find.clear();
+        self.find.dirty = true;
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
     // Keyboard
     // ------------------------------------------------------------------
 
@@ -7105,8 +8202,33 @@ impl LubanApp {
         let key = event.keystroke.key.to_ascii_lowercase();
         let secondary = modifiers.secondary();
         let shift = modifiers.shift;
+        let alt = modifiers.alt;
         let command = secondary || modifiers.control;
+        // A waiting shortcut editor claims the next keystroke verbatim.
+        if self
+            .shortcut_editor
+            .as_ref()
+            .is_some_and(|editor| editor.waiting_for.is_some())
+        {
+            return self.capture_shortcut(&event.keystroke, window, cx);
+        }
         if key == "escape" {
+            if self.palette.is_some() {
+                self.close_palette(window, cx);
+                return true;
+            }
+            if self.history_dialog.is_some() {
+                self.history_dialog = None;
+                self.pending_history_restore = None;
+                self.focus_editor = true;
+                cx.notify();
+                return true;
+            }
+            if self.shortcut_editor.is_some() {
+                self.shortcut_editor = None;
+                cx.notify();
+                return true;
+            }
             if self.overwrite_save.is_some() {
                 self.cancel_overwrite(cx);
                 return true;
@@ -7157,6 +8279,58 @@ impl LubanApp {
                 return true;
             }
             return false;
+        }
+
+        // Registered commands take precedence over the legacy inline
+        // handlers below. Editing commands only apply while the editor owns
+        // the focus, so a find field or dialog keeps Ctrl+C/V/A. A rebound
+        // command consumes its old default instead of running twice. Modal
+        // quick-open surfaces own their keystrokes entirely.
+        if self.palette.is_none() && self.history_dialog.is_none() && self.shortcut_editor.is_none()
+        {
+            let editor_focused = self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.editor.read(cx).focus_handle(cx).is_focused(window));
+            // Layout-dependent keys arrive as their unshifted character.
+            let lookup_key = match key.as_str() {
+                "=" => "plus",
+                "-" => "minus",
+                "/" => "slash",
+                other => other,
+            };
+            if let Some(id) = self.keymap.lookup(lookup_key, command, shift, alt) {
+                if !id.starts_with("edit.") || editor_focused {
+                    return self.run_command(id, window, cx);
+                }
+            }
+            if let Some(id) = self
+                .keymap
+                .suppressed_binding(lookup_key, command, shift, alt)
+            {
+                if !id.starts_with("edit.") || editor_focused {
+                    return true;
+                }
+            }
+        }
+
+        // A quick-open surface with a query field keeps its text-editing and
+        // navigation keys; every other command/chord stays with the overlay.
+        if self.palette.is_some() {
+            let text_edit = command && matches!(key.as_str(), "c" | "v" | "x" | "a" | "z" | "y");
+            if text_edit {
+                return false;
+            }
+            let function_key = key.len() > 1
+                && key.starts_with('f')
+                && key[1..].chars().all(|ch| ch.is_ascii_digit());
+            return command || alt || function_key;
+        }
+        if self.history_dialog.is_some() || self.shortcut_editor.is_some() {
+            let function_key = key.len() > 1
+                && key.starts_with('f')
+                && key[1..].chars().all(|ch| ch.is_ascii_digit());
+            return command || alt || function_key;
         }
 
         if self.file_dialog.is_some() {
@@ -7330,6 +8504,14 @@ impl LubanApp {
     // Menus
     // ------------------------------------------------------------------
 
+    /// Label for a command, sourced from the registry so menus and the
+    /// command palette cannot drift.
+    fn command_label(id: &str) -> String {
+        commands::spec(id)
+            .map(|spec| tr(spec.label_key))
+            .unwrap_or_else(|| id.to_string())
+    }
+
     fn menu_item<F>(
         weak: &WeakEntity<Self>,
         label: impl Into<SharedString>,
@@ -7379,6 +8561,7 @@ impl LubanApp {
             .unwrap_or_else(|| language::PLAIN_TEXT.to_string());
         let active_partial = self.active_doc().is_some_and(Document::is_partial);
         let active_huge = self.active_doc().is_some_and(Document::is_huge);
+        let closed_tab_count = self.closed_tabs.len();
 
         let weak_file = weak.clone();
         let weak_edit = weak.clone();
@@ -7396,7 +8579,7 @@ impl LubanApp {
                 menu = menu
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.new"),
+                        Self::command_label("file.new"),
                         false,
                         None,
                         |this, window, cx| {
@@ -7405,7 +8588,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.open"),
+                        Self::command_label("file.open"),
                         false,
                         None,
                         |this, window, cx| {
@@ -7414,7 +8597,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.open_folder"),
+                        Self::command_label("file.open-folder"),
                         false,
                         None,
                         |this, window, cx| {
@@ -7455,7 +8638,7 @@ impl LubanApp {
                     .separator()
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.save"),
+                        Self::command_label("file.save"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7464,7 +8647,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.save_as"),
+                        Self::command_label("file.save-as"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7473,7 +8656,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.save_all"),
+                        Self::command_label("file.save-all"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7482,17 +8665,26 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.reload"),
+                        Self::command_label("file.reload"),
                         !has_doc || (active_partial && !active_huge),
                         None,
                         |this, window, cx| {
                             this.reload_active(window, cx);
                         },
                     ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.local-history"),
+                        !has_doc || active_huge || active_partial,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.local-history", window, cx);
+                        },
+                    ))
                     .separator()
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.close"),
+                        Self::command_label("file.close"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7501,17 +8693,26 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.close_all"),
+                        Self::command_label("file.close-all"),
                         !has_doc,
                         None,
                         |this, window, cx| {
                             this.request_close_all(window, cx);
                         },
                     ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("tabs.reopen-closed"),
+                        closed_tab_count == 0,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("tabs.reopen-closed", window, cx);
+                        },
+                    ))
                     .separator()
                     .item(Self::menu_item(
                         &weak_file,
-                        tr("menu.file.exit"),
+                        Self::command_label("file.exit"),
                         false,
                         None,
                         |this, window, cx| {
@@ -7529,7 +8730,7 @@ impl LubanApp {
                 let mut menu = menu
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.undo"),
+                        Self::command_label("edit.undo"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7538,7 +8739,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.redo"),
+                        Self::command_label("edit.redo"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7548,7 +8749,7 @@ impl LubanApp {
                     .separator()
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.cut"),
+                        Self::command_label("edit.cut"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7557,7 +8758,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.copy"),
+                        Self::command_label("edit.copy"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7566,7 +8767,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.paste"),
+                        Self::command_label("edit.paste"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7575,7 +8776,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.select_all"),
+                        Self::command_label("edit.select-all"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7585,7 +8786,7 @@ impl LubanApp {
                     .separator()
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.indent"),
+                        Self::command_label("edit.indent"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7594,7 +8795,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.outdent"),
+                        Self::command_label("edit.outdent"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7603,7 +8804,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.duplicate_line"),
+                        Self::command_label("edit.duplicate-line"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7612,7 +8813,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.delete_line"),
+                        Self::command_label("edit.delete-line"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7621,7 +8822,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.toggle_comment"),
+                        Self::command_label("edit.toggle-comment"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7630,7 +8831,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.trim_whitespace"),
+                        Self::command_label("edit.trim-whitespace"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7641,7 +8842,7 @@ impl LubanApp {
                 menu = menu
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.uppercase"),
+                        Self::command_label("edit.uppercase"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7650,7 +8851,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.lowercase"),
+                        Self::command_label("edit.lowercase"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7659,7 +8860,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.title_case"),
+                        Self::command_label("edit.title-case"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7669,7 +8870,7 @@ impl LubanApp {
                     .separator()
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.sort_asc"),
+                        Self::command_label("edit.sort-asc"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7678,7 +8879,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_edit,
-                        tr("menu.edit.sort_desc"),
+                        Self::command_label("edit.sort-desc"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7717,7 +8918,7 @@ impl LubanApp {
             .dropdown_menu(move |menu, _window, _cx| {
                 menu.item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.find"),
+                    Self::command_label("search.find"),
                     !has_doc,
                     None,
                     |this, window, cx| {
@@ -7726,7 +8927,7 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.replace"),
+                    Self::command_label("search.replace"),
                     !has_doc,
                     None,
                     |this, window, cx| {
@@ -7735,7 +8936,7 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.find_next"),
+                    Self::command_label("search.find-next"),
                     !has_doc,
                     None,
                     |this, window, cx| {
@@ -7744,7 +8945,7 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.find_previous"),
+                    Self::command_label("search.find-previous"),
                     !has_doc,
                     None,
                     |this, window, cx| {
@@ -7754,7 +8955,7 @@ impl LubanApp {
                 .separator()
                 .item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.go_to_line"),
+                    Self::command_label("search.go-to-line"),
                     !has_doc,
                     None,
                     |this, window, cx| {
@@ -7763,7 +8964,7 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.find_in_files"),
+                    Self::command_label("search.find-in-files"),
                     false,
                     None,
                     |this, window, cx| {
@@ -7772,7 +8973,7 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_search,
-                    tr("menu.search.clear_highlights"),
+                    Self::command_label("search.clear-highlights"),
                     false,
                     None,
                     |this, _, cx| {
@@ -7790,7 +8991,7 @@ impl LubanApp {
                 let mut menu = menu
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.word_wrap"),
+                        Self::command_label("view.word-wrap"),
                         false,
                         Some(settings.word_wrap),
                         |this, window, cx| {
@@ -7800,7 +9001,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.line_numbers"),
+                        Self::command_label("view.line-numbers"),
                         false,
                         Some(settings.show_line_numbers),
                         |this, window, cx| {
@@ -7810,7 +9011,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.toolbar"),
+                        Self::command_label("view.toolbar"),
                         false,
                         Some(settings.show_toolbar),
                         |this, _window, cx| {
@@ -7821,7 +9022,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.status_bar"),
+                        Self::command_label("view.status-bar"),
                         false,
                         Some(settings.show_status_bar),
                         |this, _window, cx| {
@@ -7832,7 +9033,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.explorer"),
+                        Self::command_label("view.explorer"),
                         false,
                         Some(settings.show_file_explorer),
                         |this, _window, cx| {
@@ -7843,7 +9044,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.large_file_controller"),
+                        Self::command_label("view.large-file-controller"),
                         !has_doc,
                         Some(large_file_open),
                         |this, window, cx| {
@@ -7853,21 +9054,21 @@ impl LubanApp {
                     .separator()
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.zoom_in"),
+                        Self::command_label("view.zoom-in"),
                         !has_doc,
                         None,
                         |this, _, cx| this.zoom(1.0, cx),
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.zoom_out"),
+                        Self::command_label("view.zoom-out"),
                         !has_doc,
                         None,
                         |this, _, cx| this.zoom(-1.0, cx),
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.zoom_reset"),
+                        Self::command_label("view.zoom-reset"),
                         !has_doc,
                         None,
                         |this, _, cx| this.reset_zoom(cx),
@@ -7876,7 +9077,7 @@ impl LubanApp {
                 menu = menu
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.light_theme"),
+                        Self::command_label("view.theme-light"),
                         false,
                         Some(settings.theme == ThemeChoice::Light),
                         |this, window, cx| {
@@ -7886,7 +9087,7 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.dark_theme"),
+                        Self::command_label("view.theme-dark"),
                         false,
                         Some(settings.theme == ThemeChoice::Dark),
                         |this, window, cx| {
@@ -7894,10 +9095,49 @@ impl LubanApp {
                             this.apply_settings(window, cx);
                         },
                     ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.theme-system"),
+                        false,
+                        Some(settings.theme == ThemeChoice::System),
+                        |this, window, cx| {
+                            this.settings.theme = ThemeChoice::System;
+                            this.apply_settings(window, cx);
+                        },
+                    ))
                     .separator()
                     .item(Self::menu_item(
                         &weak_view,
-                        tr("menu.view.choose_language"),
+                        Self::command_label("palette.commands"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("palette.commands", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("palette.quick-open"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("palette.quick-open", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.fullscreen"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("view.fullscreen", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.choose-language"),
                         !has_doc,
                         None,
                         |this, window, cx| {
@@ -7928,7 +9168,7 @@ impl LubanApp {
             .dropdown_menu(move |menu, _window, _cx| {
                 menu.item(Self::menu_item(
                     &weak_settings,
-                    tr("menu.settings.preferences"),
+                    Self::command_label("settings.preferences"),
                     false,
                     None,
                     |this, window, cx| this.open_preferences(window, cx),
@@ -7942,7 +9182,7 @@ impl LubanApp {
             .dropdown_menu(move |menu, _window, _cx| {
                 menu.item(Self::menu_item(
                     &weak_help,
-                    tr("menu.help.shortcuts"),
+                    Self::command_label("help.shortcuts"),
                     false,
                     None,
                     |this, _, cx| {
@@ -7952,7 +9192,16 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_help,
-                    tr("menu.help.about"),
+                    Self::command_label("help.open-log-dir"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("help.open-log-dir", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_help,
+                    Self::command_label("help.about"),
                     false,
                     None,
                     |this, _, cx| {
@@ -8150,9 +9399,9 @@ impl LubanApp {
         let wrap_enabled =
             self.settings.word_wrap && !self.active_tab().is_some_and(|tab| tab.large_file);
         let (theme_icon, theme_label) = if self.settings.theme == ThemeChoice::Light {
-            (IconName::Moon, tr("menu.view.dark_theme"))
+            (IconName::Moon, Self::command_label("view.theme-dark"))
         } else {
-            (IconName::Sun, tr("menu.view.light_theme"))
+            (IconName::Sun, Self::command_label("view.theme-light"))
         };
 
         let mut file_group = ToolbarGroup::new("tb-file");
@@ -8178,60 +9427,76 @@ impl LubanApp {
             file_group,
             "tb-new",
             IconName::FilePlus,
-            tr("toolbar.new"),
-            |this: &mut Self, window, cx| this.new_file(window, cx)
+            Self::command_label("file.new"),
+            |this: &mut Self, window, cx| {
+                this.run_command("file.new", window, cx);
+            }
         );
         tool!(
             file_group,
             "tb-open",
             IconName::FolderOpen,
-            tr("toolbar.open"),
-            |this: &mut Self, window, cx| this.open_file_dialog(window, cx)
+            Self::command_label("file.open"),
+            |this: &mut Self, window, cx| {
+                this.run_command("file.open", window, cx);
+            }
         );
         tool!(
             file_group,
             "tb-save",
             IconName::Save,
-            tr("toolbar.save"),
-            |this: &mut Self, window, cx| this.save_active(window, cx)
+            Self::command_label("file.save"),
+            |this: &mut Self, window, cx| {
+                this.run_command("file.save", window, cx);
+            }
         );
         tool!(
             history_group,
             "tb-undo",
             IconName::Undo,
-            tr("toolbar.undo"),
-            |this: &mut Self, window, cx| this.editor_action(Box::new(Undo), window, cx)
+            Self::command_label("edit.undo"),
+            |this: &mut Self, window, cx| {
+                this.run_command("edit.undo", window, cx);
+            }
         );
         tool!(
             history_group,
             "tb-redo",
             IconName::Redo,
-            tr("toolbar.redo"),
-            |this: &mut Self, window, cx| this.editor_action(Box::new(Redo), window, cx)
+            Self::command_label("edit.redo"),
+            |this: &mut Self, window, cx| {
+                this.run_command("edit.redo", window, cx);
+            }
         );
         tool!(
             search_group,
             "tb-find",
             IconName::Search,
-            tr("toolbar.find"),
-            |this: &mut Self, window, cx| this.open_find(false, window, cx)
+            Self::command_label("search.find"),
+            |this: &mut Self, window, cx| {
+                this.run_command("search.find", window, cx);
+            }
         );
         tool!(
             search_group,
             "tb-replace",
             IconName::Replace,
-            tr("toolbar.replace"),
-            |this: &mut Self, window, cx| this.open_find(true, window, cx)
+            Self::command_label("search.replace"),
+            |this: &mut Self, window, cx| {
+                this.run_command("search.replace", window, cx);
+            }
         );
         tool!(
             search_group,
             "tb-findfiles",
             IconName::FolderSearch,
-            tr("toolbar.find_in_files"),
-            |this: &mut Self, window, cx| this.open_find_in_files(window, cx)
+            Self::command_label("search.find-in-files"),
+            |this: &mut Self, window, cx| {
+                this.run_command("search.find-in-files", window, cx);
+            }
         );
         let weak_wrap = weak.clone();
-        let wrap_label = tr("toolbar.wrap");
+        let wrap_label = Self::command_label("view.word-wrap");
         view_group = view_group.child(
             Button::new("tb-wrap")
                 .icon(IconName::TextWrap)
@@ -8241,8 +9506,7 @@ impl LubanApp {
                 .accessibility_label(wrap_label)
                 .on_click(move |_, window, cx| {
                     let _ = weak_wrap.update(cx, |this, cx| {
-                        this.settings.word_wrap = !this.settings.word_wrap;
-                        this.apply_settings(window, cx);
+                        this.run_command("view.word-wrap", window, cx);
                     });
                 }),
         );
@@ -8252,12 +9516,7 @@ impl LubanApp {
             theme_icon,
             theme_label,
             |this: &mut Self, window, cx| {
-                this.settings.theme = if this.settings.theme == ThemeChoice::Dark {
-                    ThemeChoice::Light
-                } else {
-                    ThemeChoice::Dark
-                };
-                this.apply_settings(window, cx);
+                this.run_command("view.toggle-theme", window, cx);
             }
         );
 
@@ -8296,9 +9555,11 @@ impl LubanApp {
             .border_color(cx.theme().colors.border)
             .bg(cx.theme().colors.background);
         let mut tab_elements = Vec::new();
+        let tab_count = self.tabs.len();
         for (index, tab) in self.tabs.iter().enumerate() {
             let active = index == self.active;
             let id = tab.id;
+            let has_path = tab.doc.path.is_some();
             let label = if tab.doc.is_modified() {
                 format!("● {}", tab.doc.display_name())
             } else {
@@ -8306,14 +9567,25 @@ impl LubanApp {
             };
             let weak_click = weak.clone();
             let weak_close = weak.clone();
+            let weak_drop = weak.clone();
+            let weak_drag_move = weak.clone();
+            let weak_menu_close = weak.clone();
+            let weak_menu_others = weak.clone();
+            let weak_menu_right = weak.clone();
+            let weak_menu_copy = weak.clone();
+            let weak_menu_reveal = weak.clone();
+            let weak_menu_reload = weak.clone();
+            let drag_label: SharedString = label.clone().into();
             let interaction_id = ("tab", id);
-            let mut tab_el = div()
+            let tab_el = div()
                 .id(interaction_id)
                 .flex()
                 .items_center()
                 .gap_2()
                 .px_3()
+                .w(px(TAB_WIDTH))
                 .h_full()
+                .overflow_hidden()
                 .border_r_1()
                 .border_color(cx.theme().colors.border)
                 .cursor_pointer()
@@ -8344,15 +9616,122 @@ impl LubanApp {
                             });
                         }),
                 );
-            tab_el = tab_el.on_click(move |_, window, cx| {
-                let _ = weak_click.update(cx, |this, cx| {
-                    this.activate_tab_index(index, window, cx);
-                });
-            });
+            let tab_el =
+                tab_el
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_click.update(cx, |this, cx| {
+                            this.activate_tab_index(index, window, cx);
+                        });
+                    })
+                    .on_drag(
+                        TabDrag {
+                            id,
+                            label: drag_label,
+                        },
+                        |drag, _, _, cx| {
+                            cx.new(|_| TabDragPreview {
+                                label: drag.label.clone(),
+                            })
+                        },
+                    )
+                    .on_drag_move::<TabDrag>(move |event, window, cx| {
+                        if event.drag(cx).id != id {
+                            return;
+                        }
+                        let x = event.event.position.x;
+                        let left = event.bounds.origin.x;
+                        let right = left + event.bounds.size.width;
+                        let _ = weak_drag_move.update(cx, |this, cx| {
+                            let Some(current) = this.tab_index_by_id(id) else {
+                                return;
+                            };
+                            if x > right {
+                                this.move_tab_by_id(id, current + 2, window, cx);
+                            } else if x < left && current > 0 {
+                                this.move_tab_by_id(id, current - 1, window, cx);
+                            }
+                        });
+                    })
+                    .on_drop(move |drag: &TabDrag, window, cx| {
+                        let _ = weak_drop.update(cx, |this, cx| {
+                            this.move_tab_by_id(drag.id, index, window, cx);
+                        });
+                    })
+                    .context_menu(move |menu, _, _| {
+                        let weak_close = weak_menu_close.clone();
+                        let weak_others = weak_menu_others.clone();
+                        let weak_right = weak_menu_right.clone();
+                        let weak_copy = weak_menu_copy.clone();
+                        let weak_reveal = weak_menu_reveal.clone();
+                        let weak_reload = weak_menu_reload.clone();
+                        let mut menu = menu
+                            .item(
+                                PopupMenuItem::new(Self::command_label("file.close")).on_click(
+                                    move |_, window, cx| {
+                                        let _ = weak_close.update(cx, |this, cx| {
+                                            this.close_tab_by_id(id, window, cx);
+                                        });
+                                    },
+                                ),
+                            )
+                            .item(
+                                PopupMenuItem::new(Self::command_label("tabs.close-others"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_others.update(cx, |this, cx| {
+                                            this.activate_tab_index(index, window, cx);
+                                            this.request_trim_tabs(false, window, cx);
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(Self::command_label("tabs.close-right"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_right.update(cx, |this, cx| {
+                                            this.activate_tab_index(index, window, cx);
+                                            this.request_trim_tabs(true, window, cx);
+                                        });
+                                    }),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(Self::command_label("tabs.copy-path"))
+                                    .disabled(!has_path)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_copy.update(cx, |this, cx| {
+                                            this.activate_tab_index(index, window, cx);
+                                            this.copy_active_path(cx);
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(Self::command_label("tabs.reveal"))
+                                    .disabled(!has_path)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_reveal.update(cx, |this, cx| {
+                                            this.activate_tab_index(index, window, cx);
+                                            this.reveal_active_in_file_manager(cx);
+                                        });
+                                    }),
+                            );
+                        if has_path {
+                            menu = menu.item(
+                                PopupMenuItem::new(Self::command_label("file.reload")).on_click(
+                                    move |_, window, cx| {
+                                        let _ = weak_reload.update(cx, |this, cx| {
+                                            this.activate_tab_index(index, window, cx);
+                                            this.reload_active(window, cx);
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    });
             tab_elements.push(tab_el.into_any_element());
         }
         tabs_row = tabs_row.children(tab_elements);
         let weak_new = weak.clone();
+        let weak_drop_end = weak.clone();
         tabs_row = tabs_row.child(
             div()
                 .id("tab-new")
@@ -8366,12 +9745,42 @@ impl LubanApp {
                 .child("+")
                 .on_click(move |_, window, cx| {
                     let _ = weak_new.update(cx, |this, cx| this.new_file(window, cx));
+                })
+                .on_drop(move |drag: &TabDrag, window, cx| {
+                    let _ = weak_drop_end.update(cx, |this, cx| {
+                        this.move_tab_by_id(drag.id, tab_count, window, cx);
+                    });
                 }),
         );
         tabs_row.into_any_element()
     }
 
-    fn render_status_bar(&self, cx: &gpui_kit::App) -> AnyElement {
+    fn move_tab_by_id(
+        &mut self,
+        dragged_id: u64,
+        target_index: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(from) = self.tab_index_by_id(dragged_id) else {
+            return;
+        };
+        let Some(to) = reorder_index(self.tabs.len(), from, target_index) else {
+            return;
+        };
+        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(active_id) = active_id {
+            if let Some(index) = self.tab_index_by_id(active_id) {
+                self.active = index;
+            }
+        }
+        self.save_session_now();
+        cx.notify();
+    }
+
+    fn render_status_bar(&mut self, cx: &gpui_kit::App) -> AnyElement {
         let (mut line, mut column) = (1, 1);
         let (mut sel_len, mut chars, mut lines) = (0, 0, 0);
         let mut large_file = false;
@@ -8503,6 +9912,51 @@ impl LubanApp {
             tr("status.saved_state")
         };
         let zoom_label = tr_args("status.zoom", &[("percent", zoom.to_string())]);
+        let unit = self.settings.large_file_display_unit;
+        let size_label = match self.active_doc() {
+            Some(doc) if doc.path.is_some() => tr_args(
+                "status.file_size",
+                &[("size", format_bytes(doc.file_size, unit))],
+            ),
+            Some(_) => tr("status.file_size_unavailable"),
+            None => String::new(),
+        };
+        let words = self.active_tab_mut().and_then(|tab| {
+            if tab.large_file || tab.doc.is_huge() || tab.doc.is_partial() || tab.doc.is_non_text()
+            {
+                return None;
+            }
+            let revision = tab.doc.revision();
+            match tab.word_count {
+                Some((cached, count)) if cached == revision => Some(count),
+                _ => {
+                    let count = count_words(&tab.doc.text);
+                    tab.word_count = Some((revision, count));
+                    Some(count)
+                }
+            }
+        });
+        let words_label = match words {
+            Some(count) => tr_args("status.words", &[("count", count.to_string())]),
+            None if self.active_doc().is_some() => tr("status.words_unavailable"),
+            None => String::new(),
+        };
+        let indent_label = if self.settings.use_spaces {
+            tr_args(
+                "status.indent_spaces",
+                &[("size", self.settings.tab_size.to_string())],
+            )
+        } else {
+            tr_args(
+                "status.indent_tab",
+                &[("size", self.settings.tab_size.to_string())],
+            )
+        };
+        let read_only_label = if self.active_doc().is_some_and(|doc| doc.read_only) {
+            tr("status.read_only")
+        } else {
+            String::new()
+        };
 
         div()
             .flex()
@@ -8520,6 +9974,10 @@ impl LubanApp {
                 div().child(selection),
                 div().child(chars_label),
                 div().child(lines_label),
+                div().child(size_label),
+                div().child(words_label),
+                div().child(indent_label),
+                div().child(read_only_label),
                 div().child(if large_file {
                     tr("status.large_file")
                 } else {
@@ -9115,7 +10573,10 @@ impl LubanApp {
         if let Some(request) = self.overwrite_save.take() {
             if matches!(
                 request.then,
-                SaveThen::Exit | SaveThen::CloseAll | SaveThen::NextNormalSave
+                SaveThen::Exit
+                    | SaveThen::CloseAll
+                    | SaveThen::NextNormalSave
+                    | SaveThen::NextTrimSave
             ) {
                 self.abort_pending_saves();
             }
@@ -9189,7 +10650,7 @@ impl LubanApp {
     fn cancel_file_dialog(&mut self, cx: &mut Context<Self>) {
         if let Some(dialog) = self.file_dialog.take() {
             if let FileDialogPurpose::SaveAs {
-                then: SaveThen::Exit | SaveThen::CloseAll,
+                then: SaveThen::Exit | SaveThen::CloseAll | SaveThen::NextTrimSave,
                 ..
             } = dialog.purpose
             {
@@ -9922,6 +11383,370 @@ impl LubanApp {
         self.overlay_card(520.0, None, cx, content)
     }
 
+    fn render_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(overlay) = &self.palette else {
+            return div().into_any_element();
+        };
+        let kind = overlay.kind;
+        let state = overlay.state.clone();
+        let context = self.command_context();
+        let weak_confirm = cx.weak_entity();
+        let weak_cancel = cx.weak_entity();
+        let mut command = Command::new(&state)
+            .bordered(false)
+            .placeholder(match kind {
+                PaletteKind::Commands => tr("command.palette.placeholder"),
+                PaletteKind::QuickOpen => tr("command.quick_open.placeholder"),
+            })
+            .on_confirm(move |index, window, cx| {
+                let _ = weak_confirm.update(cx, |this, cx| {
+                    this.confirm_palette(kind, index, window, cx);
+                });
+            })
+            .on_cancel(move |window, cx| {
+                let _ = weak_cancel.update(cx, |this, cx| this.close_palette(window, cx));
+            });
+        match kind {
+            PaletteKind::Commands => {
+                for (category, specs) in palette::command_groups() {
+                    let category_label = tr(category.label_key());
+                    let items = specs.iter().map(|spec| {
+                        let mut item = CommandItem::new()
+                            .label(tr(spec.label_key))
+                            .keywords([spec.id, category_label.as_str()]);
+                        if !spec.enabled(&context) {
+                            item = item.disabled(true);
+                        }
+                        item
+                    });
+                    command = command.group(
+                        CommandGroup::new()
+                            .label(tr(category.label_key()))
+                            .items(items),
+                    );
+                }
+            }
+            PaletteKind::QuickOpen => {
+                if let Some((tabs, files)) = &self.quick_open_rows {
+                    if !tabs.is_empty() {
+                        command = command.group(
+                            CommandGroup::new()
+                                .label(tr("command.quick_open.tabs"))
+                                .items(tabs.iter().map(|(_, label, detail)| {
+                                    CommandItem::new()
+                                        .label(label.clone())
+                                        .keywords([detail.clone()])
+                                })),
+                        );
+                    }
+                    if !files.is_empty() {
+                        command = command.group(
+                            CommandGroup::new()
+                                .label(tr("command.quick_open.recent"))
+                                .items(files.iter().map(|(_, label, detail)| {
+                                    CommandItem::new()
+                                        .label(label.clone())
+                                        .keywords([detail.clone()])
+                                })),
+                        );
+                    }
+                }
+            }
+        }
+        self.overlay_card(640.0, Some(440.0), cx, command.into_any_element())
+    }
+
+    fn render_history_dialog(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(dialog) = &self.history_dialog else {
+            return div().into_any_element();
+        };
+        let name = dialog
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dialog.path.display().to_string());
+        let entries = dialog.entries.clone();
+        let empty = entries.is_empty();
+        let error = dialog.error.clone();
+        let has_error = error.is_some();
+        let weak_clear = cx.weak_entity();
+        let weak_close = cx.weak_entity();
+        let unit = self.settings.large_file_display_unit;
+        let rows = entries.into_iter().map(|entry| {
+            let weak_restore = cx.weak_entity();
+            let time = logging::format_timestamp(entry.taken_at);
+            let size = format_bytes(entry.size, unit);
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(cx.theme().colors.border)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_sm().child(time))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(size),
+                        ),
+                )
+                .child(
+                    Button::new(format!("history-restore:{}", entry.path.display()))
+                        .label(tr("history.restore"))
+                        .compact()
+                        .on_click(move |_, window, cx| {
+                            let entry = entry.clone();
+                            let _ = weak_restore.update(cx, |this, cx| {
+                                this.restore_history_entry(entry, window, cx);
+                            });
+                        }),
+                )
+                .into_any_element()
+        });
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr_args("history.title", &[("name", name)])),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("history-clear")
+                                    .label(tr("history.clear"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_clear
+                                            .update(cx, |this, cx| this.clear_local_history(cx));
+                                    }),
+                            )
+                            .child(
+                                Button::new("history-close")
+                                    .label(tr("common.close"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_close.update(cx, |this, cx| {
+                                            this.history_dialog = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .when(empty && !has_error, |this| {
+                this.child(
+                    div()
+                        .p_4()
+                        .text_sm()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(tr("history.empty")),
+                )
+            })
+            .child(
+                div()
+                    .id("history-entries")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element();
+        self.overlay_card(560.0, Some(440.0), cx, content)
+    }
+
+    fn render_shortcut_editor(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(editor) = &self.shortcut_editor else {
+            return div().into_any_element();
+        };
+        let waiting = editor.waiting_for.clone();
+        let error = editor.error.clone();
+        let conflicts = commands::conflicts(&self.settings.keybindings);
+        let overrides = self.settings.keybindings.clone();
+        let keymap = &self.keymap;
+        let rows: Vec<_> = commands::COMMANDS
+            .iter()
+            .map(|spec| {
+                (
+                    spec.id,
+                    tr(spec.label_key),
+                    keymap.binding_text(spec.id).unwrap_or("—").to_string(),
+                    overrides.get(spec.id).cloned(),
+                )
+            })
+            .collect();
+        let weak_all = cx.weak_entity();
+        let weak_close = cx.weak_entity();
+        let mut list = Vec::new();
+        for (id, label, binding, overridden) in rows {
+            let weak_edit = cx.weak_entity();
+            let weak_reset = cx.weak_entity();
+            let is_waiting = waiting.as_deref() == Some(id);
+            let mut edit = Button::new(format!("shortcut-edit:{id}"))
+                .label(if is_waiting {
+                    tr("shortcuts.press_key")
+                } else {
+                    tr("shortcuts.change")
+                })
+                .compact();
+            if is_waiting {
+                edit = edit.primary();
+            }
+            list.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors.border)
+                    .child(div().flex_1().text_sm().child(label))
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .text_sm()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(binding),
+                    )
+                    .child(edit.on_click(move |_, _, cx| {
+                        let _ = weak_edit.update(cx, |this, cx| {
+                            if let Some(editor) = this.shortcut_editor.as_mut() {
+                                editor.error = None;
+                                editor.waiting_for = Some(id.to_string());
+                            }
+                            cx.notify();
+                        });
+                    }))
+                    .when(overridden.is_some(), |this| {
+                        this.child(
+                            Button::new(format!("shortcut-reset:{id}"))
+                                .label(tr("shortcuts.reset"))
+                                .compact()
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak_reset.update(cx, |this, cx| {
+                                        this.reset_shortcut(id, window, cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr("shortcuts.edit_title")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("shortcuts-reset-all")
+                                    .label(tr("shortcuts.reset_all"))
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_all.update(cx, |this, cx| {
+                                            this.reset_all_shortcuts(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("shortcuts-editor-close")
+                                    .label(tr("common.close"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_close.update(cx, |this, cx| {
+                                            this.shortcut_editor = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .when(!conflicts.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(tr_args(
+                            "shortcuts.conflicts",
+                            &[("count", conflicts.len().to_string())],
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .id("shortcut-editor-rows")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(list),
+            )
+            .into_any_element();
+        self.overlay_card(680.0, Some(560.0), cx, content)
+    }
+
     fn render_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut overlays = Vec::new();
         if self.find_in_files.open {
@@ -9929,6 +11754,15 @@ impl LubanApp {
         }
         if self.preferences.open {
             overlays.push(self.render_preferences(window, cx));
+        }
+        if self.palette.is_some() {
+            overlays.push(self.render_palette(window, cx));
+        }
+        if self.history_dialog.is_some() {
+            overlays.push(self.render_history_dialog(window, cx));
+        }
+        if self.shortcut_editor.is_some() {
+            overlays.push(self.render_shortcut_editor(window, cx));
         }
         if self.confirm.is_some() {
             overlays.push(self.render_confirm(window, cx));
@@ -10001,12 +11835,16 @@ impl LubanApp {
                 ("confirm.overwrite_yes", "common.reload")
             }
             CloseIntent::ReloadTab(_) => ("confirm.reload_save", "confirm.reload_discard"),
+            CloseIntent::RestoreHistory => ("common.restore", "common.cancel"),
+            CloseIntent::TrimTabs => ("confirm.save_close", "confirm.discard"),
             _ if exit => ("confirm.save_exit", "confirm.discard_exit"),
             _ => ("confirm.save_close", "confirm.discard"),
         };
         let discard_is_danger = !matches!(
             confirm.intent,
-            CloseIntent::OverwriteExternal(_) | CloseIntent::SaveConflict(_)
+            CloseIntent::OverwriteExternal(_)
+                | CloseIntent::SaveConflict(_)
+                | CloseIntent::RestoreHistory
         );
         let weak_save = cx.weak_entity();
         let weak_discard = cx.weak_entity();
@@ -10444,24 +12282,18 @@ impl LubanApp {
 
     fn render_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
-        let rows = [
-            (tr("shortcuts.new_open_save"), "Ctrl+N / Ctrl+O / Ctrl+S"),
-            (tr("shortcuts.save_as_all"), "Ctrl+Shift+S"),
-            (tr("shortcuts.close"), "Ctrl+W / Ctrl+Shift+W"),
-            (tr("shortcuts.find_replace"), "Ctrl+F / Ctrl+H"),
-            (tr("shortcuts.find_next_prev"), "F3 / Shift+F3"),
-            (tr("shortcuts.find_in_files"), "Ctrl+Shift+F"),
-            (tr("shortcuts.go_to_line"), "Ctrl+G"),
-            (tr("shortcuts.undo_redo"), "Ctrl+Z / Ctrl+Shift+Z"),
-            (
-                tr("shortcuts.duplicate_delete_line"),
-                "Ctrl+D / Ctrl+Shift+K",
-            ),
-            (tr("shortcuts.toggle_comment"), "Ctrl+/"),
-            (tr("shortcuts.next_prev_tab"), "Ctrl+Tab / Ctrl+Shift+Tab"),
-            (tr("shortcuts.zoom"), "Ctrl++ / Ctrl+- / Ctrl+0"),
-            (tr("shortcuts.quit"), "Ctrl+Q"),
-        ];
+        let weak_edit = cx.weak_entity();
+        let groups = palette::command_groups();
+        let sections = groups.into_iter().map(|(category, specs)| {
+            let rows: Vec<_> = specs
+                .iter()
+                .filter_map(|spec| {
+                    let binding = self.keymap.binding_text(spec.id)?;
+                    Some((tr(spec.label_key), binding.to_string()))
+                })
+                .collect();
+            (tr(category.label_key()), rows)
+        });
         let content = div()
             .flex()
             .flex_col()
@@ -10469,43 +12301,85 @@ impl LubanApp {
             .p_5()
             .child(
                 div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(tr("shortcuts.title")),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr("shortcuts.title")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("shortcuts-edit")
+                                    .label(tr("shortcuts.customize"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_edit.update(cx, |this, cx| {
+                                            this.open_shortcut_editor(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("shortcuts-close")
+                                    .label(tr("common.close"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.shortcuts_open = false;
+                                            this.focus_editor = true;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    ),
             )
             .child(
                 div()
+                    .id("shortcut-help")
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .children(rows.map(|(action, shortcut)| {
-                        div()
-                            .flex()
-                            .justify_between()
-                            .text_sm()
-                            .child(action)
-                            .child(
-                                div()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(shortcut),
-                            )
-                    })),
-            )
-            .child(
-                div().flex().justify_end().child(
-                    Button::new("shortcuts-close")
-                        .label(tr("common.close"))
-                        .on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.shortcuts_open = false;
-                                cx.notify();
-                            });
-                        }),
-                ),
+                    .gap_2()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(sections.filter(|(_, rows)| !rows.is_empty()).map(
+                        |(category, rows)| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(category),
+                                )
+                                .children(rows.into_iter().map(|(label, shortcut)| {
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .gap_4()
+                                        .text_sm()
+                                        .child(label)
+                                        .child(
+                                            div()
+                                                .text_color(cx.theme().colors.muted_foreground)
+                                                .child(shortcut),
+                                        )
+                                }))
+                        },
+                    )),
             )
             .into_any_element();
         let _ = window;
-        self.overlay_card(520.0, None, cx, content)
+        self.overlay_card(520.0, Some(560.0), cx, content)
     }
 
     fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10532,6 +12406,12 @@ impl LubanApp {
         let weak_lang_system = cx.weak_entity();
         let weak_lang_en = cx.weak_entity();
         let weak_lang_zh = cx.weak_entity();
+        let weak_theme_system = cx.weak_entity();
+        let weak_days_down = cx.weak_entity();
+        let weak_days_up = cx.weak_entity();
+        let weak_mb_down = cx.weak_entity();
+        let weak_mb_up = cx.weak_entity();
+        let weak_shortcuts = cx.weak_entity();
 
         let mut language_system = Button::new("prefs-lang-system")
             .label(tr("prefs.language_system"))
@@ -10661,7 +12541,17 @@ impl LubanApp {
                                 this.apply_settings(window, cx);
                             });
                         },
-                    )),
+                    ))
+                    .child(
+                        Button::new("prefs-system")
+                            .label(tr("prefs.system_theme"))
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_theme_system.update(cx, |this, cx| {
+                                    this.settings.theme = ThemeChoice::System;
+                                    this.apply_settings(window, cx);
+                                });
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -10845,6 +12735,126 @@ impl LubanApp {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(tr("prefs.local_history")),
+                    )
+                    .child(toggle_row(
+                        tr("prefs.local_history_enabled"),
+                        settings.local_history_enabled,
+                        "prefs-history-enabled",
+                        weak.clone(),
+                        |this, checked, window, cx| {
+                            this.settings.local_history_enabled = checked;
+                            this.apply_settings(window, cx);
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .w(px(140.))
+                                    .text_sm()
+                                    .child(tr("prefs.local_history_days")),
+                            )
+                            .child(
+                                Button::new("prefs-history-days-down")
+                                    .label("−")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_days_down.update(cx, |this, cx| {
+                                            this.settings.local_history_days = this
+                                                .settings
+                                                .local_history_days
+                                                .saturating_sub(1)
+                                                .max(1);
+                                            this.apply_settings(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(settings.local_history_days.to_string()),
+                            )
+                            .child(
+                                Button::new("prefs-history-days-up")
+                                    .label("+")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_days_up.update(cx, |this, cx| {
+                                            this.settings.local_history_days =
+                                                (this.settings.local_history_days + 1).min(3650);
+                                            this.apply_settings(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .w(px(140.))
+                                    .text_sm()
+                                    .child(tr("prefs.local_history_size")),
+                            )
+                            .child(
+                                Button::new("prefs-history-mb-down")
+                                    .label("−")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_mb_down.update(cx, |this, cx| {
+                                            this.settings.local_history_max_mb = this
+                                                .settings
+                                                .local_history_max_mb
+                                                .saturating_sub(1)
+                                                .max(1);
+                                            this.apply_settings(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(settings.local_history_max_mb.to_string()),
+                            )
+                            .child(
+                                Button::new("prefs-history-mb-up")
+                                    .label("+")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_mb_up.update(cx, |this, cx| {
+                                            this.settings.local_history_max_mb =
+                                                (this.settings.local_history_max_mb + 1).min(4096);
+                                            this.apply_settings(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Button::new("prefs-shortcuts")
+                            .label(tr("shortcuts.customize"))
+                            .compact()
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_shortcuts.update(cx, |this, cx| {
+                                    this.open_shortcut_editor(cx);
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
                     .text_xs()
                     .text_color(cx.theme().colors.muted_foreground)
                     .child(tr("prefs.footer")),
@@ -11025,6 +13035,37 @@ fn client_decorated_frame(root: AnyElement, border: Hsla, maximized: bool) -> An
 }
 
 #[cfg(test)]
+mod tab_ops_tests {
+    use super::{count_words, reorder_index, trim_queue};
+
+    #[test]
+    fn reorder_moves_before_the_target_and_ignores_no_ops() {
+        assert_eq!(reorder_index(4, 0, 2), Some(1));
+        assert_eq!(reorder_index(4, 3, 0), Some(0));
+        assert_eq!(reorder_index(4, 1, 4), Some(3));
+        assert_eq!(reorder_index(4, 1, 2), None);
+        assert_eq!(reorder_index(4, 1, 1), None);
+        assert_eq!(reorder_index(4, 4, 2), None);
+    }
+
+    #[test]
+    fn trim_targets_skip_the_kept_tab() {
+        assert_eq!(trim_queue(4, 1, false), vec![0, 2, 3]);
+        assert_eq!(trim_queue(4, 1, true), vec![2, 3]);
+        assert_eq!(trim_queue(4, 3, true), Vec::<usize>::new());
+        assert_eq!(trim_queue(1, 0, false), Vec::<usize>::new());
+        assert_eq!(trim_queue(3, 3, false), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn words_use_unicode_whitespace() {
+        assert_eq!(count_words("alpha beta\ngamma\t"), 3);
+        assert_eq!(count_words("   "), 0);
+        assert_eq!(count_words("你好 世界"), 2);
+    }
+}
+
+#[cfg(test)]
 mod menu_label_tests {
     use super::{char_columns, truncate_middle};
 
@@ -11073,6 +13114,33 @@ mod restore_tests {
     use super::RestoreSpec;
     use luban_core::encoding::TextEncoding;
     use luban_core::eol::Eol;
+
+    #[test]
+    fn partial_range_restore_stays_partial_and_refuses_source_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.txt");
+        std::fs::write(&path, b"AAAAA\nBBBBB\nCCCCC\n").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let mut doc =
+            luban_core::Document::open_range(&path, 0, 6, 1024, &cancel, &progress).unwrap();
+        assert!(doc.is_partial());
+        assert!(doc.save().is_err());
+        assert_eq!(std::fs::read(&path).unwrap().len(), 18);
+    }
+
+    #[test]
+    fn recreated_non_text_buffer_writes_raw_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        let mut doc = luban_core::Document::new_untitled("bin.dat");
+        doc.mark_non_text();
+        doc.attach_text("x\r\ny".to_string());
+        doc.encoding = TextEncoding::Windows1252;
+        doc.eol = Eol::CrLf;
+        doc.save_as(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"x\r\ny");
+    }
 
     #[test]
     fn non_text_restore_keeps_raw_text() {

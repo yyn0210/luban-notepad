@@ -381,6 +381,10 @@ pub enum CloseIntent {
     SaveConflict(u64),
     /// Reload a tab after discarding or saving its edits.
     ReloadTab(u64),
+    /// Replace the buffer with a local-history snapshot.
+    RestoreHistory,
+    /// Save/discard every tab targeted by close-other/close-right.
+    TrimTabs,
 }
 
 pub struct ConfirmState {
@@ -411,6 +415,8 @@ pub enum SaveThen {
     NextNormalSave,
     /// Reload the tab after saving it.
     ReloadTab(u64),
+    /// Continue saving the targets of a close-other/close-right plan.
+    NextTrimSave,
 }
 
 pub struct SaveAsRequest {
