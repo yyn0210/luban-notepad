@@ -237,39 +237,15 @@ fn cleanup_stale_temps(parent: &Path, target: &Path) {
 
 /// Atomically replace `target` with `temp` (which must be on the same
 /// filesystem).
+///
+/// `std::fs::rename` is used on every platform. On Windows it renames through
+/// `FileRenameInfoEx` with POSIX semantics, which detaches the old file from
+/// the namespace immediately. `MoveFileExW` cannot replace a file that is
+/// still open (even with `FILE_SHARE_DELETE`, the old name stays delete-pending
+/// until the handle closes), and the disk engine keeps the saved document open
+/// for reading its unchanged blocks.
 pub fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-        let from: Vec<u16> = temp
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let to: Vec<u16> = target
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let replaced = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if replaced == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(temp, target)
-    }
+    fs::rename(temp, target)
 }
 
 #[cfg(test)]
@@ -304,6 +280,19 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         assert!(!temp.exists());
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn replaces_a_file_that_is_still_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, "original").unwrap();
+        // The disk engine keeps the saved document open while a snapshot is
+        // written; Windows cannot replace such a file through MoveFileEx.
+        let open = fs::File::open(&path).unwrap();
+        write_atomic(&path, b"replacement").unwrap();
+        drop(open);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }
 
     #[test]

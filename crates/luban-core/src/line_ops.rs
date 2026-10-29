@@ -500,9 +500,12 @@ mod tests {
         // A column past the end leaves that line unchanged.
         let (out, _, _) = split_lines_at("ab\n", 0, 0, 9);
         assert_eq!(out, "ab\n");
-        // Splitting the last line gives the first half a newline.
+        // Splitting the last line gives the first half a newline. The line has
+        // no terminator of its own, so the document falls back to the platform
+        // convention.
+        let native = eol::Eol::native().as_str();
         let (out, _, _) = split_lines_at("abcd", 0, 0, 2);
-        assert_eq!(out, "ab\ncd");
+        assert_eq!(out, format!("ab{native}cd"));
     }
 
     #[test]

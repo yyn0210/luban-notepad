@@ -39,11 +39,62 @@ struct IgnoredSave {
     until: Instant,
 }
 
+/// Paths registered by the caller plus the paths the backend reports for them.
+#[derive(Default)]
+struct TrackedPaths {
+    /// Registered paths. Events are reported with these paths, not with the
+    /// ones the backend uses.
+    paths: HashSet<PathBuf>,
+    /// Backend path -> registered path.
+    ///
+    /// Watchers resolve symbolic links in the watched directory: macOS
+    /// FSEvents canonicalises its watch roots, so a document under `/var`
+    /// arrives as `/private/var` and would never match the registered path.
+    aliases: HashMap<PathBuf, PathBuf>,
+}
+
+impl TrackedPaths {
+    fn replace(&mut self, paths: &[PathBuf]) {
+        if self.paths.len() == paths.len() && paths.iter().all(|path| self.paths.contains(path)) {
+            return;
+        }
+        self.paths.clear();
+        self.aliases.clear();
+        for path in paths {
+            self.paths.insert(path.clone());
+            if let Some(resolved) = resolved_path(path) {
+                if resolved != *path {
+                    self.aliases.insert(resolved, path.clone());
+                }
+            }
+        }
+    }
+
+    fn registered(&self, reported: &Path) -> Option<&PathBuf> {
+        self.paths
+            .get(reported)
+            .or_else(|| self.aliases.get(reported))
+    }
+}
+
+/// The path a notification backend reports for `path`.
+fn resolved_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    // A tracked file may be gone (a pending deletion); its directory still
+    // resolves, so the backend's path can be predicted from it.
+    let name = path.file_name()?;
+    fs::canonicalize(path.parent()?)
+        .ok()
+        .map(|parent| parent.join(name))
+}
+
 /// Directory watcher shared by every open tab.
 pub struct FileWatcher {
     watcher: Option<RecommendedWatcher>,
     watched: HashMap<PathBuf, usize>,
-    tracked: Arc<Mutex<HashSet<PathBuf>>>,
+    tracked: Arc<Mutex<TrackedPaths>>,
     pending: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     ignored: HashMap<PathBuf, IgnoredSave>,
     debounce: Duration,
@@ -69,7 +120,7 @@ impl FileWatcher {
     }
 
     pub fn with_debounce(debounce: Duration) -> Self {
-        let tracked: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tracked: Arc<Mutex<TrackedPaths>> = Arc::new(Mutex::new(TrackedPaths::default()));
         let pending: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let callback_tracked = tracked.clone();
         let callback_pending = pending.clone();
@@ -86,8 +137,8 @@ impl FileWatcher {
                 Err(_) => return,
             };
             for path in event.paths {
-                if tracked.contains(&path) {
-                    pending.insert(path, Instant::now());
+                if let Some(registered) = tracked.registered(&path) {
+                    pending.insert(registered.clone(), Instant::now());
                 }
             }
         })
@@ -109,8 +160,7 @@ impl FileWatcher {
     /// Keep exactly the parent directories of `paths` watched.
     pub fn sync(&mut self, paths: &[PathBuf]) {
         if let Ok(mut tracked) = self.tracked.lock() {
-            tracked.clear();
-            tracked.extend(paths.iter().cloned());
+            tracked.replace(paths);
         }
         let mut desired: HashMap<PathBuf, usize> = HashMap::new();
         for path in paths {
@@ -186,7 +236,7 @@ impl FileWatcher {
         let tracked: HashSet<PathBuf> = self
             .tracked
             .lock()
-            .map(|tracked| tracked.clone())
+            .map(|tracked| tracked.paths.clone())
             .unwrap_or_default();
         let mut events = Vec::new();
         for path in due {
@@ -246,6 +296,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_backend_paths_map_back_to_registered_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("note.txt"), "one").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let registered = link.join("note.txt");
+        let mut tracked = TrackedPaths::default();
+        tracked.replace(std::slice::from_ref(&registered));
+
+        // macOS FSEvents reports the resolved path of the watched directory.
+        let reported = resolved_path(&registered).unwrap();
+        assert_ne!(reported, registered);
+        assert_eq!(tracked.registered(&reported), Some(&registered));
     }
 
     #[test]
