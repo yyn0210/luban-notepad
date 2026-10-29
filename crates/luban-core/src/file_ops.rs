@@ -386,7 +386,7 @@ mod tests {
         assert!(!dir.path().join("a").exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn trash_moves_files_into_the_xdg_trash() {
         let home = tempfile::tempdir().unwrap();
@@ -403,6 +403,20 @@ mod tests {
         assert!(info.contains("[Trash Info]"));
         assert!(info.contains("Path="));
         assert!(info.contains("DeletionDate="));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trash_moves_files_into_the_home_trash() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("old.txt");
+        fs::write(&file, "content").unwrap();
+        trash_path(&file).unwrap();
+        assert!(!file.exists());
+        let trashed = home.path().join(".Trash/old.txt");
+        assert_eq!(fs::read(&trashed).unwrap(), b"content");
     }
 
     #[test]

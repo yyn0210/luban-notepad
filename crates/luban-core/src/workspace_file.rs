@@ -296,13 +296,14 @@ mod tests {
     fn relative_roots_resolve_against_the_workspace_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("w.luban-workspace");
+        let absolute_root = dir.path().join("abs");
         let workspace = WorkspaceFile {
-            roots: vec![PathBuf::from("src"), PathBuf::from("/abs")],
+            roots: vec![PathBuf::from("src"), absolute_root.clone()],
             ..WorkspaceFile::default()
         };
         let roots = workspace.resolved_roots(&path);
         assert_eq!(roots[0], dir.path().join("src"));
-        assert_eq!(roots[1], PathBuf::from("/abs"));
+        assert_eq!(roots[1], absolute_root);
     }
 
     #[test]
