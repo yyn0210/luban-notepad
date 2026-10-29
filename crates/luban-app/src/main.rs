@@ -6,6 +6,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 mod app;
+mod column_editor;
 mod commands;
 mod dialogs;
 mod explorer;
@@ -18,8 +19,10 @@ mod i18n;
 mod icons;
 mod large_file;
 mod logging;
+mod macro_ui;
 mod palette;
 mod preferences;
+mod syntax_theme;
 mod theme;
 mod util;
 

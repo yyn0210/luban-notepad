@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::encoding::TextEncoding;
 use crate::eol::Eol;
 use crate::large_file::SizeUnit;
+use crate::macros::MacroSet;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +19,21 @@ pub enum ThemeChoice {
     Light,
     /// Follow the operating system's light/dark appearance.
     System,
+}
+
+/// Per-language indentation and line-ending defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageSettings {
+    pub tab_size: Option<usize>,
+    pub use_spaces: Option<bool>,
+    pub eol: Option<Eol>,
+}
+
+impl LanguageSettings {
+    pub fn is_empty(&self) -> bool {
+        self.tab_size.is_none() && self.use_spaces.is_none() && self.eol.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,6 +94,21 @@ pub struct Settings {
     /// `+`-separated modifiers and a key name, e.g. `ctrl+shift+p`.
     #[serde(default)]
     pub keybindings: std::collections::BTreeMap<String, String>,
+    /// Recent non-empty find queries, most recent first.
+    #[serde(default)]
+    pub search_history: Vec<String>,
+    /// Recent non-empty replacement texts, most recent first.
+    #[serde(default)]
+    pub replace_history: Vec<String>,
+    /// Command-level macros and their shortcuts.
+    #[serde(default)]
+    pub macros: MacroSet,
+    /// Per-language indentation and line-ending overrides.
+    #[serde(default)]
+    pub language_settings: std::collections::BTreeMap<String, LanguageSettings>,
+    /// Path to an imported `.tmTheme` file. `None` uses a built-in theme.
+    #[serde(default)]
+    pub syntax_theme_path: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -133,6 +164,11 @@ impl Default for Settings {
             local_history_days: 30,
             local_history_max_mb: 200,
             keybindings: std::collections::BTreeMap::new(),
+            search_history: Vec::new(),
+            replace_history: Vec::new(),
+            macros: MacroSet::default(),
+            language_settings: std::collections::BTreeMap::new(),
+            syntax_theme_path: None,
         }
     }
 }
@@ -200,6 +236,25 @@ impl Settings {
         for binding in self.keybindings.values_mut() {
             *binding = binding.trim().to_lowercase();
         }
+        normalize_history(&mut self.search_history);
+        normalize_history(&mut self.replace_history);
+        self.macros.validate();
+        self.language_settings.retain(|name, settings| {
+            if name.trim().is_empty() {
+                return false;
+            }
+            if let Some(size) = settings.tab_size.as_mut() {
+                *size = (*size).clamp(1, 16);
+            }
+            !settings.is_empty()
+        });
+        if self
+            .syntax_theme_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            self.syntax_theme_path = None;
+        }
         if self.syntax_theme.is_empty() {
             self.syntax_theme = "InspiredGitHub".to_string();
         }
@@ -243,6 +298,65 @@ impl Settings {
     pub fn large_file_partial_size_bytes(&self) -> u64 {
         (self.large_file_partial_size as u64).min(self.max_file_size_bytes())
     }
+
+    /// Record a non-empty find query, most recent first, capped at 20.
+    pub fn record_search(&mut self, query: &str) {
+        push_history(&mut self.search_history, query);
+    }
+
+    /// Record a non-empty replacement text, most recent first, capped at 20.
+    pub fn record_replacement(&mut self, replacement: &str) {
+        push_history(&mut self.replace_history, replacement);
+    }
+
+    pub fn language_overrides(&self, language: &str) -> Option<&LanguageSettings> {
+        self.language_settings.get(language)
+    }
+
+    /// Indentation width for a language, falling back to the global setting.
+    pub fn tab_size_for(&self, language: &str) -> usize {
+        self.language_overrides(language)
+            .and_then(|settings| settings.tab_size)
+            .unwrap_or(self.tab_size)
+    }
+
+    pub fn use_spaces_for(&self, language: &str) -> bool {
+        self.language_overrides(language)
+            .and_then(|settings| settings.use_spaces)
+            .unwrap_or(self.use_spaces)
+    }
+
+    /// Line ending for a newly created document in `language`.
+    pub fn eol_for_new_document(&self, language: &str) -> Eol {
+        self.language_overrides(language)
+            .and_then(|settings| settings.eol)
+            .unwrap_or(self.default_eol)
+    }
+}
+
+fn normalize_history(history: &mut Vec<String>) {
+    let mut out: Vec<String> = Vec::new();
+    for entry in history.drain(..) {
+        let entry = entry.trim().to_string();
+        if entry.is_empty() || out.iter().any(|existing| existing == &entry) {
+            continue;
+        }
+        out.push(entry);
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    *history = out;
+}
+
+fn push_history(history: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    history.retain(|entry| entry != value);
+    history.insert(0, value.to_string());
+    history.truncate(20);
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -450,6 +564,68 @@ mod tests {
             Some("ctrl+s")
         );
         assert!(!loaded.keybindings.contains_key("empty"));
+    }
+
+    #[test]
+    fn search_history_dedupes_and_caps() {
+        let mut settings = Settings::default();
+        settings.record_search("  alpha  ");
+        settings.record_search("beta");
+        settings.record_search("alpha");
+        assert_eq!(settings.search_history, ["alpha", "beta"]);
+        for index in 0..30 {
+            settings.record_search(&format!("q{index}"));
+        }
+        assert_eq!(settings.search_history.len(), 20);
+        assert_eq!(settings.search_history[0], "q29");
+    }
+
+    #[test]
+    fn language_overrides_fall_back_and_validate() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.tab_size_for("Python"), settings.tab_size);
+        assert_eq!(
+            settings.eol_for_new_document("Python"),
+            settings.default_eol
+        );
+        settings.language_settings.insert(
+            "Python".to_string(),
+            LanguageSettings {
+                tab_size: Some(99),
+                use_spaces: Some(false),
+                eol: Some(Eol::CrLf),
+            },
+        );
+        settings
+            .language_settings
+            .insert("Empty".to_string(), LanguageSettings::default());
+        settings.validate();
+        assert_eq!(settings.tab_size_for("Python"), 16);
+        assert!(!settings.use_spaces_for("Python"));
+        assert_eq!(settings.eol_for_new_document("Python"), Eol::CrLf);
+        assert!(!settings.language_settings.contains_key("Empty"));
+    }
+
+    #[test]
+    fn macros_and_theme_path_survive_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings
+            .macros
+            .upsert("demo", vec!["edit.duplicate-line".to_string()])
+            .unwrap();
+        settings.syntax_theme_path = Some(PathBuf::from("/tmp/theme.tmTheme"));
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(
+            loaded.macros.find("demo").unwrap().commands,
+            ["edit.duplicate-line"]
+        );
+        assert_eq!(
+            loaded.syntax_theme_path.as_deref(),
+            Some(Path::new("/tmp/theme.tmTheme"))
+        );
     }
 
     #[test]

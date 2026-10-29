@@ -16,18 +16,22 @@ pub enum CommandCategory {
     View,
     Tabs,
     Navigation,
+    Bookmarks,
+    Macros,
     Settings,
     Help,
 }
 
 impl CommandCategory {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::File,
         Self::Edit,
         Self::Search,
         Self::View,
         Self::Tabs,
         Self::Navigation,
+        Self::Bookmarks,
+        Self::Macros,
         Self::Settings,
         Self::Help,
     ];
@@ -40,6 +44,8 @@ impl CommandCategory {
             Self::View => "command.category.view",
             Self::Tabs => "command.category.tabs",
             Self::Navigation => "command.category.navigation",
+            Self::Bookmarks => "command.category.bookmarks",
+            Self::Macros => "command.category.macros",
             Self::Settings => "command.category.settings",
             Self::Help => "command.category.help",
         }
@@ -55,6 +61,7 @@ pub enum CommandWhen {
     CanSave,
     CanUndo,
     CanRedo,
+    CanEditFullText,
 }
 
 /// Registry entry.
@@ -73,6 +80,9 @@ pub struct CommandContext {
     pub can_save: bool,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// The active tab holds complete, editable text (not a disk-engine window,
+    /// range view, reduced large-file view or non-text buffer).
+    pub can_edit_full_text: bool,
 }
 
 impl CommandSpec {
@@ -84,6 +94,7 @@ impl CommandSpec {
             CommandWhen::CanSave => context.can_save,
             CommandWhen::CanUndo => context.can_undo,
             CommandWhen::CanRedo => context.can_redo,
+            CommandWhen::CanEditFullText => context.can_edit_full_text,
         }
     }
 }
@@ -127,6 +138,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         "menu.file.local_history",
         None,
         HasPath
+    ),
+    command!(
+        "file.export-html",
+        File,
+        "menu.file.export_html",
+        None,
+        HasDocument
+    ),
+    command!(
+        "file.export-rtf",
+        File,
+        "menu.file.export_rtf",
+        None,
+        HasDocument
     ),
     command!(
         "file.close",
@@ -245,6 +270,139 @@ pub const COMMANDS: &[CommandSpec] = &[
         HasDocument
     ),
     command!(
+        "edit.sort-ignore-case-asc",
+        Edit,
+        "menu.edit.sort_ignore_case_asc",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.sort-ignore-case-desc",
+        Edit,
+        "menu.edit.sort_ignore_case_desc",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.sort-numeric-asc",
+        Edit,
+        "menu.edit.sort_numeric_asc",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.sort-numeric-desc",
+        Edit,
+        "menu.edit.sort_numeric_desc",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.sort-by-column",
+        Edit,
+        "menu.edit.sort_by_column",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.move-line-up",
+        Edit,
+        "menu.edit.move_line_up",
+        Some("ctrl+shift+up"),
+        HasDocument
+    ),
+    command!(
+        "edit.move-line-down",
+        Edit,
+        "menu.edit.move_line_down",
+        Some("ctrl+shift+down"),
+        HasDocument
+    ),
+    command!(
+        "edit.join-lines",
+        Edit,
+        "menu.edit.join_lines",
+        Some("ctrl+j"),
+        HasDocument
+    ),
+    command!(
+        "edit.split-lines",
+        Edit,
+        "menu.edit.split_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.remove-duplicate-lines",
+        Edit,
+        "menu.edit.remove_duplicate_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.remove-empty-lines",
+        Edit,
+        "menu.edit.remove_empty_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.filter-lines",
+        Edit,
+        "menu.edit.filter_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.column-editor",
+        Edit,
+        "menu.edit.column_editor",
+        Some("alt+c"),
+        HasDocument
+    ),
+    command!(
+        "edit.add-cursor-above",
+        Edit,
+        "menu.edit.add_cursor_above",
+        Some("ctrl+alt+up"),
+        CanEditFullText
+    ),
+    command!(
+        "edit.add-cursor-below",
+        Edit,
+        "menu.edit.add_cursor_below",
+        Some("ctrl+alt+down"),
+        CanEditFullText
+    ),
+    command!(
+        "edit.select-next-occurrence",
+        Edit,
+        "menu.edit.select_next_occurrence",
+        Some("ctrl+shift+d"),
+        CanEditFullText
+    ),
+    command!(
+        "edit.select-all-occurrences",
+        Edit,
+        "menu.edit.select_all_occurrences",
+        Some("ctrl+shift+l"),
+        CanEditFullText
+    ),
+    command!(
+        "edit.unfold-current",
+        Edit,
+        "menu.edit.unfold_current",
+        None,
+        HasDocument
+    ),
+    command!(
+        "edit.unfold-all",
+        Edit,
+        "menu.edit.unfold_all",
+        None,
+        HasDocument
+    ),
+    command!(
         "search.find",
         Search,
         "menu.search.find",
@@ -290,6 +448,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         "search.clear-highlights",
         Search,
         "menu.search.clear_highlights",
+        None,
+        Always
+    ),
+    command!(
+        "search.mark-all",
+        Search,
+        "menu.search.mark_all",
+        None,
+        HasDocument
+    ),
+    command!(
+        "search.clear-history",
+        Search,
+        "menu.search.clear_history",
         None,
         Always
     ),
@@ -410,6 +582,83 @@ pub const COMMANDS: &[CommandSpec] = &[
         "menu.tabs.previous",
         Some("ctrl+shift+tab"),
         HasDocument
+    ),
+    command!(
+        "bookmarks.toggle",
+        Bookmarks,
+        "menu.bookmarks.toggle",
+        Some("ctrl+f2"),
+        HasDocument
+    ),
+    command!(
+        "bookmarks.next",
+        Bookmarks,
+        "menu.bookmarks.next",
+        Some("f2"),
+        HasDocument
+    ),
+    command!(
+        "bookmarks.previous",
+        Bookmarks,
+        "menu.bookmarks.previous",
+        Some("shift+f2"),
+        HasDocument
+    ),
+    command!(
+        "bookmarks.clear",
+        Bookmarks,
+        "menu.bookmarks.clear",
+        Some("ctrl+shift+f2"),
+        HasDocument
+    ),
+    command!(
+        "bookmarks.cut-lines",
+        Bookmarks,
+        "menu.bookmarks.cut_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "bookmarks.copy-lines",
+        Bookmarks,
+        "menu.bookmarks.copy_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "bookmarks.delete-lines",
+        Bookmarks,
+        "menu.bookmarks.delete_lines",
+        None,
+        HasDocument
+    ),
+    command!(
+        "macro.toggle-recording",
+        Macros,
+        "menu.macro.toggle_recording",
+        Some("ctrl+shift+r"),
+        Always
+    ),
+    command!(
+        "macro.play-last",
+        Macros,
+        "menu.macro.play_last",
+        Some("ctrl+shift+m"),
+        Always
+    ),
+    command!(
+        "macro.play-saved",
+        Macros,
+        "menu.macro.play_saved",
+        None,
+        Always
+    ),
+    command!(
+        "macro.save-recording",
+        Macros,
+        "menu.macro.save_recording",
+        None,
+        Always
     ),
     command!(
         "palette.commands",
@@ -776,6 +1025,49 @@ pub fn validate_override(
     Ok(formatted)
 }
 
+/// Parse macro shortcuts into matchable entries, skipping invalid values.
+pub fn macro_keymap(bindings: &BTreeMap<String, String>) -> Vec<(Binding, String)> {
+    let mut out = Vec::new();
+    for (name, text) in bindings {
+        if let Ok(binding) = parse_binding(text) {
+            out.push((binding, name.clone()));
+        }
+    }
+    out
+}
+
+/// Validate a shortcut assigned to a macro.
+///
+/// A macro binding may not use a bare key, may not collide with an effective
+/// command binding, and may not collide with another macro. Default command
+/// bindings that the user suppressed are free for macros.
+pub fn validate_macro_binding(
+    name: &str,
+    text: &str,
+    overrides: &BTreeMap<String, String>,
+    macro_bindings: &BTreeMap<String, String>,
+) -> Result<String, BindingError> {
+    let binding = parse_binding(text)?;
+    if !binding_allowed(&binding) {
+        return Err(BindingError::SingleKey);
+    }
+    let keymap = Keymap::build(overrides);
+    if let Some(command) = keymap.lookup(&binding.key, binding.ctrl, binding.shift, binding.alt) {
+        return Err(BindingError::Duplicate(command.to_string()));
+    }
+    for (other, text) in macro_bindings {
+        if other == name {
+            continue;
+        }
+        if let Ok(existing) = parse_binding(text) {
+            if existing == binding {
+                return Err(BindingError::Duplicate(other.clone()));
+            }
+        }
+    }
+    Ok(format_binding(&binding))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +1090,21 @@ mod tests {
         defaults.dedup();
         assert_eq!(defaults.len(), count, "duplicate default bindings");
         assert!(conflicts(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn macro_bindings_reject_command_and_macro_conflicts() {
+        let overrides = BTreeMap::new();
+        let mut macros = BTreeMap::new();
+        macros.insert("one".to_string(), "ctrl+alt+1".to_string());
+        assert!(validate_macro_binding("two", "ctrl+alt+1", &overrides, &macros).is_err());
+        assert!(validate_macro_binding("one", "ctrl+alt+1", &overrides, &macros).is_ok());
+        assert!(validate_macro_binding("two", "ctrl+s", &overrides, &macros).is_err());
+        assert!(validate_macro_binding("two", "a", &overrides, &macros).is_err());
+        assert_eq!(
+            validate_macro_binding("two", "Ctrl+Alt+2", &overrides, &macros).unwrap(),
+            "Ctrl+Alt+2"
+        );
     }
 
     #[test]

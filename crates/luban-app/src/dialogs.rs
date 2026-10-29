@@ -8,6 +8,7 @@ use luban_core::workspace::{wildcard_match, FileEntry};
 
 use crate::app::LubanApp;
 use crate::i18n::tr;
+use luban_core::export::ExportFormat;
 
 /// Listing generations are process-wide so a stale task from a closed dialog
 /// can never match a newly opened dialog that happens to list the same
@@ -31,6 +32,8 @@ pub enum FileDialogPurpose {
     OpenFolder,
     FindInFilesFolder,
     SaveAs { tab_id: u64, then: SaveThen },
+    Export { format: ExportFormat },
+    ImportTheme,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,7 +183,13 @@ impl FileDialogState {
     pub fn title(&self) -> String {
         tr(match self.mode {
             FileDialogMode::Open => "dialog.open_file",
-            FileDialogMode::Save => "dialog.save_as",
+            FileDialogMode::Save => match &self.purpose {
+                FileDialogPurpose::Export { format } => match format {
+                    ExportFormat::Html => "dialog.export_html",
+                    ExportFormat::Rtf => "dialog.export_rtf",
+                },
+                _ => "dialog.save_as",
+            },
             FileDialogMode::Folder => match self.purpose {
                 FileDialogPurpose::OpenFolder => "dialog.open_folder",
                 FileDialogPurpose::FindInFilesFolder => "dialog.choose_search_folder",

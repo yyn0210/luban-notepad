@@ -10,7 +10,7 @@ use luban_core::workspace::FileMatch;
 use crate::app::LubanApp;
 use crate::i18n::{tr, tr_args};
 
-pub const MAX_HIGHLIGHTS: usize = 5000;
+pub const MAX_HIGHLIGHTS: usize = 20_000;
 
 pub struct FindPanel {
     pub open: bool,
@@ -20,6 +20,7 @@ pub struct FindPanel {
     pub match_case: bool,
     pub whole_word: bool,
     pub regex: bool,
+    pub enhanced_regex: bool,
     pub in_selection: bool,
     pub dot_matches_newline: bool,
     pub matches: Vec<Match>,
@@ -52,6 +53,7 @@ impl FindPanel {
             match_case: false,
             whole_word: false,
             regex: false,
+            enhanced_regex: false,
             in_selection: false,
             dot_matches_newline: false,
             matches: Vec::new(),
@@ -73,6 +75,7 @@ impl FindPanel {
             match_case: self.match_case,
             whole_word: self.whole_word,
             regex: self.regex,
+            enhanced_regex: self.enhanced_regex,
             dot_matches_newline: self.dot_matches_newline,
             wrap_around: true,
             in_selection: self.in_selection,
@@ -189,6 +192,9 @@ pub struct FindInFilesPanel {
     pub match_case: bool,
     pub whole_word: bool,
     pub regex: bool,
+    pub enhanced_regex: bool,
+    /// Search only open documents with a path instead of the folder.
+    pub open_documents: bool,
     pub results: Vec<FileMatch>,
     pub files_scanned: usize,
     pub running: bool,
@@ -221,6 +227,8 @@ impl FindInFilesPanel {
             match_case: false,
             whole_word: false,
             regex: false,
+            enhanced_regex: false,
+            open_documents: false,
             results: Vec::new(),
             files_scanned: 0,
             running: false,
@@ -236,6 +244,7 @@ impl FindInFilesPanel {
             match_case: self.match_case,
             whole_word: self.whole_word,
             regex: self.regex,
+            enhanced_regex: self.enhanced_regex,
             dot_matches_newline: true,
             wrap_around: true,
             in_selection: false,

@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::input::{AddCursorAbove, AddCursorBelow};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{
-    Copy, Cut, Editor, EditorState, Indent, Input, InputEvent, InputState, Outdent, Paste,
-    RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo, RopeExt, Search,
-    SelectAll, TabSize, Undo,
+    Copy, Cut, Editor, EditorState, FoldRange, Indent, Input, InputEvent, InputState, Outdent,
+    Paste, Position, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo,
+    RopeExt, Search, SelectAll, TabSize, Undo,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarMode};
@@ -22,23 +23,29 @@ use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
 use gpui_kit::component::{Disableable as _, Selectable as _, Sizable as _, Size, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
+use luban_core::atomic_write::write_atomic;
+use luban_core::bookmarks::BookmarkSet;
 use luban_core::disk_engine::{DiskEngine, RecoveryInfo, WindowText, WINDOW_BYTES};
 use luban_core::document::{DiskStatus, Document, PartialRange};
 use luban_core::encoding::{self, TextEncoding};
 use luban_core::eol::{self, Eol};
+use luban_core::export::{self, ExportFormat};
 use luban_core::i18n::language_display_name;
 use luban_core::language;
 use luban_core::large_file::{format_bytes, RangeMode, SizeUnit};
+use luban_core::line_ops::{self, SortMode};
 use luban_core::local_history::{HistoryEntry, HistoryStore};
-use luban_core::search::{ByteMatch, Match};
+use luban_core::macros::SavedMacro;
+use luban_core::search::{ByteMatch, Match, ReplacePreview};
 use luban_core::session::{Session, SessionTab};
-use luban_core::settings::{Settings, ThemeChoice};
+use luban_core::settings::{LanguageSettings, Settings, ThemeChoice};
 use luban_core::text as textutil;
 use luban_core::undo::EditKind;
 use luban_core::workspace::{
     list_directory, FileEntry, FileMatch, FindInFilesOptions, FindInFilesOutcome,
 };
 
+use crate::column_editor::ColumnEditorState;
 use crate::commands::{self, CommandContext, Keymap};
 use crate::dialogs::{
     next_listing_generation, CloseIntent, ConfirmState, FileDialogMode, FileDialogPurpose,
@@ -57,8 +64,10 @@ use crate::huge_scrollbar::{self, HugeScrollbarProps};
 use crate::i18n::{active_language_name, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
 use crate::logging;
+use crate::macro_ui::MacroUiState;
 use crate::palette::{self, QuickTarget};
 use crate::preferences::{matching_fonts, FontPickerState, PreferencesState};
+use crate::syntax_theme::{self, THEME_OPTIONS};
 use crate::theme::apply_theme;
 use crate::util::{self, language_key};
 
@@ -153,6 +162,32 @@ struct ShortcutEditorState {
     error: Option<String>,
 }
 
+struct SortDialogState {
+    column: Entity<InputState>,
+    ascending: bool,
+    ignore_case: bool,
+    error: Option<String>,
+}
+
+struct FilterDialogState {
+    needle: Entity<InputState>,
+    keep: bool,
+    match_case: bool,
+    regex: bool,
+    error: Option<String>,
+}
+
+struct ReplacePreviewState {
+    preview: ReplacePreview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookmarkAction {
+    Cut,
+    Copy,
+    Delete,
+}
+
 /// Sequential close-other/close-right plan. Each modified tab goes through the
 /// normal per-tab save/discard confirmation before the next one is attempted.
 struct TrimPlan {
@@ -191,6 +226,10 @@ pub struct Tab {
     pub doc: Document,
     pub editor: Entity<EditorState>,
     pub decorations: RangeDecorationCollection,
+    pub bookmark_decorations: RangeDecorationCollection,
+    pub bookmarks: BookmarkSet,
+    pub bookmark_revision: u64,
+    pub fold_generation: u64,
     pub needs_sync: bool,
     /// The editor emitted a real text change that has not been synced into
     /// the document yet. Selection and focus events do not set this.
@@ -251,6 +290,7 @@ struct RestoreSpec {
     huge: bool,
     huge_line: Option<u64>,
     huge_column: Option<u64>,
+    bookmarks: Vec<usize>,
 }
 
 impl RestoreSpec {
@@ -417,6 +457,7 @@ pub struct LubanApp {
     file_name_input: Entity<InputState>,
     pub confirm: Option<ConfirmState>,
     overwrite_save: Option<SaveAsRequest>,
+    pending_export: Option<ExportFormat>,
     pub go_to_line: Option<GoToLineState>,
     pub language_picker: Option<LanguagePickerState>,
     pub about_open: bool,
@@ -425,6 +466,17 @@ pub struct LubanApp {
     palette: Option<PaletteOverlay>,
     quick_open_rows: Option<QuickOpenRows>,
     shortcut_editor: Option<ShortcutEditorState>,
+    pub column_editor: ColumnEditorState,
+    pub macro_ui: MacroUiState,
+    macro_recording: bool,
+    macro_recorded: Vec<String>,
+    macro_playback: bool,
+    macro_keymap: Vec<(commands::Binding, String)>,
+    replace_preview: Option<ReplacePreviewState>,
+    /// Last match end reached by Select Next Occurrence, keyed by needle and tab.
+    occurrence_anchor: Option<(String, usize, u64)>,
+    sort_dialog: Option<SortDialogState>,
+    filter_dialog: Option<FilterDialogState>,
     /// Snapshot waiting for the user to confirm replacing a modified buffer.
     pending_history_restore: Option<HistoryEntry>,
     /// Tabs closed during this session, newest last.
@@ -615,6 +667,9 @@ impl LubanApp {
         let keybindings = settings.keybindings.clone();
         crate::i18n::apply_language(&settings.ui_language);
         apply_theme(&settings, Some(window), cx);
+        if let Err(error) = syntax_theme::apply(&settings, cx) {
+            log::warn!("could not apply syntax theme: {error}");
+        }
 
         let mut app = Self {
             settings,
@@ -630,7 +685,7 @@ impl LubanApp {
             large_file: LargeFilePanel::new(window, cx),
             large_loads: Vec::new(),
             next_load_generation: 1,
-            preferences: PreferencesState::new(),
+            preferences: PreferencesState::new(window, cx),
             file_dialog: None,
             file_path_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder(tr("dialog.path_placeholder"))),
@@ -639,6 +694,7 @@ impl LubanApp {
             }),
             confirm: None,
             overwrite_save: None,
+            pending_export: None,
             go_to_line: None,
             language_picker: None,
             about_open: false,
@@ -647,6 +703,16 @@ impl LubanApp {
             palette: None,
             quick_open_rows: None,
             shortcut_editor: None,
+            column_editor: ColumnEditorState::new(window, cx),
+            macro_ui: MacroUiState::new(window, cx),
+            macro_recording: false,
+            macro_recorded: Vec::new(),
+            macro_playback: false,
+            macro_keymap: Vec::new(),
+            replace_preview: None,
+            occurrence_anchor: None,
+            sort_dialog: None,
+            filter_dialog: None,
             pending_history_restore: None,
             closed_tabs: Vec::new(),
             trim_plan: None,
@@ -688,6 +754,8 @@ impl LubanApp {
             window_height: 820.0,
             _subscriptions: Vec::new(),
         };
+
+        app.rebuild_macro_keymap();
 
         // The shortcut editor captures keystrokes even when no input owns the
         // focus; the disk-engine history shortcuts must run before the
@@ -929,6 +997,7 @@ impl LubanApp {
             .push(cx.observe_window_appearance(window, |this, window, cx| {
                 if matches!(this.settings.theme, ThemeChoice::System) {
                     apply_theme(&this.settings, Some(window), cx);
+                    let _ = syntax_theme::apply(&this.settings, cx);
                     cx.notify();
                 }
             }));
@@ -956,6 +1025,28 @@ impl LubanApp {
         self.tabs.iter().position(|t| t.id == id)
     }
 
+    /// Whether per-language indentation applies to this document.
+    fn language_indent_applies(doc: &Document, large_file: bool) -> bool {
+        !large_file && !doc.is_huge() && !doc.is_non_text()
+    }
+
+    /// Indentation for an editor: per-language overrides only apply to
+    /// ordinary text documents, never to reduced, non-text or disk-engine views.
+    fn editor_tab_size(&self, doc: &Document, large_file: bool) -> TabSize {
+        let (tab_size, use_spaces) = if Self::language_indent_applies(doc, large_file) {
+            (
+                self.settings.tab_size_for(&doc.language),
+                self.settings.use_spaces_for(&doc.language),
+            )
+        } else {
+            (self.settings.tab_size, self.settings.use_spaces)
+        };
+        TabSize {
+            tab_size,
+            hard_tabs: !use_spaces,
+        }
+    }
+
     fn new_editor(
         &self,
         doc: &mut Document,
@@ -966,6 +1057,7 @@ impl LubanApp {
         cx: &mut Context<Self>,
     ) -> (
         Entity<EditorState>,
+        RangeDecorationCollection,
         RangeDecorationCollection,
         Subscription,
         Subscription,
@@ -989,8 +1081,9 @@ impl LubanApp {
         // editor's window-local gutter stays off.
         let line_numbers = self.settings.show_line_numbers && !doc.is_huge();
         let wrap = !large_file && self.settings.word_wrap;
-        let tab_size = self.settings.tab_size;
-        let use_spaces = self.settings.use_spaces;
+        let editor_tab = self.editor_tab_size(doc, large_file);
+        let tab_size = editor_tab.tab_size;
+        let use_spaces = !editor_tab.hard_tabs;
 
         let editor = {
             let window_ref = &mut *window;
@@ -1014,6 +1107,9 @@ impl LubanApp {
             state.set_searchable(false, cx);
         });
         let decorations = editor.update(cx, |state, cx| {
+            state.create_range_decorations_collection(Vec::new(), cx)
+        });
+        let bookmark_decorations = editor.update(cx, |state, cx| {
             state.create_range_decorations_collection(Vec::new(), cx)
         });
 
@@ -1071,7 +1167,13 @@ impl LubanApp {
             }
         });
 
-        (editor, decorations, subscription, notification)
+        (
+            editor,
+            decorations,
+            bookmark_decorations,
+            subscription,
+            notification,
+        )
     }
 
     fn add_document(&mut self, doc: Document, window: &mut Window, cx: &mut Context<Self>) {
@@ -1086,13 +1188,17 @@ impl LubanApp {
             .as_ref()
             .map(|window| HugeFileUi::new(window.clone()));
         let huge_cursor = doc.huge().map(|huge| huge.cursor);
-        let (editor, decorations, subscription, notification) =
+        let (editor, decorations, bookmark_decorations, subscription, notification) =
             self.new_editor(&mut doc, large_file, initial, huge_cursor, window, cx);
         self.tabs.push(Tab {
             id,
             doc,
             editor,
             decorations,
+            bookmark_decorations,
+            bookmarks: BookmarkSet::default(),
+            bookmark_revision: 0,
+            fold_generation: 0,
             needs_sync: false,
             pending_edit: false,
             word_count: None,
@@ -1108,7 +1214,96 @@ impl LubanApp {
         self.focus_editor = true;
         self.status.clear();
         self.find.clear();
+        self.apply_fold_candidates(self.active, cx);
+        self.schedule_fold_candidates(self.active, window, cx);
+        self.refresh_bookmark_decorations(self.active, cx);
         cx.notify();
+    }
+
+    fn restore_tab_bookmarks(&mut self, bookmarks: Vec<usize>, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.len().checked_sub(1) else {
+            return;
+        };
+        {
+            let Some(tab) = self.tabs.get_mut(index) else {
+                return;
+            };
+            if tab.doc.is_huge() || tab.doc.is_non_text() {
+                return;
+            }
+            let text = if tab.large_file {
+                tab.editor.read(cx).text().to_string()
+            } else {
+                tab.doc.text.clone()
+            };
+            let count = textutil::LineIndex::new(&text).len();
+            tab.bookmarks = BookmarkSet::from_lines(bookmarks);
+            tab.bookmarks.clamp(count);
+            tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+        }
+        self.refresh_bookmark_decorations(index, cx);
+        cx.notify();
+    }
+
+    fn apply_fold_candidates(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.doc.is_huge()
+            || tab.large_file
+            || tab.doc.is_non_text()
+            || tab.doc.partial_range().is_some()
+        {
+            return;
+        }
+        let language = tab.doc.language.as_str();
+        if !matches!(
+            language,
+            "Python" | "YAML" | "Makefile" | "Ruby" | "Haskell" | "TOML"
+        ) {
+            return;
+        }
+        if tab.doc.text.len() > 8 * 1024 * 1024 {
+            return;
+        }
+        let candidates = textutil::indent_fold_candidates(&tab.doc.text, self.settings.tab_size);
+        let ranges: Vec<FoldRange> = candidates
+            .into_iter()
+            .map(|(start, end)| FoldRange::new(start, end))
+            .collect();
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| {
+            state.apply_highlighter_fold_candidates(ranges, cx);
+        });
+    }
+
+    fn schedule_fold_candidates(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.fold_generation = tab.fold_generation.wrapping_add(1);
+        let generation = tab.fold_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(260))
+                .await;
+            let _ = this.update_in(cx, |app, _window, cx| {
+                let current = app
+                    .tabs
+                    .get(index)
+                    .map(|tab| tab.fold_generation)
+                    .unwrap_or_default();
+                if current == generation {
+                    app.apply_fold_candidates(index, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1118,7 +1313,7 @@ impl LubanApp {
             &[("number", self.untitled_counter.to_string())],
         ));
         doc.encoding = self.settings.default_encoding;
-        doc.eol = self.settings.default_eol;
+        doc.eol = self.settings.eol_for_new_document(language::PLAIN_TEXT);
         self.add_document(doc, window, cx);
     }
 
@@ -2452,6 +2647,7 @@ impl LubanApp {
                 huge: tab.huge,
                 huge_line: tab.huge_line,
                 huge_column: tab.huge_column,
+                bookmarks: tab.bookmarks,
             });
         }
 
@@ -2462,8 +2658,10 @@ impl LubanApp {
         }
         if !any_large {
             for spec in specs {
+                let bookmarks = spec.bookmarks.clone();
                 let doc = spec.load(max_size);
                 self.add_document(doc, window, cx);
+                self.restore_tab_bookmarks(bookmarks, cx);
             }
             self.active = active.min(self.tabs.len().saturating_sub(1));
             self.focus_editor = true;
@@ -2476,7 +2674,10 @@ impl LubanApp {
         let task = cx.background_executor().spawn(async move {
             specs
                 .into_iter()
-                .map(|spec| spec.load(max_size))
+                .map(|spec| {
+                    let bookmarks = spec.bookmarks.clone();
+                    (bookmarks, spec.load(max_size))
+                })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -2490,7 +2691,7 @@ impl LubanApp {
 
     fn finish_restore(
         &mut self,
-        docs: Vec<Document>,
+        docs: Vec<(Vec<usize>, Document)>,
         active: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2499,8 +2700,9 @@ impl LubanApp {
             self.new_file(window, cx);
             return;
         }
-        for doc in docs {
+        for (bookmarks, doc) in docs {
             self.add_document(doc, window, cx);
+            self.restore_tab_bookmarks(bookmarks, cx);
         }
         self.active = active.min(self.tabs.len().saturating_sub(1));
         self.focus_editor = true;
@@ -2555,10 +2757,13 @@ impl LubanApp {
         let changed = normalized != self.tabs[index].doc.text;
         let tab = &mut self.tabs[index];
         if changed {
+            self.occurrence_anchor = None;
+            tab.bookmarks.adjust(&tab.doc.text, &normalized);
             tab.doc.set_text_from_widget(&normalized, cursor, anchor);
             tab.needs_sync = false;
             tab.pending_edit = false;
             tab.highlighted_revision = u64::MAX;
+            tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
         } else {
             tab.doc.set_selection(anchor, cursor);
             tab.needs_sync = false;
@@ -2566,12 +2771,15 @@ impl LubanApp {
         }
         if changed {
             self.find.dirty = true;
+            self.apply_fold_candidates(index, cx);
+            self.schedule_fold_candidates(index, window, cx);
+            self.refresh_bookmark_decorations(index, cx);
         }
 
         if normalize_cr {
             let b0 = textutil::char_to_byte(&normalized, start);
             let b1 = textutil::char_to_byte(&normalized, end);
-            let editor = tab.editor.clone();
+            let editor = self.tabs[index].editor.clone();
             editor.update(cx, |state, cx| {
                 state.set_value(normalized, window, cx);
                 state.set_selected_range(b0..b1.max(b0), cx);
@@ -2692,6 +2900,10 @@ impl LubanApp {
         let anchor = select_start.min(char_count);
         let cursor = select_end.min(char_count);
         let large_file = tab.large_file;
+        if !large_file && !tab.doc.is_huge() && !tab.doc.is_non_text() {
+            tab.bookmarks.adjust(&tab.doc.text, &new_text);
+            tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+        }
         tab.highlighted_revision = u64::MAX;
         tab.decorations_key = None;
         let b0 = textutil::char_to_byte(&new_text, anchor);
@@ -5321,6 +5533,241 @@ impl LubanApp {
         );
     }
 
+    fn language_override(&self) -> Option<&LanguageSettings> {
+        self.settings
+            .language_settings
+            .get(&self.preferences.language)
+    }
+
+    fn update_language_override(&mut self, update: impl FnOnce(&mut LanguageSettings)) {
+        let language = self.preferences.language.clone();
+        let mut entry = self
+            .settings
+            .language_settings
+            .get(&language)
+            .cloned()
+            .unwrap_or_default();
+        update(&mut entry);
+        if entry.is_empty() {
+            self.settings.language_settings.remove(&language);
+        } else {
+            self.settings.language_settings.insert(language, entry);
+        }
+        let _ = self.settings.save();
+    }
+
+    fn apply_language_indent_to_open_tabs(&mut self, cx: &mut Context<Self>) {
+        let language = self.preferences.language.clone();
+        let tab_size = self.settings.tab_size_for(&language);
+        let use_spaces = self.settings.use_spaces_for(&language);
+        for tab in &self.tabs {
+            if tab.doc.language != language
+                || !Self::language_indent_applies(&tab.doc, tab.large_file)
+            {
+                continue;
+            }
+            tab.editor.update(cx, |state, cx| {
+                state.set_tab_size(
+                    TabSize {
+                        tab_size,
+                        hard_tabs: !use_spaces,
+                    },
+                    cx,
+                );
+            });
+        }
+    }
+
+    fn set_language_use_spaces(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        self.update_language_override(|entry| entry.use_spaces = value);
+        self.apply_language_indent_to_open_tabs(cx);
+        cx.notify();
+    }
+
+    fn set_language_eol(&mut self, value: Option<Eol>, cx: &mut Context<Self>) {
+        self.update_language_override(|entry| entry.eol = value);
+        cx.notify();
+    }
+
+    fn apply_language_tab_size(&mut self, cx: &mut Context<Self>) {
+        let value = self
+            .preferences
+            .language_tab_size
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            self.update_language_override(|entry| entry.tab_size = None);
+        } else {
+            match value.parse::<usize>() {
+                Ok(size) if (1..=16).contains(&size) => {
+                    self.update_language_override(|entry| entry.tab_size = Some(size));
+                }
+                _ => {
+                    self.set_status(tr("prefs.language_tab_invalid"), cx);
+                    return;
+                }
+            }
+        }
+        self.apply_language_indent_to_open_tabs(cx);
+        self.set_status(tr("prefs.language_saved"), cx);
+        cx.notify();
+    }
+
+    fn import_syntax_theme(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        match syntax_theme::load_custom(path) {
+            Ok(_) => {
+                let previous = self.settings.syntax_theme.clone();
+                let previous_path = self.settings.syntax_theme_path.clone();
+                self.settings.syntax_theme = syntax_theme::CUSTOM_ID.to_string();
+                self.settings.syntax_theme_path = Some(util::absolutize(path));
+                if let Err(error) = syntax_theme::apply(&self.settings, cx) {
+                    self.settings.syntax_theme = previous;
+                    self.settings.syntax_theme_path = previous_path;
+                    self.set_status(
+                        tr_args("status.theme_import_failed", &[("error", error)]),
+                        cx,
+                    );
+                    return;
+                }
+                let _ = self.settings.save();
+                self.set_status(
+                    tr_args(
+                        "status.theme_imported",
+                        &[("path", path.display().to_string())],
+                    ),
+                    cx,
+                );
+                self.focus_editor(window, cx);
+            }
+            Err(error) => self.set_status(
+                tr_args("status.theme_import_failed", &[("error", error)]),
+                cx,
+            ),
+        }
+        cx.notify();
+    }
+
+    fn open_syntax_theme_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = dirs::home_dir()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.show_file_dialog(
+            FileDialogMode::Open,
+            FileDialogPurpose::ImportTheme,
+            dir,
+            String::new(),
+            window,
+            cx,
+        );
+    }
+
+    fn set_syntax_theme(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.settings.syntax_theme.clone();
+        let previous_path = self.settings.syntax_theme_path.clone();
+        self.settings.syntax_theme = id.to_string();
+        match syntax_theme::apply(&self.settings, cx) {
+            Ok(()) => {
+                let _ = self.settings.save();
+                self.set_status(tr("status.theme_applied"), cx);
+            }
+            Err(error) => {
+                self.settings.syntax_theme = previous;
+                self.settings.syntax_theme_path = previous_path;
+                self.set_status(
+                    tr_args("status.theme_import_failed", &[("error", error)]),
+                    cx,
+                );
+            }
+        }
+        self.refresh_placeholders(window, cx);
+        cx.notify();
+    }
+
+    fn export_document(
+        &mut self,
+        format: ExportFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_active(window, cx);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.doc.is_huge() || tab.doc.partial_range().is_some() || tab.doc.is_non_text() {
+            self.set_status(tr("status.export_unavailable"), cx);
+            return;
+        }
+        let dir = util::default_save_directory(tab.doc.path.as_deref());
+        let stem = tab
+            .doc
+            .path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string());
+        let suggested = format!("{stem}.{}", format.extension());
+        self.pending_export = None;
+        self.show_file_dialog(
+            FileDialogMode::Save,
+            FileDialogPurpose::Export { format },
+            dir,
+            suggested,
+            window,
+            cx,
+        );
+    }
+
+    fn write_export(
+        &mut self,
+        path: &Path,
+        format: ExportFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_active(window, cx);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.doc.is_huge() || tab.doc.partial_range().is_some() || tab.doc.is_non_text() {
+            self.set_status(tr("status.export_unavailable"), cx);
+            return;
+        }
+        if !self.ensure_active_text(cx) {
+            return;
+        }
+        let (text, language) = {
+            let Some(tab) = self.active_tab() else { return };
+            (tab.doc.text.clone(), tab.doc.language.clone())
+        };
+        let token = if self.active_tab().is_some_and(|tab| tab.large_file) {
+            "text".to_string()
+        } else {
+            util::language_key(&language).to_string()
+        };
+        let (_, theme) = syntax_theme::export_theme(&self.settings);
+        let title = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Luban Notepad".to_string());
+        let content = match format {
+            ExportFormat::Html => export::to_html(&text, &token, &theme, &title),
+            ExportFormat::Rtf => export::to_rtf(&text, &token, &theme),
+        };
+        self.release_active_text();
+        match write_atomic(path, content.as_bytes()) {
+            Ok(()) => self.set_status(
+                tr_args("status.exported", &[("path", path.display().to_string())]),
+                cx,
+            ),
+            Err(err) => self.set_status(
+                tr_args("status.export_failed", &[("error", err.to_string())]),
+                cx,
+            ),
+        }
+    }
+
     fn save_as_request(
         &mut self,
         request: SaveAsRequest,
@@ -5754,6 +6201,30 @@ impl LubanApp {
         match dialog.mode {
             FileDialogMode::Open => {
                 let selected = dialog.selected_in_visible_order();
+                if matches!(dialog.purpose, FileDialogPurpose::ImportTheme) {
+                    let candidate = selected.first().cloned().or_else(|| {
+                        if typed.is_empty() {
+                            None
+                        } else {
+                            Some(util::absolutize(Path::new(&typed)))
+                        }
+                    });
+                    match candidate {
+                        Some(path) if path.is_file() => {
+                            self.import_syntax_theme(&path, window, cx);
+                        }
+                        Some(_) => {
+                            self.file_dialog = Some(dialog);
+                            self.file_dialog_error(tr("dialog.not_a_file"), cx);
+                        }
+                        None => {
+                            self.file_dialog = Some(dialog);
+                            self.file_dialog_error(tr("dialog.select_file"), cx);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 if !selected.is_empty() {
                     let total = selected.len();
                     let mut opened = 0usize;
@@ -5798,7 +6269,11 @@ impl LubanApp {
                     self.file_dialog = Some(dialog);
                     self.file_dialog_navigate(candidate, window, cx);
                 } else if candidate.is_file() {
-                    self.open_path(&candidate, window, cx);
+                    if matches!(dialog.purpose, FileDialogPurpose::ImportTheme) {
+                        self.import_syntax_theme(&candidate, window, cx);
+                    } else {
+                        self.open_path(&candidate, window, cx);
+                    }
                 } else {
                     self.file_dialog = Some(dialog);
                     self.file_dialog_error(
@@ -5834,17 +6309,32 @@ impl LubanApp {
                     self.file_dialog_error(tr("dialog.target_is_folder"), cx);
                     return;
                 }
-                if let FileDialogPurpose::SaveAs { tab_id, then } = dialog.purpose {
-                    let request = SaveAsRequest {
-                        tab_id,
-                        path: candidate,
-                        then,
-                    };
-                    if request.path.exists() {
-                        self.overwrite_save = Some(request);
-                    } else {
-                        self.save_as_request(request, window, cx);
+                match dialog.purpose.clone() {
+                    FileDialogPurpose::SaveAs { tab_id, then } => {
+                        let request = SaveAsRequest {
+                            tab_id,
+                            path: candidate,
+                            then,
+                        };
+                        if request.path.exists() {
+                            self.overwrite_save = Some(request);
+                        } else {
+                            self.save_as_request(request, window, cx);
+                        }
                     }
+                    FileDialogPurpose::Export { format } => {
+                        if candidate.exists() {
+                            self.pending_export = Some(format);
+                            self.overwrite_save = Some(SaveAsRequest {
+                                tab_id: 0,
+                                path: candidate,
+                                then: SaveThen::Nothing,
+                            });
+                        } else {
+                            self.write_export(&candidate, format, window, cx);
+                        }
+                    }
+                    _ => {}
                 }
             }
             FileDialogMode::Folder => {
@@ -6433,6 +6923,11 @@ impl LubanApp {
                             .ok()
                             .and_then(|engine| engine.recovery_id().map(str::to_string))
                     }),
+                    bookmarks: if huge {
+                        Vec::new()
+                    } else {
+                        tab.bookmarks.as_vec()
+                    },
                 }
             })
             .collect();
@@ -6539,23 +7034,666 @@ impl LubanApp {
     }
 
     pub fn sort_selection(&mut self, ascending: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.sort_selection_mode(SortMode::Text, ascending, false, 1, window, cx);
+    }
+
+    /// Whether a full-text editing command may run on the active tab.
+    fn full_text_editing_available(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.sync_active(window, cx);
-        if !self.ensure_active_text(cx) {
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        if tab.doc.is_huge() {
+            self.set_status(tr("status.huge_op_unavailable"), cx);
+            return false;
+        }
+        if tab.large_file || tab.doc.partial_range().is_some() || tab.doc.is_non_text() {
+            self.set_status(tr("status.op_needs_full_text"), cx);
+            return false;
+        }
+        true
+    }
+
+    fn multi_cursor_available(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.sync_active(window, cx);
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        if tab.doc.is_huge()
+            || tab.large_file
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text()
+        {
+            self.set_status(tr("status.op_needs_full_text"), cx);
+            return false;
+        }
+        true
+    }
+
+    fn sort_selection_mode(
+        &mut self,
+        mode: SortMode,
+        ascending: bool,
+        ignore_case: bool,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        let (new_text, sel_start, sel_end) = line_ops::sort_lines(
+            &tab.doc.text,
+            start,
+            end,
+            mode,
+            ascending,
+            ignore_case,
+            column,
+        );
+        self.replace_document_text(new_text, sel_start, sel_end, window, cx);
+        self.set_status(tr("status.sorted"), cx);
+    }
+
+    fn move_lines(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        let (new_text, sel_start, sel_end) = line_ops::move_lines(&tab.doc.text, start, end, up);
+        if new_text == tab.doc.text {
+            self.set_status(tr("status.line_move_boundary"), cx);
+            return;
+        }
+        self.replace_document_text(new_text, sel_start, sel_end, window, cx);
+        self.set_status(
+            tr(if up {
+                "status.line_moved_up"
+            } else {
+                "status.line_moved_down"
+            }),
+            cx,
+        );
+    }
+
+    fn join_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        let (new_text, sel_start, sel_end) = line_ops::join_lines(&tab.doc.text, start, end);
+        if new_text == tab.doc.text {
+            self.set_status(tr("status.line_join_boundary"), cx);
+            return;
+        }
+        self.replace_document_text(new_text, sel_start, sel_end, window, cx);
+        self.set_status(tr("status.lines_joined"), cx);
+    }
+
+    fn split_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        let (_, column) = textutil::LineIndex::new(&tab.doc.text).line_col(tab.doc.cursor);
+        if column <= 1 && start == end {
+            self.set_status(tr("status.line_split_no_column"), cx);
+            return;
+        }
+        let column = column.saturating_sub(1);
+        let (new_text, sel_start, sel_end) =
+            line_ops::split_lines_at(&tab.doc.text, start, end, column);
+        if new_text == tab.doc.text {
+            self.set_status(tr("status.line_split_no_column"), cx);
+            return;
+        }
+        self.replace_document_text(new_text, sel_start, sel_end, window, cx);
+        self.set_status(tr("status.lines_split"), cx);
+    }
+
+    fn remove_duplicate_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
             return;
         }
         let Some(tab) = self.active_tab() else { return };
         let (start, end) = tab.doc.selection();
         let (new_text, sel_start, sel_end) =
-            textutil::sort_lines(&tab.doc.text, start, end, ascending, false);
+            line_ops::remove_duplicate_lines(&tab.doc.text, start, end);
         self.replace_document_text(new_text, sel_start, sel_end, window, cx);
+        self.set_status(tr("status.duplicates_removed"), cx);
+    }
+
+    fn remove_empty_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        let (new_text, sel_start, sel_end) =
+            line_ops::remove_empty_lines(&tab.doc.text, start, end);
+        self.replace_document_text(new_text, sel_start, sel_end, window, cx);
+        self.set_status(tr("status.empty_lines_removed"), cx);
+    }
+
+    fn open_sort_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        let column = cx.new(|cx| InputState::new(window, cx).default_value("1"));
+        let focus = column.clone();
+        cx.defer_in(window, move |_this, window, cx| {
+            focus.update(cx, |input, cx| input.focus(window, cx));
+        });
+        self.sort_dialog = Some(SortDialogState {
+            column,
+            ascending: true,
+            ignore_case: true,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn apply_sort_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.sort_dialog.take() else {
+            return;
+        };
+        let column = dialog.column.read(cx).value().trim().parse::<usize>();
+        let Ok(column) = column else {
+            self.sort_dialog = Some(SortDialogState {
+                error: Some(tr("sort.invalid_column")),
+                ..dialog
+            });
+            cx.notify();
+            return;
+        };
+        if column == 0 {
+            self.sort_dialog = Some(SortDialogState {
+                error: Some(tr("sort.invalid_column")),
+                ..dialog
+            });
+            cx.notify();
+            return;
+        }
+        self.sort_selection_mode(
+            SortMode::Column,
+            dialog.ascending,
+            dialog.ignore_case,
+            column,
+            window,
+            cx,
+        );
+        self.focus_editor(window, cx);
+    }
+
+    fn open_filter_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        let needle =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("filter.needle_placeholder")));
+        let focus = needle.clone();
+        cx.defer_in(window, move |_this, window, cx| {
+            focus.update(cx, |input, cx| input.focus(window, cx));
+        });
+        self.filter_dialog = Some(FilterDialogState {
+            needle,
+            keep: true,
+            match_case: false,
+            regex: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn apply_filter_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.filter_dialog.take() else {
+            return;
+        };
+        let needle = dialog.needle.read(cx).value().to_string();
+        if needle.is_empty() {
+            self.filter_dialog = Some(FilterDialogState {
+                error: Some(tr("filter.empty_needle")),
+                ..dialog
+            });
+            cx.notify();
+            return;
+        }
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        match line_ops::filter_lines(
+            &tab.doc.text,
+            start,
+            end,
+            &needle,
+            dialog.keep,
+            dialog.match_case,
+            dialog.regex,
+        ) {
+            Ok(outcome) => {
+                if outcome.matched == 0 {
+                    self.set_status(tr("status.filter_no_match"), cx);
+                    return;
+                }
+                if outcome.removed == 0 {
+                    self.set_status(tr("status.filter_no_match"), cx);
+                    return;
+                }
+                self.replace_document_text(
+                    outcome.text,
+                    outcome.selection.0,
+                    outcome.selection.1,
+                    window,
+                    cx,
+                );
+                self.set_status(
+                    tr_args(
+                        "status.filtered_lines",
+                        &[("count", outcome.removed.to_string())],
+                    ),
+                    cx,
+                );
+                self.focus_editor(window, cx);
+            }
+            Err(err) => {
+                self.filter_dialog = Some(FilterDialogState {
+                    error: Some(err),
+                    ..dialog
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_column_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (_, column) = textutil::LineIndex::new(&tab.doc.text).line_col(tab.doc.cursor);
+        self.column_editor.open_at(column, window, cx);
+        let input = self.column_editor.column.clone();
+        cx.defer_in(window, move |_this, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.notify();
+    }
+
+    fn apply_column_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let payload = match self.column_editor.payload(cx) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.column_editor.error = Some(err);
+                cx.notify();
+                return;
+            }
+        };
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let (start, end) = tab.doc.selection();
+        let (new_text, sel_start, _sel_end) =
+            line_ops::column_edit(&tab.doc.text, start, end, payload.0, &payload.1);
+        self.column_editor.open = false;
+        self.column_editor.error = None;
+        self.replace_document_text(new_text, sel_start, sel_start, window, cx);
+        self.focus_editor(window, cx);
+        self.set_status(tr("status.column_edited"), cx);
+    }
+
+    /// Text used for "select next/all occurrences": the selection or the word
+    /// at the cursor.
+    fn occurrence_target(&self, cx: &gpui_kit::App) -> Option<(String, usize, usize)> {
+        let tab = self.active_tab()?;
+        if tab.doc.is_huge()
+            || tab.large_file
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text()
+        {
+            return None;
+        }
+        let state = tab.editor.read(cx);
+        let range = state.selected_range();
+        let text = state.text();
+        if range.start != range.end {
+            let selected = text.slice(range.clone()).to_string();
+            return Some((selected, range.start, range.end));
+        }
+        let offset = state.cursor().min(text.len());
+        let full = text.to_string();
+        let char_index = text.byte_to_char_idx(offset);
+        let (word_start, word_end) = textutil::word_range_at(&full, char_index);
+        if word_start == word_end {
+            return None;
+        }
+        let b0 = text.char_to_byte_idx(word_start);
+        let b1 = text.char_to_byte_idx(word_end);
+        Some((text.slice(b0..b1).to_string(), b0, b1))
+    }
+
+    fn select_next_occurrence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let Some((needle, _, _)) = self.occurrence_target(cx) else {
+            self.set_status(tr("status.occurrence_needs_selection"), cx);
+            return;
+        };
+        if needle.contains(['\n', '\r']) || needle.chars().count() > 200 {
+            self.set_status(tr("status.occurrence_needs_single_line"), cx);
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let tab_id = tab.id;
+        let text = tab.editor.read(cx).text().to_string();
+        let options = luban_core::search::SearchOptions {
+            match_case: self.find.match_case,
+            wrap_around: false,
+            ..Default::default()
+        };
+        let engine = luban_core::search::SearchEngine::new(needle.clone(), options);
+        let from = {
+            let state = tab.editor.read(cx);
+            match &self.occurrence_anchor {
+                Some((anchor_needle, end, anchor_tab))
+                    if anchor_needle == &needle && *anchor_tab == tab_id =>
+                {
+                    state.text().byte_to_char_idx(*end)
+                }
+                _ => state.text().byte_to_char_idx(state.selected_range().end),
+            }
+        };
+        let next = engine.find_from(&text, from, true, None);
+        let editor = tab.editor.clone();
+        match next {
+            Some(matched) => {
+                let (b0, b1) = {
+                    let state = tab.editor.read(cx);
+                    (
+                        state.text().char_to_byte_idx(matched.start),
+                        state.text().char_to_byte_idx(matched.end),
+                    )
+                };
+                editor.update(cx, |state, cx| {
+                    state.add_selection(b0..b1, cx);
+                    state.focus(window, cx);
+                });
+                self.occurrence_anchor = Some((needle, b1, tab_id));
+                self.set_status(tr("status.occurrence_added"), cx);
+            }
+            None => self.set_status(tr("status.occurrence_none"), cx),
+        }
+    }
+
+    fn select_all_occurrences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.occurrence_anchor = None;
+        self.sync_active(window, cx);
+        let Some((needle, _, _)) = self.occurrence_target(cx) else {
+            self.set_status(tr("status.occurrence_needs_selection"), cx);
+            return;
+        };
+        if needle.contains(['\n', '\r']) || needle.chars().count() > 200 {
+            self.set_status(tr("status.occurrence_needs_single_line"), cx);
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let text = tab.editor.read(cx).text().to_string();
+        let options = luban_core::search::SearchOptions {
+            match_case: self.find.match_case,
+            wrap_around: false,
+            ..Default::default()
+        };
+        let engine = luban_core::search::SearchEngine::new(needle, options);
+        let matches = engine.find_all(&text, None, 20_001);
+        if matches.is_empty() {
+            self.set_status(tr("status.occurrence_none"), cx);
+            return;
+        }
+        if matches.len() > 20_000 {
+            self.set_status(tr("status.occurrence_too_many"), cx);
+            return;
+        }
+        let ranges: Vec<(usize, usize)> = {
+            let state = tab.editor.read(cx);
+            matches
+                .iter()
+                .map(|matched| {
+                    (
+                        state.text().char_to_byte_idx(matched.start),
+                        state.text().char_to_byte_idx(matched.end),
+                    )
+                })
+                .collect()
+        };
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| {
+            state.set_selected_range(ranges[0].0..ranges[0].1, cx);
+            for range in ranges.iter().skip(1) {
+                state.add_selection(range.0..range.1, cx);
+            }
+            state.focus(window, cx);
+        });
         self.set_status(
-            tr(if ascending {
-                "status.sorted_asc"
+            tr_args(
+                "status.occurrences_added",
+                &[("count", ranges.len().to_string())],
+            ),
+            cx,
+        );
+    }
+
+    fn unfold_current(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        if tab.doc.is_huge() || tab.large_file {
+            self.set_status(tr("status.folding_unavailable"), cx);
+            return;
+        }
+        let editor = tab.editor.clone();
+        let unfolded = editor.update(cx, |state, cx| {
+            let line = state
+                .text()
+                .offset_to_point(state.cursor().min(state.text().len()))
+                .row;
+            state.unfold_at(Position::new(line as u32, 0), cx)
+        });
+        if unfolded {
+            self.set_status(tr("status.unfolded"), cx);
+        } else {
+            self.set_status(tr("status.no_fold_at_cursor"), cx);
+        }
+    }
+
+    fn unfold_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        if tab.doc.is_huge() || tab.large_file {
+            self.set_status(tr("status.folding_unavailable"), cx);
+            return;
+        }
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| {
+            state.set_folding(false, window, cx);
+            state.set_folding(true, window, cx);
+        });
+        self.set_status(tr("status.unfolded_all"), cx);
+    }
+
+    fn bookmark_line(&self) -> Option<usize> {
+        let tab = self.active_tab()?;
+        if tab.doc.is_huge() || tab.doc.is_non_text() {
+            return None;
+        }
+        Some(line_ops::line_of_char(&tab.doc.text, tab.doc.cursor))
+    }
+
+    fn toggle_bookmark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        let Some(line) = self.bookmark_line() else {
+            return;
+        };
+        let index = self.active;
+        let set = {
+            let Some(tab) = self.tabs.get_mut(index) else {
+                return;
+            };
+            let set = tab.bookmarks.toggle(line);
+            tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+            set
+        };
+        self.refresh_bookmark_decorations(index, cx);
+        self.set_status(
+            tr(if set {
+                "status.bookmark_added"
             } else {
-                "status.sorted_desc"
+                "status.bookmark_removed"
             }),
             cx,
         );
+    }
+
+    fn goto_bookmark(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        let Some(current) = self.bookmark_line() else {
+            return;
+        };
+        let target = {
+            let Some(tab) = self.active_tab() else { return };
+            if forward {
+                tab.bookmarks.next_after(current)
+            } else {
+                tab.bookmarks.previous_before(current)
+            }
+        };
+        let Some(line) = target else {
+            self.set_status(
+                tr(if forward {
+                    "status.no_next_bookmark"
+                } else {
+                    "status.no_previous_bookmark"
+                }),
+                cx,
+            );
+            return;
+        };
+        let offset = {
+            let Some(tab) = self.active_tab() else { return };
+            line_ops::line_start(&tab.doc.text, line)
+        };
+        self.select_char_range(offset, offset, window, cx);
+        self.set_status(
+            tr_args("status.jumped_bookmark", &[("line", line.to_string())]),
+            cx,
+        );
+    }
+
+    fn clear_bookmarks(&mut self, cx: &mut Context<Self>) {
+        let index = self.active;
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.bookmarks.clear();
+        tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+        self.refresh_bookmark_decorations(index, cx);
+        self.set_status(tr("status.bookmarks_cleared"), cx);
+    }
+
+    fn bookmark_lines(
+        &mut self,
+        action: BookmarkAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.full_text_editing_available(window, cx) || !self.ensure_active_text(cx) {
+            return;
+        }
+        let Some(tab) = self.active_tab() else { return };
+        if tab.bookmarks.is_empty() {
+            self.set_status(tr("status.no_bookmarks"), cx);
+            return;
+        }
+        let text = tab.doc.text.clone();
+        let cursor = tab.doc.cursor;
+        let mut bookmarks = tab.bookmarks.clone();
+        let index = self.active;
+        match action {
+            BookmarkAction::Copy => {
+                let selected = bookmarks.selected_text(&text);
+                cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                self.set_status(tr("status.bookmarked_lines_copied"), cx);
+            }
+            BookmarkAction::Cut => {
+                let (clipboard, new_text) = bookmarks.cut_lines(&text);
+                cx.write_to_clipboard(ClipboardItem::new_string(clipboard));
+                let new_len = textutil::char_count(&new_text);
+                let cursor = cursor.min(new_len);
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.bookmarks.clear();
+                    tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+                }
+                self.replace_document_text(new_text, cursor, cursor, window, cx);
+                self.refresh_bookmark_decorations(index, cx);
+                self.set_status(tr("status.bookmarked_lines_cut"), cx);
+            }
+            BookmarkAction::Delete => {
+                let new_text = bookmarks.delete_lines(&text);
+                let new_len = textutil::char_count(&new_text);
+                let cursor = cursor.min(new_len);
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.bookmarks.clear();
+                    tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+                }
+                self.replace_document_text(new_text, cursor, cursor, window, cx);
+                self.refresh_bookmark_decorations(index, cx);
+                self.set_status(tr("status.bookmarked_lines_deleted"), cx);
+            }
+        }
+    }
+
+    fn refresh_bookmark_decorations(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.doc.is_huge() || tab.doc.is_non_text() || tab.bookmarks.is_empty() {
+            tab.bookmark_decorations.clear(cx);
+            return;
+        }
+        let text = if tab.large_file {
+            std::borrow::Cow::Owned(tab.editor.read(cx).text().to_string())
+        } else {
+            std::borrow::Cow::Borrowed(tab.doc.text.as_str())
+        };
+        let index_lines = textutil::LineIndex::new(&text);
+        let mut color = cx.theme().colors.yellow;
+        color.a = 0.22;
+        let decorations: Vec<RangeDecoration> = tab
+            .bookmarks
+            .lines()
+            .filter_map(|line| {
+                let line = line.saturating_sub(1);
+                if line >= index_lines.len() {
+                    return None;
+                }
+                let start = index_lines.line_start(line);
+                let end = index_lines.line_end_including_newline(line);
+                let b0 = textutil::char_to_byte(&text, start);
+                let b1 = textutil::char_to_byte(&text, end);
+                (b1 > b0).then(|| {
+                    RangeDecoration::new(b0..b1)
+                        .with_style(RangeDecorationStyle::Fill)
+                        .with_color(color)
+                })
+            })
+            .collect();
+        tab.bookmark_decorations.set(decorations, cx);
     }
 
     pub fn transform_case(
@@ -6609,11 +7747,15 @@ impl LubanApp {
     }
 
     pub fn set_language(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let language_eol = self.settings.eol_for_new_document(&name);
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if !tab.doc.set_language(name.clone()) {
             return;
+        }
+        if tab.doc.path.is_none() && tab.doc.text.is_empty() && !tab.doc.is_non_text() {
+            tab.doc.eol = language_eol;
         }
         let key = language_key(&name).to_string();
         tab.highlighted_revision = u64::MAX;
@@ -6621,6 +7763,26 @@ impl LubanApp {
         if !tab.large_file {
             tab.editor
                 .update(cx, |state, cx| state.set_highlighter(key, cx));
+        }
+        let index = self.active;
+        let tab_size = self.settings.tab_size_for(&name);
+        let use_spaces = self.settings.use_spaces_for(&name);
+        let editor = self.tabs[index].editor.clone();
+        if !self.tabs[index].large_file
+            && !self.tabs[index].doc.is_huge()
+            && !self.tabs[index].doc.is_non_text()
+        {
+            editor.update(cx, |state, cx| {
+                state.set_tab_size(
+                    TabSize {
+                        tab_size,
+                        hard_tabs: !use_spaces,
+                    },
+                    cx,
+                );
+            });
+            self.apply_fold_candidates(index, cx);
+            self.schedule_fold_candidates(index, window, cx);
         }
         self.set_status(
             tr_args(
@@ -6646,17 +7808,18 @@ impl LubanApp {
 
     pub fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(&self.settings, Some(window), cx);
+        if let Err(error) = syntax_theme::apply(&self.settings, cx) {
+            log::warn!("could not apply syntax theme: {error}");
+        }
         self.keymap = Keymap::build(&self.settings.keybindings);
+        self.rebuild_macro_keymap();
         let line_numbers = self.settings.show_line_numbers;
         let wrap = self.settings.word_wrap;
-        let tab = TabSize {
-            tab_size: self.settings.tab_size,
-            hard_tabs: !self.settings.use_spaces,
-        };
         for index in 0..self.tabs.len() {
             let wrap = !self.tabs[index].large_file && wrap;
             // Disk-engine tabs draw document-global numbers in the app.
             let line_numbers = line_numbers && !self.tabs[index].doc.is_huge();
+            let tab = self.editor_tab_size(&self.tabs[index].doc, self.tabs[index].large_file);
             self.tabs[index].editor.update(cx, |state, cx| {
                 state.set_line_number(line_numbers, window, cx);
                 state.set_soft_wrap(wrap, window, cx);
@@ -6668,6 +7831,244 @@ impl LubanApp {
         }
         self.explorer.refresh();
         cx.notify();
+    }
+
+    fn mark_find_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        if self.find.matches.is_empty() {
+            self.set_status(tr("status.no_matches_to_mark"), cx);
+            return;
+        }
+        let index = self.active;
+        let mut lines = HashSet::new();
+        {
+            let Some(tab) = self.tabs.get(index) else {
+                return;
+            };
+            for matched in &self.find.matches {
+                lines.insert(line_ops::line_of_char(&tab.doc.text, matched.start));
+            }
+        }
+        let added = {
+            let Some(tab) = self.tabs.get_mut(index) else {
+                return;
+            };
+            let mut added = 0usize;
+            for line in lines.iter().copied() {
+                if tab.bookmarks.toggle(line) {
+                    added += 1;
+                }
+            }
+            tab.bookmark_revision = tab.bookmark_revision.wrapping_add(1);
+            added
+        };
+        self.refresh_bookmark_decorations(index, cx);
+        self.set_status(
+            tr_args("status.marked_matches", &[("count", added.to_string())]),
+            cx,
+        );
+    }
+
+    fn clear_search_history(&mut self, cx: &mut Context<Self>) {
+        self.settings.search_history.clear();
+        self.settings.replace_history.clear();
+        let _ = self.settings.save();
+        self.set_status(tr("status.search_history_cleared"), cx);
+        cx.notify();
+    }
+
+    fn toggle_macro_recording(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.macro_recording {
+            self.macro_recording = false;
+            let count = self.macro_recorded.len();
+            if count == 0 {
+                self.set_status(tr("status.macro_empty"), cx);
+            } else {
+                self.set_status(
+                    tr_args("status.macro_stopped", &[("count", count.to_string())]),
+                    cx,
+                );
+            }
+        } else {
+            self.macro_recording = true;
+            self.macro_recorded.clear();
+            self.set_status(tr("status.macro_recording"), cx);
+        }
+        cx.notify();
+    }
+
+    fn save_macro_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.macro_recorded.is_empty() {
+            self.set_status(tr("status.macro_empty"), cx);
+            return;
+        }
+        self.macro_ui.reset(window, cx);
+        let input = self.macro_ui.name_input.clone();
+        cx.defer_in(window, move |_this, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.notify();
+    }
+
+    fn confirm_save_macro(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.macro_ui.name_input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.macro_ui.error = Some(tr("macro.name_empty"));
+            cx.notify();
+            return;
+        }
+        if self.settings.macros.find(&name).is_some()
+            && self.macro_ui.overwrite_pending.as_deref() != Some(name.as_str())
+        {
+            self.macro_ui.overwrite_pending = Some(name.clone());
+            self.macro_ui.error = Some(tr_args("macro.overwrite_confirm", &[("name", name)]));
+            cx.notify();
+            return;
+        }
+        match self
+            .settings
+            .macros
+            .upsert(&name, self.macro_recorded.clone())
+        {
+            Ok(()) => {
+                let _ = self.settings.save();
+                self.macro_ui.open = false;
+                self.macro_ui.error = None;
+                self.macro_ui.overwrite_pending = None;
+                self.macro_recorded.clear();
+                self.set_status(
+                    tr_args("status.macro_saved", &[("name", name.trim().to_string())]),
+                    cx,
+                );
+                self.rebuild_macro_keymap();
+                self.focus_editor(window, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.macro_ui.error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_macro_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.macro_ui.reset(window, cx);
+        cx.notify();
+    }
+
+    fn play_last_macro(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(saved) = self.settings.macros.macros.last().cloned() else {
+            self.set_status(tr("status.no_macros"), cx);
+            return;
+        };
+        self.play_macro(&saved, window, cx);
+    }
+
+    fn play_macro(&mut self, saved: &SavedMacro, window: &mut Window, cx: &mut Context<Self>) {
+        if self.macro_playback {
+            return;
+        }
+        let commands = saved.commands.clone();
+        let name = saved.name.clone();
+        self.macro_playback = true;
+        let mut failed = 0usize;
+        for command in &commands {
+            if !self.run_command(command, window, cx) {
+                failed += 1;
+            }
+        }
+        self.macro_playback = false;
+        self.set_status(
+            tr_args(
+                "status.macro_played",
+                &[
+                    ("name", name),
+                    ("count", commands.len().to_string()),
+                    ("failed", failed.to_string()),
+                ],
+            ),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn delete_macro(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.settings.macros.remove(name);
+        let _ = self.settings.save();
+        self.rebuild_macro_keymap();
+        self.macro_ui.selected = None;
+        self.set_status(
+            tr_args("status.macro_deleted", &[("name", name.to_string())]),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn rename_macro(&mut self, cx: &mut Context<Self>) {
+        let Some(old) = self.macro_ui.selected.clone() else {
+            self.macro_ui.error = Some(tr("macro.select_first"));
+            cx.notify();
+            return;
+        };
+        let new = self.macro_ui.name_input.read(cx).value().trim().to_string();
+        match self.settings.macros.rename(&old, &new) {
+            Ok(()) => {
+                let _ = self.settings.save();
+                self.macro_ui.selected = Some(new.clone());
+                self.macro_ui.error = None;
+                self.rebuild_macro_keymap();
+                self.set_status(tr_args("status.macro_renamed", &[("name", new)]), cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.macro_ui.error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn assign_macro_shortcut(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.macro_ui.selected.clone() else {
+            self.macro_ui.error = Some(tr("macro.select_first"));
+            cx.notify();
+            return;
+        };
+        let text = self.macro_ui.shortcut_input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            self.settings.macros.remove_binding(&name);
+            let _ = self.settings.save();
+            self.rebuild_macro_keymap();
+            self.macro_ui.error = None;
+            self.set_status(tr("status.macro_shortcut_removed"), cx);
+            cx.notify();
+            return;
+        }
+        match commands::validate_macro_binding(
+            &name,
+            &text,
+            &self.settings.keybindings,
+            &self.settings.macros.bindings,
+        ) {
+            Ok(formatted) => {
+                self.settings.macros.set_binding(&name, formatted);
+                let _ = self.settings.save();
+                self.rebuild_macro_keymap();
+                self.macro_ui.error = None;
+                self.set_status(tr("status.macro_shortcut_saved"), cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.macro_ui.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn rebuild_macro_keymap(&mut self) {
+        self.macro_keymap = commands::macro_keymap(&self.settings.macros.bindings);
     }
 
     fn refresh_placeholders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6771,6 +8172,8 @@ impl LubanApp {
             self.open_find(false, window, cx);
             return;
         }
+        self.settings.record_search(&query);
+        let _ = self.settings.save();
         if self.find.in_selection && self.find.scope.is_none() {
             let (a, b) = self.active_selection();
             if a != b {
@@ -6873,6 +8276,9 @@ impl LubanApp {
         if query.is_empty() {
             return;
         }
+        self.settings.record_search(&query);
+        self.settings.record_replacement(&replacement);
+        let _ = self.settings.save();
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -7003,6 +8409,62 @@ impl LubanApp {
         if query.is_empty() {
             return;
         }
+        self.settings.record_search(&query);
+        self.settings.record_replacement(&replacement);
+        let _ = self.settings.save();
+        if !self.ensure_active_text(cx) {
+            return;
+        }
+        let preview = {
+            let text = self
+                .tabs
+                .get(self.active)
+                .map(|tab| tab.doc.text.as_str())
+                .unwrap_or("");
+            self.find
+                .engine(&query)
+                .preview_replace(text, &replacement, self.find.scope, 5)
+        };
+        self.release_active_text();
+        match preview {
+            Ok(preview) => {
+                self.replace_preview = Some(ReplacePreviewState { preview });
+                cx.notify();
+            }
+            Err(err) => {
+                self.find.error = Some(err);
+                cx.notify();
+            }
+        }
+    }
+
+    fn confirm_replace_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let empty = self
+            .replace_preview
+            .as_ref()
+            .is_some_and(|state| state.preview.count == 0);
+        self.replace_preview = None;
+        if empty {
+            cx.notify();
+            return;
+        }
+        self.apply_replace_all(window, cx);
+    }
+
+    fn apply_replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(Document::is_huge) {
+            self.huge_replace_all(window, cx);
+            return;
+        }
+        self.sync_active(window, cx);
+        let query = self.find.query_text(cx);
+        let replacement = self.find.replacement_text(cx);
+        if query.is_empty() {
+            return;
+        }
+        self.settings.record_search(&query);
+        self.settings.record_replacement(&replacement);
+        let _ = self.settings.save();
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -7102,6 +8564,12 @@ impl LubanApp {
             cx.notify();
             return;
         }
+        self.settings.record_search(&query);
+        let _ = self.settings.save();
+        if self.find_in_files.open_documents {
+            self.search_open_documents(cx);
+            return;
+        }
         let folder = self.find_in_files.folder_path(cx);
         if !folder.is_dir() {
             self.find_in_files.status =
@@ -7141,6 +8609,74 @@ impl LubanApp {
             .ok();
         })
         .detach();
+    }
+
+    fn search_open_documents(&mut self, cx: &mut Context<Self>) {
+        let query = self.find_in_files.query_text(cx);
+        let engine =
+            luban_core::search::SearchEngine::new(query, self.find_in_files.search_options());
+        if let Some(error) = engine.error() {
+            self.find_in_files.clear_results();
+            self.find_in_files.status = error.to_string();
+            cx.notify();
+            return;
+        }
+        let mut matches = Vec::new();
+        let mut scanned = 0usize;
+        let mut files_with_matches = HashSet::new();
+        let mut truncated = false;
+        for tab in &self.tabs {
+            if tab.doc.is_huge() || tab.doc.partial_range().is_some() || tab.doc.is_non_text() {
+                continue;
+            }
+            let Some(path) = tab.doc.path.clone() else {
+                continue;
+            };
+            scanned += 1;
+            let before = matches.len();
+            let text = if tab.large_file {
+                tab.editor.read(cx).text().to_string()
+            } else {
+                tab.doc.text.clone()
+            };
+            let index = textutil::LineIndex::new(&text);
+            for matched in engine.find_all(&text, None, 2000 - matches.len()) {
+                let (line, column) = index.line_col(matched.start);
+                matches.push(FileMatch {
+                    path: path.clone(),
+                    line,
+                    column,
+                    line_text: index.line_text(&text, line - 1),
+                    match_text: textutil::slice_chars(&text, matched.start, matched.end),
+                    match_len: matched.len(),
+                });
+                if matches.len() >= 2000 {
+                    truncated = true;
+                    break;
+                }
+            }
+            if matches.len() > before {
+                files_with_matches.insert(path);
+            }
+            if truncated {
+                break;
+            }
+        }
+        self.find_in_files.generation += 1;
+        let generation = self.find_in_files.generation;
+        self.find_in_files.running = false;
+        self.find_in_files.cancel = None;
+        self.finish_find_in_files(
+            Ok(FindInFilesOutcome {
+                matches,
+                files_scanned: scanned,
+                files_with_matches: files_with_matches.len(),
+                truncated,
+                cancelled: false,
+            }),
+            generation,
+            cx,
+        );
     }
 
     fn finish_find_in_files(
@@ -7360,7 +8896,28 @@ impl LubanApp {
             can_save: tab.is_some(),
             can_undo,
             can_redo,
+            can_edit_full_text: tab.is_some_and(|tab| {
+                !tab.doc.is_huge()
+                    && !tab.large_file
+                    && tab.doc.partial_range().is_none()
+                    && !tab.doc.is_non_text()
+            }),
         }
+    }
+
+    /// A cheap fingerprint of state a macro can reasonably replay.
+    ///
+    /// Tab revisions catch document edits, and the serialized settings catch
+    /// view/theme/preference changes. Commands that only move a caret or open
+    /// a transient overlay do not add a macro step.
+    fn macro_state_signature(&self) -> (usize, usize, Vec<u64>, Vec<bool>, String) {
+        (
+            self.tabs.len(),
+            self.active,
+            self.tabs.iter().map(|tab| tab.doc.revision()).collect(),
+            self.tabs.iter().map(|tab| tab.doc.is_modified()).collect(),
+            serde_json::to_string(&self.settings).unwrap_or_default(),
+        )
     }
 
     /// Execute a registered command. Menu items, the toolbar, shortcuts and
@@ -7373,6 +8930,12 @@ impl LubanApp {
         if !spec.enabled(&self.command_context()) {
             return false;
         }
+        if id != "edit.select-next-occurrence" {
+            self.occurrence_anchor = None;
+        }
+        let recording_before =
+            (self.macro_recording && !self.macro_playback && luban_core::macros::recordable(id))
+                .then(|| self.macro_state_signature());
         match id {
             "file.new" => self.new_file(window, cx),
             "file.open" => self.open_file_dialog(window, cx),
@@ -7382,6 +8945,8 @@ impl LubanApp {
             "file.save-all" => self.save_all(window, cx),
             "file.reload" => self.reload_active(window, cx),
             "file.local-history" => self.open_local_history(window, cx),
+            "file.export-html" => self.export_document(ExportFormat::Html, window, cx),
+            "file.export-rtf" => self.export_document(ExportFormat::Rtf, window, cx),
             "file.close" => self.request_close_active(window, cx),
             "file.close-all" => self.request_close_all(window, cx),
             "file.exit" => self.request_exit(window, cx),
@@ -7402,6 +8967,41 @@ impl LubanApp {
             "edit.title-case" => self.transform_case(textutil::CaseMode::Title, window, cx),
             "edit.sort-asc" => self.sort_selection(true, window, cx),
             "edit.sort-desc" => self.sort_selection(false, window, cx),
+            "edit.sort-ignore-case-asc" => {
+                self.sort_selection_mode(SortMode::Text, true, true, 1, window, cx)
+            }
+            "edit.sort-ignore-case-desc" => {
+                self.sort_selection_mode(SortMode::Text, false, true, 1, window, cx)
+            }
+            "edit.sort-numeric-asc" => {
+                self.sort_selection_mode(SortMode::Numeric, true, false, 1, window, cx)
+            }
+            "edit.sort-numeric-desc" => {
+                self.sort_selection_mode(SortMode::Numeric, false, false, 1, window, cx)
+            }
+            "edit.sort-by-column" => self.open_sort_dialog(window, cx),
+            "edit.move-line-up" => self.move_lines(true, window, cx),
+            "edit.move-line-down" => self.move_lines(false, window, cx),
+            "edit.join-lines" => self.join_lines(window, cx),
+            "edit.split-lines" => self.split_lines(window, cx),
+            "edit.remove-duplicate-lines" => self.remove_duplicate_lines(window, cx),
+            "edit.remove-empty-lines" => self.remove_empty_lines(window, cx),
+            "edit.filter-lines" => self.open_filter_dialog(window, cx),
+            "edit.column-editor" => self.open_column_editor(window, cx),
+            "edit.add-cursor-above" => {
+                if self.multi_cursor_available(window, cx) {
+                    self.editor_action(Box::new(AddCursorAbove), window, cx);
+                }
+            }
+            "edit.add-cursor-below" => {
+                if self.multi_cursor_available(window, cx) {
+                    self.editor_action(Box::new(AddCursorBelow), window, cx);
+                }
+            }
+            "edit.select-next-occurrence" => self.select_next_occurrence(window, cx),
+            "edit.select-all-occurrences" => self.select_all_occurrences(window, cx),
+            "edit.unfold-current" => self.unfold_current(window, cx),
+            "edit.unfold-all" => self.unfold_all(window, cx),
             "search.find" => self.open_find(false, window, cx),
             "search.replace" => self.open_find(true, window, cx),
             "search.find-next" => self.find_next(true, window, cx),
@@ -7412,6 +9012,19 @@ impl LubanApp {
                 self.find.clear();
                 cx.notify();
             }
+            "search.mark-all" => self.mark_find_all(window, cx),
+            "search.clear-history" => self.clear_search_history(cx),
+            "bookmarks.toggle" => self.toggle_bookmark(window, cx),
+            "bookmarks.next" => self.goto_bookmark(true, window, cx),
+            "bookmarks.previous" => self.goto_bookmark(false, window, cx),
+            "bookmarks.clear" => self.clear_bookmarks(cx),
+            "bookmarks.cut-lines" => self.bookmark_lines(BookmarkAction::Cut, window, cx),
+            "bookmarks.copy-lines" => self.bookmark_lines(BookmarkAction::Copy, window, cx),
+            "bookmarks.delete-lines" => self.bookmark_lines(BookmarkAction::Delete, window, cx),
+            "macro.toggle-recording" => self.toggle_macro_recording(window, cx),
+            "macro.play-last" => self.play_last_macro(window, cx),
+            "macro.play-saved" => self.open_macro_dialog(window, cx),
+            "macro.save-recording" => self.save_macro_recording(window, cx),
             "view.word-wrap" => {
                 self.settings.word_wrap = !self.settings.word_wrap;
                 self.apply_settings(window, cx);
@@ -7496,6 +9109,12 @@ impl LubanApp {
             other => {
                 log::warn!("command {other} has no implementation");
                 return false;
+            }
+        }
+        if let Some(before) = recording_before {
+            if before != self.macro_state_signature() {
+                self.macro_recorded.push(id.to_string());
+                cx.notify();
             }
         }
         true
@@ -8202,6 +9821,33 @@ impl LubanApp {
             return self.capture_shortcut(&event.keystroke, window, cx);
         }
         if key == "escape" {
+            if self.replace_preview.is_some() {
+                self.replace_preview = None;
+                cx.notify();
+                return true;
+            }
+            if self.column_editor.open {
+                self.column_editor.open = false;
+                self.column_editor.error = None;
+                cx.notify();
+                return true;
+            }
+            if self.sort_dialog.is_some() {
+                self.sort_dialog = None;
+                cx.notify();
+                return true;
+            }
+            if self.filter_dialog.is_some() {
+                self.filter_dialog = None;
+                cx.notify();
+                return true;
+            }
+            if self.macro_ui.open {
+                self.macro_ui.open = false;
+                self.macro_ui.error = None;
+                cx.notify();
+                return true;
+            }
             if self.palette.is_some() {
                 self.close_palette(window, cx);
                 return true;
@@ -8277,6 +9923,39 @@ impl LubanApp {
             return false;
         }
 
+        if key == "enter" {
+            if self.replace_preview.is_some() {
+                self.confirm_replace_preview(window, cx);
+                return true;
+            }
+            if self.sort_dialog.is_some() {
+                self.apply_sort_dialog(window, cx);
+                return true;
+            }
+            if self.filter_dialog.is_some() {
+                self.apply_filter_dialog(window, cx);
+                return true;
+            }
+            if self.column_editor.open {
+                self.apply_column_editor(window, cx);
+                return true;
+            }
+            if self.macro_ui.open {
+                self.confirm_save_macro(window, cx);
+                return true;
+            }
+        }
+
+        if self.column_editor.open
+            || self.sort_dialog.is_some()
+            || self.filter_dialog.is_some()
+            || self.macro_ui.open
+        {
+            // Text fields inside these dialogs own ordinary typing. Only
+            // command/alt chords are left for the application.
+            return command || alt;
+        }
+
         // Registered commands take precedence over the legacy inline
         // handlers below. Editing commands only apply while the editor owns
         // the focus, so a find field or dialog keeps Ctrl+C/V/A. A rebound
@@ -8305,6 +9984,17 @@ impl LubanApp {
                 .suppressed_binding(lookup_key, command, shift, alt)
             {
                 if !id.starts_with("edit.") || editor_focused {
+                    return true;
+                }
+            }
+            let macro_name = self
+                .macro_keymap
+                .iter()
+                .find(|(binding, _)| binding.matches(lookup_key, command, shift, alt))
+                .map(|(_, name)| name.clone());
+            if let Some(name) = macro_name {
+                if let Some(saved) = self.settings.macros.find(&name).cloned() {
+                    self.play_macro(&saved, window, cx);
                     return true;
                 }
             }
@@ -8557,6 +10247,10 @@ impl LubanApp {
             .unwrap_or_else(|| language::PLAIN_TEXT.to_string());
         let active_partial = self.active_doc().is_some_and(Document::is_partial);
         let active_huge = self.active_doc().is_some_and(Document::is_huge);
+        let active_large = self.active_tab().is_some_and(|tab| tab.large_file);
+        let active_non_text = self.active_doc().is_some_and(Document::is_non_text);
+        let can_edit_full_text =
+            has_doc && !active_huge && !active_partial && !active_large && !active_non_text;
         let closed_tab_count = self.closed_tabs.len();
 
         let weak_file = weak.clone();
@@ -8579,7 +10273,7 @@ impl LubanApp {
                         false,
                         None,
                         |this, window, cx| {
-                            this.new_file(window, cx);
+                            this.run_command("file.new", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8588,7 +10282,7 @@ impl LubanApp {
                         false,
                         None,
                         |this, window, cx| {
-                            this.open_file_dialog(window, cx);
+                            this.run_command("file.open", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8597,7 +10291,7 @@ impl LubanApp {
                         false,
                         None,
                         |this, window, cx| {
-                            this.open_folder_dialog(window, cx);
+                            this.run_command("file.open-folder", window, cx);
                         },
                     ))
                     .separator();
@@ -8638,7 +10332,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.save_active(window, cx);
+                            this.run_command("file.save", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8647,7 +10341,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.save_active_as(window, cx);
+                            this.run_command("file.save-as", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8656,7 +10350,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.save_all(window, cx);
+                            this.run_command("file.save-all", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8665,7 +10359,7 @@ impl LubanApp {
                         !has_doc || (active_partial && !active_huge),
                         None,
                         |this, window, cx| {
-                            this.reload_active(window, cx);
+                            this.run_command("file.reload", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8677,6 +10371,24 @@ impl LubanApp {
                             this.run_command("file.local-history", window, cx);
                         },
                     ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.export-html"),
+                        !has_doc || active_huge || active_partial,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.export-html", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.export-rtf"),
+                        !has_doc || active_huge || active_partial,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.export-rtf", window, cx);
+                        },
+                    ))
                     .separator()
                     .item(Self::menu_item(
                         &weak_file,
@@ -8684,7 +10396,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.request_close_active(window, cx);
+                            this.run_command("file.close", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8693,7 +10405,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.request_close_all(window, cx);
+                            this.run_command("file.close-all", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8712,7 +10424,7 @@ impl LubanApp {
                         false,
                         None,
                         |this, window, cx| {
-                            this.request_exit(window, cx);
+                            this.run_command("file.exit", window, cx);
                         },
                     ));
                 Self::fit_menu(menu, window)
@@ -8730,7 +10442,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.undo_or_editor(false, window, cx);
+                            this.run_command("edit.undo", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8739,7 +10451,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.undo_or_editor(true, window, cx);
+                            this.run_command("edit.redo", window, cx);
                         },
                     ))
                     .separator()
@@ -8749,7 +10461,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Cut), window, cx);
+                            this.run_command("edit.cut", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8758,7 +10470,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Copy), window, cx);
+                            this.run_command("edit.copy", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8767,7 +10479,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Paste), window, cx);
+                            this.run_command("edit.paste", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8776,7 +10488,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(SelectAll), window, cx);
+                            this.run_command("edit.select-all", window, cx);
                         },
                     ))
                     .separator()
@@ -8786,7 +10498,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Indent), window, cx);
+                            this.run_command("edit.indent", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8795,7 +10507,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.editor_action(Box::new(Outdent), window, cx);
+                            this.run_command("edit.outdent", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8804,7 +10516,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.duplicate_line(window, cx);
+                            this.run_command("edit.duplicate-line", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8813,7 +10525,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.delete_line(window, cx);
+                            this.run_command("edit.delete-line", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8822,7 +10534,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.toggle_comment(window, cx);
+                            this.run_command("edit.toggle-comment", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8831,7 +10543,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.trim_trailing(window, cx);
+                            this.run_command("edit.trim-whitespace", window, cx);
                         },
                     ))
                     .separator();
@@ -8842,7 +10554,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.transform_case(textutil::CaseMode::Upper, window, cx);
+                            this.run_command("edit.uppercase", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8851,7 +10563,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.transform_case(textutil::CaseMode::Lower, window, cx);
+                            this.run_command("edit.lowercase", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8860,7 +10572,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.transform_case(textutil::CaseMode::Title, window, cx);
+                            this.run_command("edit.title-case", window, cx);
                         },
                     ))
                     .separator()
@@ -8870,7 +10582,7 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.sort_selection(true, window, cx);
+                            this.run_command("edit.sort-asc", window, cx);
                         },
                     ))
                     .item(Self::menu_item(
@@ -8879,7 +10591,246 @@ impl LubanApp {
                         !has_doc,
                         None,
                         |this, window, cx| {
-                            this.sort_selection(false, window, cx);
+                            this.run_command("edit.sort-desc", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.sort-ignore-case-asc"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.sort-ignore-case-asc", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.sort-ignore-case-desc"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.sort-ignore-case-desc", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.sort-numeric-asc"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.sort-numeric-asc", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.sort-numeric-desc"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.sort-numeric-desc", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.sort-by-column"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.sort-by-column", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.filter-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.filter-lines", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.move-line-up"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.move-line-up", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.move-line-down"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.move-line-down", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.join-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.join-lines", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.split-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.split-lines", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.remove-duplicate-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.remove-duplicate-lines", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.remove-empty-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.remove-empty-lines", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("bookmarks.cut-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("bookmarks.cut-lines", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("bookmarks.copy-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("bookmarks.copy-lines", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("bookmarks.delete-lines"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("bookmarks.delete-lines", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.column-editor"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.column-editor", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.select-next-occurrence"),
+                        !can_edit_full_text,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.select-next-occurrence", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.select-all-occurrences"),
+                        !can_edit_full_text,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.select-all-occurrences", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.add-cursor-above"),
+                        !can_edit_full_text,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.add-cursor-above", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.add-cursor-below"),
+                        !can_edit_full_text,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.add-cursor-below", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.unfold-current"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.unfold-current", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("edit.unfold-all"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.unfold-all", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("macro.toggle-recording"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("macro.toggle-recording", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("macro.play-last"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("macro.play-last", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("macro.save-recording"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("macro.save-recording", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_edit,
+                        Self::command_label("macro.play-saved"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("macro.play-saved", window, cx);
                         },
                     ))
                     .separator();
@@ -8918,7 +10869,7 @@ impl LubanApp {
                     !has_doc,
                     None,
                     |this, window, cx| {
-                        this.open_find(false, window, cx);
+                        this.run_command("search.find", window, cx);
                     },
                 ))
                 .item(Self::menu_item(
@@ -8927,7 +10878,7 @@ impl LubanApp {
                     !has_doc,
                     None,
                     |this, window, cx| {
-                        this.open_find(true, window, cx);
+                        this.run_command("search.replace", window, cx);
                     },
                 ))
                 .item(Self::menu_item(
@@ -8936,7 +10887,7 @@ impl LubanApp {
                     !has_doc,
                     None,
                     |this, window, cx| {
-                        this.find_next(true, window, cx);
+                        this.run_command("search.find-next", window, cx);
                     },
                 ))
                 .item(Self::menu_item(
@@ -8945,7 +10896,7 @@ impl LubanApp {
                     !has_doc,
                     None,
                     |this, window, cx| {
-                        this.find_next(false, window, cx);
+                        this.run_command("search.find-previous", window, cx);
                     },
                 ))
                 .separator()
@@ -8955,7 +10906,7 @@ impl LubanApp {
                     !has_doc,
                     None,
                     |this, window, cx| {
-                        this.open_go_to_line(window, cx);
+                        this.run_command("search.go-to-line", window, cx);
                     },
                 ))
                 .item(Self::menu_item(
@@ -8964,7 +10915,7 @@ impl LubanApp {
                     false,
                     None,
                     |this, window, cx| {
-                        this.open_find_in_files(window, cx);
+                        this.run_command("search.find-in-files", window, cx);
                     },
                 ))
                 .item(Self::menu_item(
@@ -8972,9 +10923,63 @@ impl LubanApp {
                     Self::command_label("search.clear-highlights"),
                     false,
                     None,
-                    |this, _, cx| {
-                        this.find.clear();
-                        cx.notify();
+                    |this, window, cx| {
+                        this.run_command("search.clear-highlights", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("search.mark-all"),
+                    !has_doc,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("search.mark-all", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("search.clear-history"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("search.clear-history", window, cx);
+                    },
+                ))
+                .separator()
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("bookmarks.toggle"),
+                    !has_doc,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("bookmarks.toggle", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("bookmarks.next"),
+                    !has_doc,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("bookmarks.next", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("bookmarks.previous"),
+                    !has_doc,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("bookmarks.previous", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("bookmarks.clear"),
+                    !has_doc,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("bookmarks.clear", window, cx);
                     },
                 ))
             });
@@ -9719,7 +11724,7 @@ impl LubanApp {
                                     move |_, window, cx| {
                                         let _ = weak_reload.update(cx, |this, cx| {
                                             this.activate_tab_index(index, window, cx);
-                                            this.reload_active(window, cx);
+                                            this.run_command("file.reload", window, cx);
                                         });
                                     },
                                 ),
@@ -9941,16 +11946,41 @@ impl LubanApp {
             None if self.active_doc().is_some() => tr("status.words_unavailable"),
             None => String::new(),
         };
-        let indent_label = if self.settings.use_spaces {
+        let (indent_size, indent_spaces) = self
+            .active_tab()
+            .map(|tab| {
+                if Self::language_indent_applies(&tab.doc, tab.large_file) {
+                    (
+                        self.settings.tab_size_for(&tab.doc.language),
+                        self.settings.use_spaces_for(&tab.doc.language),
+                    )
+                } else {
+                    (self.settings.tab_size, self.settings.use_spaces)
+                }
+            })
+            .unwrap_or((self.settings.tab_size, self.settings.use_spaces));
+        let indent_label = if indent_spaces {
+            tr_args("status.indent_spaces", &[("size", indent_size.to_string())])
+        } else {
+            tr_args("status.indent_tab", &[("size", indent_size.to_string())])
+        };
+        let bookmark_label = self
+            .active_tab()
+            .filter(|tab| !tab.bookmarks.is_empty())
+            .map(|tab| {
+                tr_args(
+                    "status.bookmarks",
+                    &[("count", tab.bookmarks.len().to_string())],
+                )
+            })
+            .unwrap_or_default();
+        let macro_label = if self.macro_recording {
             tr_args(
-                "status.indent_spaces",
-                &[("size", self.settings.tab_size.to_string())],
+                "status.macro_recording_count",
+                &[("count", self.macro_recorded.len().to_string())],
             )
         } else {
-            tr_args(
-                "status.indent_tab",
-                &[("size", self.settings.tab_size.to_string())],
-            )
+            String::new()
         };
         let read_only_label = if self.active_doc().is_some_and(|doc| doc.read_only) {
             tr("status.read_only")
@@ -9977,6 +12007,8 @@ impl LubanApp {
                 div().child(size_label),
                 div().child(words_label),
                 div().child(indent_label),
+                div().child(bookmark_label),
+                div().child(macro_label),
                 div().child(read_only_label),
                 div().child(if large_file {
                     tr("status.large_file")
@@ -10189,7 +12221,7 @@ impl LubanApp {
                         .hover(|this| this.bg(cx.theme().colors.secondary))
                         .child(tr("explorer.open_folder"))
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.open_folder_dialog(window, cx);
+                            this.run_command("file.open-folder", window, cx);
                         })),
                 ),
         );
@@ -10336,6 +12368,7 @@ impl LubanApp {
         let weak_prev = weak.clone();
         let weak_next = weak.clone();
         let weak_all_find = weak.clone();
+        let weak_mark_all = weak.clone();
         let weak_close = weak.clone();
         let mut bar = div()
             .flex()
@@ -10403,6 +12436,61 @@ impl LubanApp {
                             }),
                     )
                     .child(
+                        Button::new("find-mark-all")
+                            .label(tr("find.mark_all"))
+                            .ghost()
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_mark_all.update(cx, |this, cx| {
+                                    this.mark_find_all(window, cx);
+                                });
+                            }),
+                    )
+                    .child({
+                        let weak_history = weak.clone();
+                        let query = query_input.clone();
+                        let history = self.settings.search_history.clone();
+                        Button::new("find-history")
+                            .label(tr("find.history"))
+                            .ghost()
+                            .compact()
+                            .dropdown_menu(move |mut menu, window, _cx| {
+                                if history.is_empty() {
+                                    menu = menu.item(
+                                        PopupMenuItem::new(tr("find.no_history")).disabled(true),
+                                    );
+                                }
+                                for entry in &history {
+                                    let value = entry.clone();
+                                    let query = query.clone();
+                                    let weak = weak_history.clone();
+                                    menu = menu.item(PopupMenuItem::new(entry.clone()).on_click(
+                                        move |_, window, cx| {
+                                            let value = value.clone();
+                                            let _ = weak.update(cx, |this, cx| {
+                                                query.update(cx, |input, cx| {
+                                                    input.set_value(value, window, cx)
+                                                });
+                                                this.find.dirty = true;
+                                                cx.notify();
+                                            });
+                                        },
+                                    ));
+                                }
+                                let weak_clear = weak_history.clone();
+                                menu = menu.separator().item(
+                                    PopupMenuItem::new(tr("find.clear_history")).on_click(
+                                        move |_, _, cx| {
+                                            let _ = weak_clear.update(cx, |this, cx| {
+                                                this.clear_search_history(cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                                Self::fit_menu(menu, window)
+                            })
+                    })
+                    .child(
                         Button::new("find-close")
                             .label(tr("common.close"))
                             .ghost()
@@ -10456,6 +12544,17 @@ impl LubanApp {
                             })),
                     )
                     .child(
+                        Checkbox::new("find-enhanced-regex")
+                            .label(tr("find.enhanced_regex"))
+                            .checked(self.find.enhanced_regex)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.find.enhanced_regex = *checked;
+                                this.find.dirty = true;
+                                this.find.scope = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Checkbox::new("find-dotall")
                             .label(tr("find.dot_newline"))
                             .checked(self.find.dot_matches_newline)
@@ -10496,6 +12595,50 @@ impl LubanApp {
                             .min_w(px(0.))
                             .child(Input::new(&replacement_input).w_full().h(px(28.))),
                     )
+                    .child({
+                        let weak_history = weak.clone();
+                        let replacement = replacement_input.clone();
+                        let history = self.settings.replace_history.clone();
+                        Button::new("replace-history")
+                            .label(tr("find.history"))
+                            .ghost()
+                            .compact()
+                            .dropdown_menu(move |mut menu, window, _cx| {
+                                if history.is_empty() {
+                                    menu = menu.item(
+                                        PopupMenuItem::new(tr("find.no_history")).disabled(true),
+                                    );
+                                }
+                                for entry in &history {
+                                    let value = entry.clone();
+                                    let replacement = replacement.clone();
+                                    let weak = weak_history.clone();
+                                    menu = menu.item(PopupMenuItem::new(entry.clone()).on_click(
+                                        move |_, window, cx| {
+                                            let value = value.clone();
+                                            let _ = weak.update(cx, |this, cx| {
+                                                replacement.update(cx, |input, cx| {
+                                                    input.set_value(value, window, cx)
+                                                });
+                                                this.find.dirty = true;
+                                                cx.notify();
+                                            });
+                                        },
+                                    ));
+                                }
+                                let weak_clear = weak_history.clone();
+                                menu = menu.separator().item(
+                                    PopupMenuItem::new(tr("find.clear_history")).on_click(
+                                        move |_, _, cx| {
+                                            let _ = weak_clear.update(cx, |this, cx| {
+                                                this.clear_search_history(cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                                Self::fit_menu(menu, window)
+                            })
+                    })
                     .child(
                         Button::new("replace-one")
                             .label(tr("find.replace"))
@@ -10570,6 +12713,7 @@ impl LubanApp {
     }
 
     fn cancel_overwrite(&mut self, cx: &mut Context<Self>) {
+        self.pending_export = None;
         if let Some(request) = self.overwrite_save.take() {
             if matches!(
                 request.then,
@@ -10586,9 +12730,555 @@ impl LubanApp {
     }
 
     fn confirm_overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(request) = self.overwrite_save.take() {
-            self.save_as_request(request, window, cx);
+        let Some(request) = self.overwrite_save.take() else {
+            return;
+        };
+        if let Some(format) = self.pending_export.take() {
+            self.write_export(&request.path, format, window, cx);
+            return;
         }
+        self.save_as_request(request, window, cx);
+    }
+
+    fn render_replace_preview(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = &self.replace_preview else {
+            return div().into_any_element();
+        };
+        let count = state.preview.count;
+        let mut samples = Vec::new();
+        for (before, after) in &state.preview.samples {
+            samples.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors.border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(textutil::preview(before, 160)),
+                    )
+                    .child(div().text_sm().child(textutil::preview(after, 160)))
+                    .into_any_element(),
+            );
+        }
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("find.preview_title")),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(tr_args(
+                        "find.preview_count",
+                        &[("count", count.to_string())],
+                    )),
+            )
+            .child(
+                div()
+                    .id("replace-preview-list")
+                    .flex()
+                    .flex_col()
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .children(samples),
+            )
+            .child(if count == 0 {
+                div()
+                    .flex()
+                    .justify_end()
+                    .child(
+                        Button::new("replace-preview-cancel")
+                            .label(tr("common.close"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.replace_preview = None;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("replace-preview-cancel")
+                            .label(tr("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.replace_preview = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("replace-preview-confirm")
+                            .label(tr("find.replace_all"))
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_replace_preview(window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .into_any_element();
+        self.overlay_card(520.0, None, cx, content)
+    }
+
+    fn render_sort_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = &self.sort_dialog else {
+            return div().into_any_element();
+        };
+        let input = dialog.column.clone();
+        let ascending = dialog.ascending;
+        let ignore_case = dialog.ignore_case;
+        let error = dialog.error.clone();
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("sort.title")),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(tr("sort.column_help")),
+            )
+            .child(Input::new(&input).h(px(30.)))
+            .child(
+                Checkbox::new("sort-ascending")
+                    .label(tr("sort.ascending"))
+                    .checked(ascending)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        if let Some(dialog) = this.sort_dialog.as_mut() {
+                            dialog.ascending = *checked;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Checkbox::new("sort-ignore-case")
+                    .label(tr("sort.ignore_case"))
+                    .checked(ignore_case)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        if let Some(dialog) = this.sort_dialog.as_mut() {
+                            dialog.ignore_case = *checked;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("sort-cancel")
+                            .label(tr("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sort_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("sort-apply")
+                            .label(tr("sort.apply"))
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_sort_dialog(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        self.overlay_card(420.0, None, cx, content)
+    }
+
+    fn render_filter_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = &self.filter_dialog else {
+            return div().into_any_element();
+        };
+        let input = dialog.needle.clone();
+        let keep = dialog.keep;
+        let match_case = dialog.match_case;
+        let regex = dialog.regex;
+        let error = dialog.error.clone();
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("filter.title")),
+            )
+            .child(Input::new(&input).h(px(30.)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        Checkbox::new("filter-keep")
+                            .label(tr("filter.keep"))
+                            .checked(keep)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                if let Some(dialog) = this.filter_dialog.as_mut() {
+                                    dialog.keep = *checked;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("filter-case")
+                            .label(tr("filter.match_case"))
+                            .checked(match_case)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                if let Some(dialog) = this.filter_dialog.as_mut() {
+                                    dialog.match_case = *checked;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("filter-regex")
+                            .label(tr("filter.regex"))
+                            .checked(regex)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                if let Some(dialog) = this.filter_dialog.as_mut() {
+                                    dialog.regex = *checked;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("filter-cancel")
+                            .label(tr("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.filter_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("filter-apply")
+                            .label(tr("filter.apply"))
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_filter_dialog(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        self.overlay_card(440.0, None, cx, content)
+    }
+
+    fn render_column_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.column_editor.open {
+            return div().into_any_element();
+        }
+        let numbers = self.column_editor.numbers;
+        let text_input = self.column_editor.text.clone();
+        let start_input = self.column_editor.start.clone();
+        let step_input = self.column_editor.step.clone();
+        let width_input = self.column_editor.width.clone();
+        let column_input = self.column_editor.column.clone();
+        let error = self.column_editor.error.clone();
+        let mut fields = div().flex().flex_col().gap_2();
+        fields = fields.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("column-text-mode")
+                        .label(tr("column.text_mode"))
+                        .when(!numbers, |button| button.primary())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.column_editor.numbers = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("column-number-mode")
+                        .label(tr("column.number_mode"))
+                        .when(numbers, |button| button.primary())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.column_editor.numbers = true;
+                            cx.notify();
+                        })),
+                ),
+        );
+        if numbers {
+            fields = fields
+                .child(div().text_sm().child(tr("column.start")))
+                .child(Input::new(&start_input).h(px(30.)))
+                .child(div().text_sm().child(tr("column.step")))
+                .child(Input::new(&step_input).h(px(30.)))
+                .child(div().text_sm().child(tr("column.width")))
+                .child(Input::new(&width_input).h(px(30.)));
+        } else {
+            fields = fields
+                .child(div().text_sm().child(tr("column.text")))
+                .child(Input::new(&text_input).h(px(30.)));
+        }
+        fields = fields
+            .child(div().text_sm().child(tr("column.column")))
+            .child(Input::new(&column_input).h(px(30.)));
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("column.title")),
+            )
+            .child(fields)
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("column-cancel")
+                            .label(tr("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.column_editor.open = false;
+                                this.column_editor.error = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("column-apply")
+                            .label(tr("column.apply"))
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_column_editor(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        self.overlay_card(440.0, None, cx, content)
+    }
+
+    fn render_macro_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.macro_ui.open {
+            return div().into_any_element();
+        }
+        let selected = self.macro_ui.selected.clone();
+        let recorded = self.macro_recorded.len();
+        let macros = self.settings.macros.macros.clone();
+        let mut rows = Vec::new();
+        for saved in macros {
+            let name = saved.name.clone();
+            let is_selected = selected.as_deref() == Some(name.as_str());
+            let shortcut = self
+                .settings
+                .macros
+                .binding(&name)
+                .unwrap_or("")
+                .to_string();
+            let weak = cx.weak_entity();
+            rows.push(
+                div()
+                    .id(format!("macro-row:{name}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .when(is_selected, |this| this.bg(cx.theme().colors.accent))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_sm().child(name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(format!(
+                                        "{} · {}",
+                                        saved.commands.len(),
+                                        if shortcut.is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            shortcut
+                                        }
+                                    )),
+                            ),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let name = name.clone();
+                        let _ = weak.update(cx, |this, cx| {
+                            this.macro_ui.selected = Some(name);
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        let name_input = self.macro_ui.name_input.clone();
+        let shortcut_input = self.macro_ui.shortcut_input.clone();
+        let error = self.macro_ui.error.clone();
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("macro.title")),
+            )
+            .child(
+                div()
+                    .id("macro-list")
+                    .flex()
+                    .flex_col()
+                    .max_h(px(220.))
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("macro-play")
+                            .label(tr("macro.play"))
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let Some(name) = this.macro_ui.selected.clone() else {
+                                    return;
+                                };
+                                let Some(saved) = this.settings.macros.find(&name).cloned() else {
+                                    return;
+                                };
+                                this.play_macro(&saved, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("macro-delete")
+                            .label(tr("macro.delete"))
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(name) = this.macro_ui.selected.clone() else {
+                                    return;
+                                };
+                                this.delete_macro(&name, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("macro-rename")
+                            .label(tr("macro.rename"))
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.rename_macro(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(Input::new(&shortcut_input).h(px(30.)).flex_1())
+                    .child(
+                        Button::new("macro-assign")
+                            .label(tr("macro.assign_shortcut"))
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.assign_macro_shortcut(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(Input::new(&name_input).h(px(30.)).flex_1())
+                    .child(
+                        Button::new("macro-save")
+                            .label(tr("macro.save_recording"))
+                            .primary()
+                            .disabled(recorded == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_save_macro(window, cx);
+                            })),
+                    ),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div().flex().justify_end().child(
+                    Button::new("macro-close")
+                        .label(tr("common.close"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.macro_ui.open = false;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .into_any_element();
+        self.overlay_card(560.0, Some(600.0), cx, content)
     }
 
     fn render_overwrite_confirm(
@@ -11791,6 +14481,21 @@ impl LubanApp {
         if self.overwrite_save.is_some() {
             overlays.push(self.render_overwrite_confirm(window, cx));
         }
+        if self.replace_preview.is_some() {
+            overlays.push(self.render_replace_preview(cx));
+        }
+        if self.sort_dialog.is_some() {
+            overlays.push(self.render_sort_dialog(cx));
+        }
+        if self.filter_dialog.is_some() {
+            overlays.push(self.render_filter_dialog(cx));
+        }
+        if self.column_editor.open {
+            overlays.push(self.render_column_editor(cx));
+        }
+        if self.macro_ui.open {
+            overlays.push(self.render_macro_dialog(cx));
+        }
         overlays
     }
 
@@ -12189,6 +14894,24 @@ impl LubanApp {
                             })),
                     )
                     .child(
+                        Checkbox::new("ff-enhanced-regex")
+                            .label(tr("ff.enhanced_regex"))
+                            .checked(self.find_in_files.enhanced_regex)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.find_in_files.enhanced_regex = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("ff-open-docs")
+                            .label(tr("ff.open_documents"))
+                            .checked(self.find_in_files.open_documents)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.find_in_files.open_documents = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Button::new("ff-search")
                             .label(tr(if running { "ff.searching" } else { "ff.search" }))
                             .primary()
@@ -12385,8 +15108,15 @@ impl LubanApp {
         self.overlay_card(520.0, Some(560.0), cx, content)
     }
 
-    fn open_preferences(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.open = true;
+        let value = self
+            .settings
+            .tab_size_for(&self.preferences.language)
+            .to_string();
+        self.preferences
+            .language_tab_size
+            .update(cx, |input, cx| input.set_value(value, window, cx));
         cx.notify();
     }
 
@@ -12594,6 +15324,74 @@ impl LubanApp {
                                     }),
                             ),
                     )
+                    .child({
+                        let syntax_label = if settings.syntax_theme == "custom" {
+                            settings
+                                .syntax_theme_path
+                                .as_ref()
+                                .and_then(|path| path.file_stem())
+                                .map(|stem| stem.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| tr("prefs.syntax_custom"))
+                        } else if settings.syntax_theme == "default"
+                            || settings.syntax_theme.is_empty()
+                        {
+                            tr("prefs.syntax_default")
+                        } else {
+                            THEME_OPTIONS
+                                .iter()
+                                .find(|option| option.id == settings.syntax_theme)
+                                .map(|option| option.label.to_string())
+                                .unwrap_or_else(|| settings.syntax_theme.clone())
+                        };
+                        let weak_theme = weak.clone();
+                        let weak_import = weak.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().w(px(140.)).text_sm().child(tr("prefs.syntax_theme")))
+                            .child(
+                                Button::new("prefs-syntax-theme")
+                                    .label(syntax_label)
+                                    .dropdown_menu(move |mut menu, window, _cx| {
+                                        let weak_default = weak_theme.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(tr("prefs.syntax_default"))
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_default.update(cx, |this, cx| {
+                                                        this.set_syntax_theme(
+                                                            "default", window, cx,
+                                                        );
+                                                    });
+                                                }),
+                                        );
+                                        for option in THEME_OPTIONS {
+                                            let weak = weak_theme.clone();
+                                            let id = option.id;
+                                            menu = menu.item(
+                                                PopupMenuItem::new(option.label).on_click(
+                                                    move |_, window, cx| {
+                                                        let _ = weak.update(cx, |this, cx| {
+                                                            this.set_syntax_theme(id, window, cx);
+                                                        });
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        Self::fit_menu(menu, window)
+                                    }),
+                            )
+                            .child(
+                                Button::new("prefs-import-theme")
+                                    .label(tr("prefs.import_theme"))
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak_import.update(cx, |this, cx| {
+                                            this.open_syntax_theme_dialog(window, cx);
+                                        });
+                                    }),
+                            )
+                    })
                     .child(
                         div()
                             .flex()
@@ -12692,6 +15490,218 @@ impl LubanApp {
                                 },
                             )),
                     )
+                    .child({
+                        let language = self.preferences.language.clone();
+                        let overrides = self.language_override().cloned().unwrap_or_default();
+                        let weak_language = weak.clone();
+                        let weak_tab_apply = weak.clone();
+                        let weak_spaces_inherit = weak.clone();
+                        let weak_spaces_on = weak.clone();
+                        let weak_spaces_off = weak.clone();
+                        let weak_eol_inherit = weak.clone();
+                        let weak_eol_lf = weak.clone();
+                        let weak_eol_crlf = weak.clone();
+                        let weak_eol_cr = weak.clone();
+                        let tab_size_input = self.preferences.language_tab_size.clone();
+                        let selected_language = language.clone();
+                        let weak_language_menu = weak_language.clone();
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(tr("prefs.per_language")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .w(px(140.))
+                                            .text_sm()
+                                            .child(tr("prefs.language_select")),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-select")
+                                            .label(language_display_name(&language))
+                                            .dropdown_menu(move |mut menu, window, _cx| {
+                                                for name in language::names() {
+                                                    let selected =
+                                                        selected_language.as_str() == name;
+                                                    let name = name.to_string();
+                                                    let weak = weak_language_menu.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(language_display_name(
+                                                            &name,
+                                                        ))
+                                                        .checked(selected)
+                                                        .on_click(move |_, window, cx| {
+                                                            let name = name.clone();
+                                                            let _ = weak.update(cx, |this, cx| {
+                                                                this.preferences.language =
+                                                                    name.clone();
+                                                                let value = this
+                                                                    .settings
+                                                                    .tab_size_for(&name)
+                                                                    .to_string();
+                                                                this.preferences
+                                                                    .language_tab_size
+                                                                    .update(cx, |input, cx| {
+                                                                        input.set_value(
+                                                                            value, window, cx,
+                                                                        )
+                                                                    });
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                    );
+                                                }
+                                                Self::fit_menu(menu, window)
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(140.))
+                                            .text_sm()
+                                            .child(tr("prefs.language_tab_size")),
+                                    )
+                                    .child(Input::new(&tab_size_input).w(px(60.)).h(px(28.)))
+                                    .child(
+                                        Button::new("prefs-language-tab-apply")
+                                            .label(tr("prefs.apply"))
+                                            .compact()
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_tab_apply.update(cx, |this, cx| {
+                                                    this.apply_language_tab_size(cx);
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(140.))
+                                            .text_sm()
+                                            .child(tr("prefs.language_indent")),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-spaces-inherit")
+                                            .label(tr("prefs.inherit"))
+                                            .compact()
+                                            .when(overrides.use_spaces.is_none(), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ =
+                                                    weak_spaces_inherit.update(cx, |this, cx| {
+                                                        this.set_language_use_spaces(None, cx);
+                                                    });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-spaces-on")
+                                            .label(tr("prefs.spaces"))
+                                            .compact()
+                                            .when(overrides.use_spaces == Some(true), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_spaces_on.update(cx, |this, cx| {
+                                                    this.set_language_use_spaces(Some(true), cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-spaces-off")
+                                            .label(tr("prefs.tabs"))
+                                            .compact()
+                                            .when(overrides.use_spaces == Some(false), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_spaces_off.update(cx, |this, cx| {
+                                                    this.set_language_use_spaces(Some(false), cx);
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div().w(px(140.)).text_sm().child(tr("prefs.language_eol")),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-eol-inherit")
+                                            .label(tr("prefs.inherit"))
+                                            .compact()
+                                            .when(overrides.eol.is_none(), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_eol_inherit.update(cx, |this, cx| {
+                                                    this.set_language_eol(None, cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-eol-lf")
+                                            .label("LF")
+                                            .compact()
+                                            .when(overrides.eol == Some(Eol::Lf), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_eol_lf.update(cx, |this, cx| {
+                                                    this.set_language_eol(Some(Eol::Lf), cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-eol-crlf")
+                                            .label("CRLF")
+                                            .compact()
+                                            .when(overrides.eol == Some(Eol::CrLf), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_eol_crlf.update(cx, |this, cx| {
+                                                    this.set_language_eol(Some(Eol::CrLf), cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("prefs-language-eol-cr")
+                                            .label("CR")
+                                            .compact()
+                                            .when(overrides.eol == Some(Eol::Cr), |button| {
+                                                button.primary()
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_eol_cr.update(cx, |this, cx| {
+                                                    this.set_language_eol(Some(Eol::Cr), cx);
+                                                });
+                                            }),
+                                    ),
+                            )
+                    })
                     .child(
                         div()
                             .flex()
@@ -13310,6 +16320,15 @@ mod restore_tests {
     }
 
     #[test]
+    fn per_language_indent_only_applies_to_ordinary_text() {
+        let mut doc = luban_core::Document::new_untitled("untitled".to_string());
+        assert!(super::LubanApp::language_indent_applies(&doc, false));
+        assert!(!super::LubanApp::language_indent_applies(&doc, true));
+        doc.mark_non_text();
+        assert!(!super::LubanApp::language_indent_applies(&doc, false));
+    }
+
+    #[test]
     fn non_text_restore_keeps_raw_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bin.dat");
@@ -13328,6 +16347,7 @@ mod restore_tests {
             huge: false,
             huge_line: None,
             huge_column: None,
+            bookmarks: Vec::new(),
         };
         let doc = spec.load(1024);
         assert!(doc.is_non_text());
@@ -13354,6 +16374,7 @@ mod restore_tests {
             huge: false,
             huge_line: None,
             huge_column: None,
+            bookmarks: Vec::new(),
         };
         let doc = spec.load(1024);
         assert!(doc.is_partial());

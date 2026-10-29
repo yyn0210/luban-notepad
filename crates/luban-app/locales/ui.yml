@@ -1217,3 +1217,479 @@ prefs.local_history_days:
 prefs.local_history_size:
   en: "Max MB per file"
   zh-CN: "每文件上限（MB）"
+
+command.category.bookmarks:
+  en: "Bookmarks"
+  zh-CN: "书签"
+command.category.macros:
+  en: "Macros"
+  zh-CN: "宏"
+menu.file.export_html:
+  en: "Export as HTML…"
+  zh-CN: "导出 HTML…"
+menu.file.export_rtf:
+  en: "Export as RTF…"
+  zh-CN: "导出 RTF…"
+menu.edit.sort_ignore_case_asc:
+  en: "Sort Ignoring Case (A → Z)"
+  zh-CN: "忽略大小写升序排序"
+menu.edit.sort_ignore_case_desc:
+  en: "Sort Ignoring Case (Z → A)"
+  zh-CN: "忽略大小写降序排序"
+menu.edit.sort_numeric_asc:
+  en: "Sort Numeric (Ascending)"
+  zh-CN: "数值升序排序"
+menu.edit.sort_numeric_desc:
+  en: "Sort Numeric (Descending)"
+  zh-CN: "数值降序排序"
+menu.edit.sort_by_column:
+  en: "Sort by Column…"
+  zh-CN: "按列排序…"
+menu.edit.move_line_up:
+  en: "Move Line Up"
+  zh-CN: "上移行"
+menu.edit.move_line_down:
+  en: "Move Line Down"
+  zh-CN: "下移行"
+menu.edit.join_lines:
+  en: "Join Lines"
+  zh-CN: "合并行"
+menu.edit.split_lines:
+  en: "Split Lines"
+  zh-CN: "拆分行"
+menu.edit.remove_duplicate_lines:
+  en: "Remove Duplicate Lines"
+  zh-CN: "删除重复行"
+menu.edit.remove_empty_lines:
+  en: "Remove Empty Lines"
+  zh-CN: "删除空行"
+menu.edit.filter_lines:
+  en: "Filter Lines…"
+  zh-CN: "行筛选…"
+menu.edit.column_editor:
+  en: "Column Editor…"
+  zh-CN: "列编辑器…"
+menu.edit.add_cursor_above:
+  en: "Add Cursor Above"
+  zh-CN: "在上方增加光标"
+menu.edit.add_cursor_below:
+  en: "Add Cursor Below"
+  zh-CN: "在下方增加光标"
+menu.edit.select_next_occurrence:
+  en: "Select Next Occurrence"
+  zh-CN: "选中下一个相同项"
+menu.edit.select_all_occurrences:
+  en: "Select All Occurrences"
+  zh-CN: "选中全部相同项"
+menu.edit.unfold_current:
+  en: "Unfold Current Line"
+  zh-CN: "展开当前行"
+menu.edit.unfold_all:
+  en: "Unfold All"
+  zh-CN: "展开全部"
+menu.search.mark_all:
+  en: "Mark All Matches"
+  zh-CN: "标记全部匹配"
+menu.bookmarks.toggle:
+  en: "Toggle Bookmark"
+  zh-CN: "切换书签"
+menu.bookmarks.next:
+  en: "Next Bookmark"
+  zh-CN: "下一个书签"
+menu.bookmarks.previous:
+  en: "Previous Bookmark"
+  zh-CN: "上一个书签"
+menu.bookmarks.clear:
+  en: "Clear All Bookmarks"
+  zh-CN: "清除全部书签"
+menu.bookmarks.cut_lines:
+  en: "Cut Bookmarked Lines"
+  zh-CN: "剪切书签行"
+menu.bookmarks.copy_lines:
+  en: "Copy Bookmarked Lines"
+  zh-CN: "复制书签行"
+menu.bookmarks.delete_lines:
+  en: "Delete Bookmarked Lines"
+  zh-CN: "删除书签行"
+menu.macro.toggle_recording:
+  en: "Start/Stop Macro Recording"
+  zh-CN: "开始/停止宏录制"
+menu.macro.play_last:
+  en: "Play Last Macro"
+  zh-CN: "回放上一个宏"
+menu.macro.play_saved:
+  en: "Play Saved Macro…"
+  zh-CN: "回放已保存宏…"
+menu.macro.save_recording:
+  en: "Save Recorded Macro…"
+  zh-CN: "保存录制的宏…"
+status.op_needs_full_text:
+  en: "This command needs the complete text; it is unavailable for range or non-text views."
+  zh-CN: "此命令需要完整文本；范围视图或非文本文档不可用。"
+status.sorted:
+  en: "Lines sorted"
+  zh-CN: "已排序"
+status.line_move_boundary:
+  en: "The line block is already at the edge"
+  zh-CN: "行块已位于边界"
+status.line_moved_up:
+  en: "Line moved up"
+  zh-CN: "已上移行"
+status.line_moved_down:
+  en: "Line moved down"
+  zh-CN: "已下移行"
+status.line_join_boundary:
+  en: "Nothing to join"
+  zh-CN: "没有可合并的行"
+status.lines_joined:
+  en: "Lines joined"
+  zh-CN: "已合并行"
+status.line_split_no_column:
+  en: "Place the cursor inside a line to split it"
+  zh-CN: "请把光标放在行内再拆分"
+status.lines_split:
+  en: "Lines split"
+  zh-CN: "已拆分行"
+status.duplicates_removed:
+  en: "Duplicate lines removed"
+  zh-CN: "已删除重复行"
+status.empty_lines_removed:
+  en: "Empty lines removed"
+  zh-CN: "已删除空行"
+status.filter_no_match:
+  en: "No lines matched the filter"
+  zh-CN: "没有匹配筛选条件的行"
+status.filtered_lines:
+  en: "Removed %{count} line(s)"
+  zh-CN: "已删除 %{count} 行"
+status.column_edited:
+  en: "Column edit applied"
+  zh-CN: "已应用列编辑"
+status.occurrence_needs_selection:
+  en: "Select text or place the cursor on a word first"
+  zh-CN: "请先选择文本或把光标放在单词上"
+status.occurrence_needs_single_line:
+  en: "Occurrence selection only supports short single-line text"
+  zh-CN: "相同项选择仅支持较短的单行文本"
+status.occurrence_added:
+  en: "Next occurrence added"
+  zh-CN: "已增加下一个相同项"
+status.occurrence_none:
+  en: "No more occurrences"
+  zh-CN: "没有更多相同项"
+status.occurrences_added:
+  en: "Added %{count} occurrence(s)"
+  zh-CN: "已增加 %{count} 个相同项"
+status.folding_unavailable:
+  en: "Folding is unavailable in this view"
+  zh-CN: "此视图不支持折叠"
+status.unfolded:
+  en: "Fold opened"
+  zh-CN: "已展开折叠"
+status.no_fold_at_cursor:
+  en: "No folded region contains the cursor"
+  zh-CN: "当前光标不在已折叠的区域内"
+status.unfolded_all:
+  en: "All folds opened"
+  zh-CN: "已展开全部折叠"
+status.bookmark_added:
+  en: "Bookmark added"
+  zh-CN: "已添加书签"
+status.bookmark_removed:
+  en: "Bookmark removed"
+  zh-CN: "已移除书签"
+status.no_next_bookmark:
+  en: "No next bookmark"
+  zh-CN: "没有下一个书签"
+status.no_previous_bookmark:
+  en: "No previous bookmark"
+  zh-CN: "没有上一个书签"
+status.jumped_bookmark:
+  en: "Jumped to line %{line}"
+  zh-CN: "已跳到第 %{line} 行"
+status.bookmarks_cleared:
+  en: "Bookmarks cleared"
+  zh-CN: "已清除书签"
+status.no_bookmarks:
+  en: "No bookmarks"
+  zh-CN: "没有书签"
+status.bookmarked_lines_copied:
+  en: "Bookmarked lines copied"
+  zh-CN: "已复制书签行"
+status.bookmarked_lines_cut:
+  en: "Bookmarked lines cut"
+  zh-CN: "已剪切书签行"
+status.bookmarked_lines_deleted:
+  en: "Bookmarked lines deleted"
+  zh-CN: "已删除书签行"
+status.no_matches_to_mark:
+  en: "No matches to mark"
+  zh-CN: "没有可标记的匹配"
+status.marked_matches:
+  en: "Marked %{count} line(s)"
+  zh-CN: "已标记 %{count} 行"
+status.macro_recording:
+  en: "Macro recording started"
+  zh-CN: "已开始录制宏"
+status.macro_recording_count:
+  en: "● Recording macro (%{count})"
+  zh-CN: "● 正在录制宏（%{count}）"
+status.macro_stopped:
+  en: "Macro stopped with %{count} command(s)"
+  zh-CN: "宏已停止，共 %{count} 个命令"
+status.macro_empty:
+  en: "No commands were recorded"
+  zh-CN: "没有录制到命令"
+status.macro_saved:
+  en: "Macro '%{name}' saved"
+  zh-CN: "宏“%{name}”已保存"
+status.macro_played:
+  en: "Macro '%{name}': %{count} command(s), %{failed} failed"
+  zh-CN: "宏“%{name}”：%{count} 个命令，%{failed} 个失败"
+status.macro_deleted:
+  en: "Macro '%{name}' deleted"
+  zh-CN: "宏“%{name}”已删除"
+status.macro_shortcut_saved:
+  en: "Macro shortcut saved"
+  zh-CN: "宏快捷键已保存"
+status.macro_shortcut_removed:
+  en: "Macro shortcut removed"
+  zh-CN: "宏快捷键已移除"
+status.no_macros:
+  en: "No saved macros"
+  zh-CN: "没有已保存的宏"
+status.exported:
+  en: "Exported to %{path}"
+  zh-CN: "已导出到 %{path}"
+status.export_failed:
+  en: "Export failed: %{error}"
+  zh-CN: "导出失败：%{error}"
+status.export_unavailable:
+  en: "Export is unavailable for this document"
+  zh-CN: "此文档不支持导出"
+status.theme_imported:
+  en: "Imported syntax theme from %{path}"
+  zh-CN: "已从 %{path} 导入语法主题"
+status.theme_import_failed:
+  en: "Theme import failed: %{error}"
+  zh-CN: "主题导入失败：%{error}"
+status.theme_applied:
+  en: "Syntax theme applied"
+  zh-CN: "已应用语法主题"
+find.enhanced_regex:
+  en: "Enhanced regex"
+  zh-CN: "增强正则"
+find.mark_all:
+  en: "Mark All"
+  zh-CN: "标记全部"
+find.history:
+  en: "Recent"
+  zh-CN: "最近"
+find.no_history:
+  en: "No recent searches"
+  zh-CN: "没有最近搜索"
+find.preview_title:
+  en: "Replace All Preview"
+  zh-CN: "替换全部预览"
+find.preview_count:
+  en: "%{count} match(es) will be replaced"
+  zh-CN: "将替换 %{count} 处匹配"
+ff.enhanced_regex:
+  en: "Enhanced regex"
+  zh-CN: "增强正则"
+ff.open_documents:
+  en: "Open documents"
+  zh-CN: "打开的文档"
+column.title:
+  en: "Column Editor"
+  zh-CN: "列编辑器"
+column.text_mode:
+  en: "Text"
+  zh-CN: "文本"
+column.number_mode:
+  en: "Numbers"
+  zh-CN: "数字"
+column.text:
+  en: "Text to insert"
+  zh-CN: "插入文本"
+column.text_placeholder:
+  en: "Text"
+  zh-CN: "文本"
+column.start:
+  en: "Start"
+  zh-CN: "起始值"
+column.step:
+  en: "Step"
+  zh-CN: "步长"
+column.width:
+  en: "Zero padding width"
+  zh-CN: "补零宽度"
+column.column:
+  en: "Column (1-based)"
+  zh-CN: "列（从 1 开始）"
+column.apply:
+  en: "Insert"
+  zh-CN: "插入"
+column.invalid_column:
+  en: "Enter a valid column number"
+  zh-CN: "请输入有效的列号"
+column.invalid_start:
+  en: "Enter a valid start number"
+  zh-CN: "请输入有效的起始值"
+column.invalid_step:
+  en: "Enter a valid step"
+  zh-CN: "请输入有效的步长"
+column.invalid_width:
+  en: "Padding width must be between 0 and 32"
+  zh-CN: "补零宽度必须在 0 到 32 之间"
+column.empty_text:
+  en: "Enter the text to insert"
+  zh-CN: "请输入要插入的文本"
+sort.title:
+  en: "Sort by Column"
+  zh-CN: "按列排序"
+sort.column_help:
+  en: "Column numbers are 1-based characters. Lines shorter than the column compare as empty."
+  zh-CN: "列号按字符从 1 开始；短于该列的行按空串比较。"
+sort.ascending:
+  en: "Ascending"
+  zh-CN: "升序"
+sort.ignore_case:
+  en: "Ignore case"
+  zh-CN: "忽略大小写"
+sort.apply:
+  en: "Sort"
+  zh-CN: "排序"
+sort.invalid_column:
+  en: "Enter a valid column number"
+  zh-CN: "请输入有效的列号"
+filter.title:
+  en: "Filter Lines"
+  zh-CN: "行筛选"
+filter.needle_placeholder:
+  en: "Text to match"
+  zh-CN: "要匹配的文本"
+filter.keep:
+  en: "Keep matching lines"
+  zh-CN: "保留匹配行"
+filter.match_case:
+  en: "Match case"
+  zh-CN: "匹配大小写"
+filter.regex:
+  en: "Regex"
+  zh-CN: "正则"
+filter.apply:
+  en: "Filter"
+  zh-CN: "筛选"
+filter.empty_needle:
+  en: "Enter the text to match"
+  zh-CN: "请输入要匹配的文本"
+macro.title:
+  en: "Macros"
+  zh-CN: "宏"
+macro.play:
+  en: "Play"
+  zh-CN: "回放"
+macro.delete:
+  en: "Delete"
+  zh-CN: "删除"
+macro.assign_shortcut:
+  en: "Assign Shortcut"
+  zh-CN: "分配快捷键"
+macro.save_recording:
+  en: "Save Recording"
+  zh-CN: "保存录制"
+macro.name_placeholder:
+  en: "Macro name"
+  zh-CN: "宏名称"
+macro.shortcut_placeholder:
+  en: "Shortcut, e.g. ctrl+alt+1 (empty removes)"
+  zh-CN: "快捷键，如 ctrl+alt+1（留空移除）"
+macro.select_first:
+  en: "Select a macro first"
+  zh-CN: "请先选择一个宏"
+dialog.export_html:
+  en: "Export as HTML"
+  zh-CN: "导出为 HTML"
+dialog.export_rtf:
+  en: "Export as RTF"
+  zh-CN: "导出为 RTF"
+dialog.not_a_file:
+  en: "Please select a file"
+  zh-CN: "请选择文件"
+dialog.select_file:
+  en: "Select a theme file first"
+  zh-CN: "请先选择主题文件"
+prefs.syntax_theme:
+  en: "Syntax theme"
+  zh-CN: "语法主题"
+prefs.syntax_default:
+  en: "Default"
+  zh-CN: "默认"
+prefs.syntax_custom:
+  en: "Custom"
+  zh-CN: "自定义"
+prefs.import_theme:
+  en: "Import .tmTheme…"
+  zh-CN: "导入 .tmTheme…"
+prefs.per_language:
+  en: "Per-language settings"
+  zh-CN: "每语言设置"
+prefs.language_select:
+  en: "Language"
+  zh-CN: "语言"
+prefs.language_tab_size:
+  en: "Indent width"
+  zh-CN: "缩进宽度"
+prefs.language_indent:
+  en: "Indent style"
+  zh-CN: "缩进方式"
+prefs.language_eol:
+  en: "Line ending"
+  zh-CN: "换行符"
+prefs.inherit:
+  en: "Inherit"
+  zh-CN: "继承"
+prefs.spaces:
+  en: "Spaces"
+  zh-CN: "空格"
+prefs.tabs:
+  en: "Tabs"
+  zh-CN: "制表符"
+prefs.apply:
+  en: "Apply"
+  zh-CN: "应用"
+prefs.language_tab_invalid:
+  en: "Indent width must be between 1 and 16"
+  zh-CN: "缩进宽度必须在 1 到 16 之间"
+prefs.language_saved:
+  en: "Language settings saved"
+  zh-CN: "语言设置已保存"
+
+status.bookmarks:
+  en: "%{count} bookmark(s)"
+  zh-CN: "%{count} 个书签"
+status.occurrence_too_many:
+  en: "Too many occurrences (limit 20,000); select a shorter text"
+  zh-CN: "相同项过多（上限 20,000），请选择更短的文本"
+status.search_history_cleared:
+  en: "Search history cleared"
+  zh-CN: "搜索历史已清空"
+menu.search.clear_history:
+  en: "Clear Search History"
+  zh-CN: "清除搜索历史"
+find.clear_history:
+  en: "Clear history"
+  zh-CN: "清除历史"
+macro.rename:
+  en: "Rename"
+  zh-CN: "重命名"
+macro.name_empty:
+  en: "Enter a macro name"
+  zh-CN: "请输入宏名称"
+macro.overwrite_confirm:
+  en: "Macro '%{name}' exists; click Save again to overwrite"
+  zh-CN: "宏“%{name}”已存在；再次点击保存以覆盖"
+status.macro_renamed:
+  en: "Macro renamed to '%{name}'"
+  zh-CN: "宏已重命名为“%{name}”"

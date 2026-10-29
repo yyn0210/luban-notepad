@@ -697,6 +697,70 @@ pub fn preview(text: &str, max_chars: usize) -> String {
     out.replace('\t', "    ")
 }
 
+/// Whether a line consists only of a comment marker and text.
+///
+/// Comment-only lines are transparent for indentation folding: an outer block
+/// continues past a comment even when the comment is written at column zero.
+fn is_comment_only(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('#')
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with('%')
+        || trimmed.starts_with(';')
+}
+
+/// Fold candidates for indentation-structured languages.
+///
+/// A candidate is `(start_line, end_line)`, both zero-based. The editor hides
+/// the lines strictly between the two, so a block whose last child is line
+/// `last` returns `end_line = last + 1`; the parent line stays visible as the
+/// fold summary. Blank lines do not open or close blocks, and a candidate is
+/// only emitted when it hides at least one line.
+pub fn indent_fold_candidates(text: &str, tab_size: usize) -> Vec<(usize, usize)> {
+    let index = LineIndex::new(text);
+    let line_count = index.len();
+    let mut candidates = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut previous: Option<(usize, usize)> = None;
+
+    for line in 0..line_count {
+        let content = index.line_text(text, line);
+        if content.trim().is_empty() || is_comment_only(&content) {
+            continue;
+        }
+        let indent = visual_indent(&content, tab_size.max(1));
+        while let Some(&(top_indent, start)) = stack.last() {
+            if indent > top_indent {
+                break;
+            }
+            stack.pop();
+            let end = line.saturating_sub(1);
+            if end > start {
+                candidates.push((start, (end + 1).min(line_count)));
+            }
+        }
+        if let Some((previous_indent, previous_line)) = previous {
+            if indent > previous_indent {
+                stack.push((previous_indent, previous_line));
+            }
+        }
+        previous = Some((indent, line));
+    }
+
+    let last_line = line_count.saturating_sub(1);
+    while let Some((_, start)) = stack.pop() {
+        if last_line > start {
+            candidates.push((start, (last_line + 1).min(line_count)));
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +776,39 @@ mod tests {
         assert_eq!(byte_to_char(s, s.len()), 5);
         assert_eq!(slice_chars(s, 1, 3), "é世");
         assert_eq!(slice_chars(s, 3, 1), "é世");
+    }
+
+    #[test]
+    fn indent_fold_candidates_follow_python_blocks() {
+        let text = "def f():\n    a = 1\n    b = 2\n\nx = 3\n";
+        let candidates = indent_fold_candidates(text, 4);
+        assert!(candidates
+            .iter()
+            .any(|(start, end)| *start == 0 && *end >= 3));
+        assert!(indent_fold_candidates("a\nb\nc\n", 4).is_empty());
+    }
+
+    #[test]
+    fn indent_fold_candidates_nest_and_support_tabs() {
+        let text = "def f():\n    if x:\n        a\n    b\nc\n";
+        let candidates = indent_fold_candidates(text, 4);
+        let starts: Vec<usize> = candidates.iter().map(|(start, _)| *start).collect();
+        assert!(starts.contains(&0));
+        assert!(starts.contains(&1));
+        assert!(candidates.iter().all(|(start, end)| end > start));
+
+        let makefile = "all:\n\tcc a.c\n\techo done\n";
+        let candidates = indent_fold_candidates(makefile, 4);
+        assert!(candidates.iter().any(|(start, _)| *start == 0));
+    }
+
+    #[test]
+    fn indent_fold_candidates_ignore_comment_only_lines() {
+        let text = "def f():\n    a\n# note\n    b\nx = 1\n";
+        let candidates = indent_fold_candidates(text, 4);
+        assert!(candidates
+            .iter()
+            .any(|(start, end)| *start == 0 && *end >= 4));
     }
 
     #[test]

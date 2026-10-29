@@ -9,14 +9,20 @@ pub struct PreferencesState {
     /// System font families, loaded the first time the font picker opens.
     pub fonts: Option<Vec<String>>,
     pub font_picker: Option<FontPickerState>,
+    /// Language selected in the per-language section.
+    pub language: String,
+    pub language_tab_size: Entity<InputState>,
 }
 
 impl PreferencesState {
-    pub fn new() -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<LubanApp>) -> Self {
+        let language_tab_size = cx.new(|cx| InputState::new(window, cx).default_value("4"));
         Self {
             open: false,
             fonts: None,
             font_picker: None,
+            language: "Python".to_string(),
+            language_tab_size,
         }
     }
 }

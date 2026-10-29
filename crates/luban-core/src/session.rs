@@ -50,6 +50,9 @@ pub struct SessionTab {
     /// edits. `None` for clean tabs and for older sessions.
     #[serde(default)]
     pub recovery_id: Option<String>,
+    /// 1-based line numbers bookmarked in this tab.
+    #[serde(default)]
+    pub bookmarks: Vec<usize>,
 }
 
 impl Default for SessionTab {
@@ -72,6 +75,7 @@ impl Default for SessionTab {
             huge_scroll: None,
             huge_modified: false,
             recovery_id: None,
+            bookmarks: Vec::new(),
         }
     }
 }
@@ -187,6 +191,7 @@ mod tests {
                 huge_scroll: Some(1.5),
                 huge_modified: true,
                 recovery_id: Some("recovery-1".into()),
+                bookmarks: vec![1, 3],
             }],
             active_tab: 0,
             workspace_root: Some(PathBuf::from("/tmp")),

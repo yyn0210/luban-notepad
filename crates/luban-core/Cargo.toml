@@ -11,12 +11,15 @@ repository.workspace = true
 chardetng.workspace = true
 dirs.workspace = true
 encoding_rs.workspace = true
+fancy-regex = "0.16"
 log.workspace = true
 regex.workspace = true
 rust-i18n.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "plist-load"] }
 sys-locale.workspace = true
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
 walkdir.workspace = true
 
 [target.'cfg(windows)'.dependencies]

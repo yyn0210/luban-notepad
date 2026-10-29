@@ -8,15 +8,19 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod atomic_write;
+pub mod bookmarks;
 pub mod disk_engine;
 pub mod document;
 pub mod encoding;
 pub mod eol;
 pub mod error;
+pub mod export;
 pub mod i18n;
 pub mod language;
 pub mod large_file;
+pub mod line_ops;
 pub mod local_history;
+pub mod macros;
 pub mod search;
 pub mod session;
 pub mod settings;
