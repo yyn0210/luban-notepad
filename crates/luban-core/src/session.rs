@@ -1,4 +1,8 @@
-//! Session persistence (open tabs, caret positions, unsaved buffers).
+//! Session persistence (windows, tab groups, open tabs, caret positions,
+//! unsaved buffers).
+//!
+//! Version 2 stores a list of windows, each with up to two tab groups. A
+//! version 1 file (a single flat tab list) is migrated on load.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +13,7 @@ use crate::encoding::TextEncoding;
 use crate::eol::Eol;
 use crate::settings::config_dir;
 
-pub const SESSION_VERSION: u32 = 1;
+pub const SESSION_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,26 +84,135 @@ impl Default for SessionTab {
     }
 }
 
+/// How a window is split. `Right` creates a second group beside the first;
+/// `Down` places it below.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitLayout {
+    #[default]
+    None,
+    Right,
+    Down,
+}
+
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupSession {
+    pub active_tab: usize,
+    pub tabs: Vec<SessionTab>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowSession {
+    pub id: u64,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+    pub workspace_file: Option<PathBuf>,
+    pub workspace_roots: Vec<PathBuf>,
+    pub split: SplitLayout,
+    pub active_group: usize,
+    pub groups: Vec<GroupSession>,
+}
+
+impl Default for WindowSession {
+    fn default() -> Self {
+        Self {
+            id: 1,
+            x: None,
+            y: None,
+            width: 1200.0,
+            height: 800.0,
+            maximized: false,
+            workspace_file: None,
+            workspace_roots: Vec::new(),
+            split: SplitLayout::None,
+            active_group: 0,
+            groups: vec![GroupSession::default()],
+        }
+    }
+}
+
+impl WindowSession {
+    pub fn normalize(&mut self) {
+        self.width = self.width.clamp(480.0, 10000.0);
+        self.height = self.height.clamp(320.0, 10000.0);
+        if self.groups.is_empty() {
+            self.groups.push(GroupSession::default());
+        }
+        if self.split == SplitLayout::None || self.groups.len() == 1 {
+            self.split = SplitLayout::None;
+            self.active_group = 0;
+            self.groups.truncate(1);
+        } else {
+            self.groups.truncate(2);
+        }
+        self.active_group = self.active_group.min(self.groups.len() - 1);
+        for group in &mut self.groups {
+            if group.active_tab >= group.tabs.len() {
+                group.active_tab = group.tabs.len().saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.groups.iter().map(|group| group.tabs.len()).sum()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
     pub version: u32,
-    pub tabs: Vec<SessionTab>,
-    pub active_tab: usize,
-    pub workspace_root: Option<PathBuf>,
-    pub window_width: f32,
-    pub window_height: f32,
+    pub windows: Vec<WindowSession>,
 }
 
 impl Default for Session {
     fn default() -> Self {
         Self {
             version: SESSION_VERSION,
-            tabs: Vec::new(),
-            active_tab: 0,
-            workspace_root: None,
-            window_width: 1200.0,
-            window_height: 800.0,
+            windows: Vec::new(),
+        }
+    }
+}
+
+/// Version 1 layout, read only during migration.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct LegacySession {
+    tabs: Vec<SessionTab>,
+    active_tab: usize,
+    workspace_root: Option<PathBuf>,
+    window_width: f32,
+    window_height: f32,
+}
+
+impl LegacySession {
+    fn migrate(self) -> WindowSession {
+        let roots = self.workspace_root.into_iter().collect();
+        let width = if self.window_width > 0.0 {
+            self.window_width
+        } else {
+            1200.0
+        };
+        let height = if self.window_height > 0.0 {
+            self.window_height
+        } else {
+            800.0
+        };
+        WindowSession {
+            id: 1,
+            width,
+            height,
+            workspace_roots: roots,
+            groups: vec![GroupSession {
+                active_tab: self.active_tab,
+                tabs: self.tabs,
+            }],
+            ..WindowSession::default()
         }
     }
 }
@@ -115,27 +228,34 @@ impl Session {
 
     pub fn load_from(path: &Path) -> Self {
         match fs::read_to_string(path) {
-            Ok(json) => match serde_json::from_str::<Session>(&json) {
-                Ok(mut session) => {
-                    session.version = SESSION_VERSION;
-                    if session.active_tab >= session.tabs.len() {
-                        session.active_tab = session.tabs.len().saturating_sub(1);
-                    }
-                    session.window_width = session.window_width.clamp(480.0, 10000.0);
-                    session.window_height = session.window_height.clamp(320.0, 10000.0);
-                    session
-                }
-                Err(err) => {
-                    log::warn!("ignoring invalid session at {}: {err}", path.display());
-                    Self::default()
-                }
-            },
+            Ok(json) => Self::from_json(&json).unwrap_or_else(|| {
+                log::warn!("ignoring invalid session at {}", path.display());
+                Self::default()
+            }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(err) => {
                 log::warn!("could not read session at {}: {err}", path.display());
                 Self::default()
             }
         }
+    }
+
+    /// Parse a session document, migrating version 1 data. Returns `None` when
+    /// the JSON cannot be understood at all.
+    pub fn from_json(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let mut session = if value.get("windows").is_some() {
+            serde_json::from_value::<Session>(value).ok()?
+        } else {
+            let legacy: LegacySession = serde_json::from_value(value).ok()?;
+            Session {
+                version: SESSION_VERSION,
+                windows: vec![legacy.migrate()],
+            }
+        };
+        session.version = SESSION_VERSION;
+        session.normalize();
+        Some(session)
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -147,20 +267,33 @@ impl Session {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        // Write-then-rename keeps a crash from truncating the previous session.
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                let _ = fs::remove_file(path);
-            }
-        }
-        fs::rename(tmp, path)
+        crate::atomic_write::write_atomic(path, json.as_bytes())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
+        self.windows.is_empty()
+    }
+
+    pub fn normalize(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        for (index, window) in self.windows.iter_mut().enumerate() {
+            if window.id == 0 {
+                window.id = index as u64 + 1;
+            }
+            window.normalize();
+        }
+    }
+
+    /// Build the v2 document around a single window.
+    pub fn single(window: WindowSession) -> Self {
+        let mut session = Self {
+            version: SESSION_VERSION,
+            windows: vec![window],
+        };
+        session.normalize();
+        session
     }
 }
 
@@ -168,65 +301,133 @@ impl Session {
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trips_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.json");
-        let session = Session {
-            tabs: vec![SessionTab {
-                path: Some(PathBuf::from("/tmp/foo.rs")),
-                text: Some("fn main() {}".into()),
-                encoding: TextEncoding::Utf8,
-                eol: Eol::Lf,
-                language: "Rust".into(),
-                cursor: 5,
-                anchor: 2,
-                scroll_offset: 12.5,
-                modified: true,
-                range: Some([100, 4096]),
-                source_size: Some(8192),
-                huge: true,
-                huge_line: Some(42),
-                huge_column: Some(3),
-                huge_scroll: Some(1.5),
-                huge_modified: true,
-                recovery_id: Some("recovery-1".into()),
-                bookmarks: vec![1, 3],
-            }],
-            active_tab: 0,
-            workspace_root: Some(PathBuf::from("/tmp")),
-            ..Session::default()
-        };
-        session.save_to(&path).unwrap();
-        let loaded = Session::load_from(&path);
-        assert_eq!(loaded.tabs.len(), 1);
-        assert_eq!(loaded.tabs[0].text.as_deref(), Some("fn main() {}"));
-        assert_eq!(loaded.tabs[0].cursor, 5);
-        assert_eq!(loaded.tabs[0].language, "Rust");
-        assert_eq!(loaded.tabs[0].range, Some([100, 4096]));
-        assert_eq!(loaded.tabs[0].source_size, Some(8192));
-        assert!(loaded.tabs[0].huge);
-        assert_eq!(loaded.tabs[0].huge_line, Some(42));
-        assert_eq!(loaded.tabs[0].huge_column, Some(3));
-        assert_eq!(loaded.tabs[0].huge_scroll, Some(1.5));
-        assert!(loaded.tabs[0].huge_modified);
-        assert_eq!(loaded.tabs[0].recovery_id.as_deref(), Some("recovery-1"));
-        assert_eq!(loaded.workspace_root, Some(PathBuf::from("/tmp")));
+    fn tab(path: &str) -> SessionTab {
+        SessionTab {
+            path: Some(PathBuf::from(path)),
+            text: Some("text".into()),
+            cursor: 3,
+            ..SessionTab::default()
+        }
     }
 
     #[test]
-    fn clamps_active_tab_and_window() {
+    fn round_trips_multiple_windows_and_groups() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
-        fs::write(
-            &path,
-            r#"{"tabs": [], "active_tab": 9, "window_width": 2, "window_height": 999999}"#,
-        )
-        .unwrap();
+        let session = Session {
+            version: SESSION_VERSION,
+            windows: vec![
+                WindowSession {
+                    id: 1,
+                    x: Some(100),
+                    y: Some(50),
+                    width: 900.0,
+                    height: 700.0,
+                    maximized: true,
+                    workspace_file: Some(PathBuf::from("/w/a.luban-workspace")),
+                    workspace_roots: vec![PathBuf::from("/w")],
+                    split: SplitLayout::Right,
+                    active_group: 1,
+                    groups: vec![
+                        GroupSession {
+                            active_tab: 0,
+                            tabs: vec![tab("/a.rs")],
+                        },
+                        GroupSession {
+                            active_tab: 1,
+                            tabs: vec![tab("/b.rs"), tab("/c.rs")],
+                        },
+                    ],
+                },
+                WindowSession {
+                    id: 2,
+                    split: SplitLayout::None,
+                    groups: vec![GroupSession {
+                        active_tab: 0,
+                        tabs: vec![tab("/d.rs")],
+                    }],
+                    ..WindowSession::default()
+                },
+            ],
+        };
+        session.save_to(&path).unwrap();
         let loaded = Session::load_from(&path);
-        assert_eq!(loaded.active_tab, 0);
-        assert_eq!(loaded.window_width, 480.0);
-        assert_eq!(loaded.window_height, 10000.0);
+        assert_eq!(loaded.windows.len(), 2);
+        assert_eq!(loaded.windows[0].split, SplitLayout::Right);
+        assert_eq!(loaded.windows[0].active_group, 1);
+        assert_eq!(loaded.windows[0].groups[1].tabs.len(), 2);
+        assert!(loaded.windows[0].maximized);
+        assert_eq!(loaded.windows[0].x, Some(100));
+        assert_eq!(loaded.windows[1].id, 2);
+    }
+
+    #[test]
+    fn migrates_version_one_sessions() {
+        let legacy = r#"{
+            "version": 1,
+            "tabs": [
+                {"path": "/a.rs", "cursor": 4, "text": "abc", "modified": true},
+                {"path": null, "cursor": 0}
+            ],
+            "active_tab": 1,
+            "workspace_root": "/w",
+            "window_width": 1000,
+            "window_height": 700
+        }"#;
+        let session = Session::from_json(legacy).unwrap();
+        assert_eq!(session.version, SESSION_VERSION);
+        assert_eq!(session.windows.len(), 1);
+        let window = &session.windows[0];
+        assert_eq!(window.workspace_roots, vec![PathBuf::from("/w")]);
+        assert_eq!(window.width, 1000.0);
+        assert_eq!(window.groups.len(), 1);
+        assert_eq!(window.groups[0].active_tab, 1);
+        assert_eq!(window.groups[0].tabs.len(), 2);
+        assert_eq!(window.groups[0].tabs[0].text.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn clamps_groups_and_active_tabs() {
+        let mut window = WindowSession {
+            split: SplitLayout::Down,
+            active_group: 9,
+            groups: vec![
+                GroupSession {
+                    active_tab: 9,
+                    tabs: vec![tab("/a")],
+                },
+                GroupSession::default(),
+            ],
+            ..WindowSession::default()
+        };
+        window.normalize();
+        assert_eq!(window.active_group, 1);
+        assert_eq!(window.groups[0].active_tab, 0);
+        assert_eq!(window.width, 1200.0);
+
+        let mut none = WindowSession {
+            split: SplitLayout::None,
+            groups: vec![GroupSession::default(), GroupSession::default()],
+            ..WindowSession::default()
+        };
+        none.normalize();
+        assert_eq!(none.groups.len(), 1);
+        assert_eq!(none.split, SplitLayout::None);
+    }
+
+    #[test]
+    fn clamps_window_size() {
+        let mut session =
+            Session::from_json(r#"{"version":2,"windows":[{"width":2,"height":999999}]}"#).unwrap();
+        assert_eq!(session.windows[0].width, 480.0);
+        assert_eq!(session.windows[0].height, 10000.0);
+        session.normalize();
+    }
+
+    #[test]
+    fn invalid_json_is_none() {
+        assert!(Session::from_json("not json").is_none());
+        assert!(Session::from_json(r#"{"windows": 3}"#).is_none());
     }
 
     #[test]

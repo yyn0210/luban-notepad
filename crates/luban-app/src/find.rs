@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -184,24 +185,43 @@ impl FindPanel {
     }
 }
 
+/// Matches for one file, shown as an expandable group.
+#[derive(Clone, Debug)]
+pub struct FileGroup {
+    pub path: PathBuf,
+    pub relative: String,
+    pub matches: Vec<FileMatch>,
+}
+
 pub struct FindInFilesPanel {
     pub open: bool,
     pub query: Entity<InputState>,
     pub folder: Entity<InputState>,
     pub masks: Entity<InputState>,
+    pub include: Entity<InputState>,
+    pub exclude: Entity<InputState>,
+    pub replacement: Entity<InputState>,
+    pub show_replace: bool,
     pub match_case: bool,
     pub whole_word: bool,
     pub regex: bool,
     pub enhanced_regex: bool,
     /// Search only open documents with a path instead of the folder.
     pub open_documents: bool,
+    /// Search every workspace root instead of the folder field.
+    pub workspace: bool,
+    pub respect_gitignore: bool,
     pub results: Vec<FileMatch>,
+    pub groups: Vec<FileGroup>,
+    pub collapsed: HashSet<PathBuf>,
     pub files_scanned: usize,
     pub running: bool,
     pub cancel: Option<Arc<AtomicBool>>,
     pub status: String,
+    pub error: Option<String>,
     pub generation: u64,
     pub truncated: bool,
+    pub cancelled: bool,
 }
 
 impl FindInFilesPanel {
@@ -219,23 +239,39 @@ impl FindInFilesPanel {
         });
         let masks =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr("ff.masks_placeholder")));
+        let include =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("ff.include_placeholder")));
+        let exclude =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("ff.exclude_placeholder")));
+        let replacement =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("ff.replacement_placeholder")));
         Self {
             open: false,
             query,
             folder,
             masks,
+            include,
+            exclude,
+            replacement,
+            show_replace: false,
             match_case: false,
             whole_word: false,
             regex: false,
             enhanced_regex: false,
             open_documents: false,
+            workspace: false,
+            respect_gitignore: true,
             results: Vec::new(),
+            groups: Vec::new(),
+            collapsed: HashSet::new(),
             files_scanned: 0,
             running: false,
             cancel: None,
             status: String::new(),
+            error: None,
             generation: 0,
             truncated: false,
+            cancelled: false,
         }
     }
 
@@ -269,10 +305,84 @@ impl FindInFilesPanel {
         self.masks.read(cx).value().to_string()
     }
 
+    pub fn include_text(&self, cx: &gpui_kit::App) -> String {
+        self.include.read(cx).value().to_string()
+    }
+
+    pub fn exclude_text(&self, cx: &gpui_kit::App) -> String {
+        self.exclude.read(cx).value().to_string()
+    }
+
+    pub fn replacement_text(&self, cx: &gpui_kit::App) -> String {
+        self.replacement.read(cx).value().to_string()
+    }
+
+    /// Compile the include/exclude fields. Invalid patterns are an error and
+    /// abort the search.
+    pub fn filter(&self, cx: &gpui_kit::App) -> Result<luban_core::globs::GlobFilter, String> {
+        luban_core::globs::GlobFilter::new(&self.include_text(cx), &self.exclude_text(cx))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Adopt the include/exclude defaults stored in the settings.
+    pub fn use_settings_filter(
+        &mut self,
+        include: &str,
+        exclude: &str,
+        window: &mut Window,
+        cx: &mut Context<LubanApp>,
+    ) {
+        self.include.update(cx, |input, cx| {
+            input.set_value(include.to_string(), window, cx);
+        });
+        self.exclude.update(cx, |input, cx| {
+            input.set_value(exclude.to_string(), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Replace the result list and group it by file. The first file and the
+    /// files holding the first 20 matches start expanded.
+    pub fn set_results(&mut self, results: Vec<FileMatch>, roots: &[PathBuf]) {
+        self.results = results;
+        let mut by_file: Vec<FileGroup> = Vec::new();
+        for matched in &self.results {
+            if let Some(group) = by_file.iter_mut().find(|group| group.path == matched.path) {
+                group.matches.push(matched.clone());
+            } else {
+                by_file.push(FileGroup {
+                    path: matched.path.clone(),
+                    relative: crate::workspace_replace::relative_path(roots, &matched.path),
+                    matches: vec![matched.clone()],
+                });
+            }
+        }
+        self.collapsed.clear();
+        let mut seen = 0usize;
+        for (index, group) in by_file.iter().enumerate() {
+            let expanded = index == 0 || seen < 20;
+            if !expanded {
+                self.collapsed.insert(group.path.clone());
+            }
+            seen += group.matches.len();
+        }
+        self.groups = by_file;
+    }
+
+    pub fn toggle_group(&mut self, path: &Path) {
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path.to_path_buf());
+        }
+    }
+
     pub fn clear_results(&mut self) {
         self.results.clear();
+        self.groups.clear();
+        self.collapsed.clear();
         self.files_scanned = 0;
         self.truncated = false;
+        self.cancelled = false;
+        self.error = None;
         self.status.clear();
     }
 }

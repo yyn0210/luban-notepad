@@ -203,6 +203,31 @@ impl FileWatcher {
             .retain(|path, _| paths.iter().any(|tracked| tracked == path));
     }
 
+    /// Rewrite tracked paths after a rename. The next `sync` call confirms the
+    /// new set from the tab list.
+    pub fn remap(&mut self, from: &Path, to: &Path) {
+        if let Ok(mut tracked) = self.tracked.lock() {
+            tracked.paths = tracked
+                .paths
+                .drain()
+                .map(|path| {
+                    if path == from {
+                        to.to_path_buf()
+                    } else if let Ok(suffix) = path.strip_prefix(from) {
+                        to.join(suffix)
+                    } else {
+                        path
+                    }
+                })
+                .collect();
+            tracked.aliases.clear();
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+        self.ignored.clear();
+    }
+
     /// Remember the metadata produced by our own save so the resulting event
     /// does not become an external-change notice.
     pub fn note_saved(&mut self, path: &Path, size: u64, modified: Option<SystemTime>) {

@@ -3725,6 +3725,8 @@ dependencies = [
  "dirs 6.0.0",
  "encoding_rs",
  "fancy-regex",
+ "globset",
+ "ignore",
  "log",
  "regex",
  "rust-i18n",

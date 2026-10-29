@@ -1693,3 +1693,568 @@ macro.overwrite_confirm:
 status.macro_renamed:
   en: "Macro renamed to '%{name}'"
   zh-CN: "宏已重命名为“%{name}”"
+
+workspace.open_failed:
+  en: "Could not open the workspace: %{error}"
+  zh-CN: "无法打开工作区：%{error}"
+workspace.not_a_folder:
+  en: "the path is not a folder"
+  zh-CN: "该路径不是文件夹"
+workspace.opened:
+  en: "Workspace %{name} opened"
+  zh-CN: "已打开工作区 %{name}"
+workspace.saved:
+  en: "Workspace saved to %{path}"
+  zh-CN: "工作区已保存到 %{path}"
+workspace.save_failed:
+  en: "Could not save the workspace: %{error}"
+  zh-CN: "无法保存工作区：%{error}"
+workspace.none:
+  en: "No workspace is open"
+  zh-CN: "当前没有打开的工作区"
+workspace.remove_root_title:
+  en: "Remove Folder from Workspace"
+  zh-CN: "从工作区移除文件夹"
+workspace.remove_root_dirty:
+  en: "This folder has %{count} modified tab(s). Remove them anyway?"
+  zh-CN: "该文件夹下有 %{count} 个未保存的标签页，仍要移除吗？"
+workspace.add_folder:
+  en: "Add Folder to Workspace…"
+  zh-CN: "添加文件夹到工作区…"
+workspace.remove_root:
+  en: "Remove from Workspace"
+  zh-CN: "从工作区移除"
+workspace.open:
+  en: "Open Workspace…"
+  zh-CN: "打开工作区…"
+workspace.save:
+  en: "Save Workspace"
+  zh-CN: "保存工作区"
+workspace.save_as:
+  en: "Save Workspace As…"
+  zh-CN: "工作区另存为…"
+workspace.close:
+  en: "Close Workspace"
+  zh-CN: "关闭工作区"
+workspace.memory_only:
+  en: "in memory (not saved as a file)"
+  zh-CN: "仅在内存中（未保存为文件）"
+workspace.keep_root:
+  en: "Keep in Workspace"
+  zh-CN: "保留在工作区"
+window.open_failed:
+  en: "Could not open a window: %{error}"
+  zh-CN: "无法打开窗口：%{error}"
+window.move_unsaved_huge_failed:
+  en: "The disk-engine document has unsaved edits that cannot be moved yet"
+  zh-CN: "磁盘引擎文档有未保存修改，暂时无法移动"
+split.empty_group:
+  en: "Open a file or move a tab here"
+  zh-CN: "打开文件或将标签移动到这里"
+breadcrumbs.label:
+  en: "Breadcrumbs"
+  zh-CN: "面包屑"
+command.quick_open.no_matches:
+  en: "No matching results"
+  zh-CN: "没有匹配结果"
+command.quick_open.indexing:
+  en: "Building the workspace index…"
+  zh-CN: "正在建立工作区索引…"
+command.quick_open.truncated:
+  en: "The workspace index is truncated"
+  zh-CN: "工作区索引已截断"
+command.quick_open.hint:
+  en: "Enter opens · :line jumps · @symbol searches symbols"
+  zh-CN: "回车打开 · :行号跳转 · @符号搜索符号"
+command.goto.no_document:
+  en: "There is no active document"
+  zh-CN: "没有活动文档"
+command.goto.invalid_line:
+  en: "Line %{line} is outside the document (1–%{total})"
+  zh-CN: "行 %{line} 超出文档范围（1–%{total}）"
+command.goto.row_detail:
+  en: "Go to line %{line}"
+  zh-CN: "跳转到第 %{line} 行"
+command.goto.no_symbols:
+  en: "No symbols in the active document"
+  zh-CN: "活动文档中没有符号"
+outline.title:
+  en: "Outline"
+  zh-CN: "大纲"
+outline.truncated:
+  en: "truncated"
+  zh-CN: "已截断"
+outline.no_document:
+  en: "No document"
+  zh-CN: "没有文档"
+outline.empty:
+  en: "No symbols"
+  zh-CN: "没有符号"
+outline.unsupported:
+  en: "Symbol outline is not available for this language"
+  zh-CN: "该语言不支持符号大纲"
+outline.unavailable:
+  en: "Outline is not available for this document"
+  zh-CN: "该文档不支持大纲"
+outline.too_large:
+  en: "The document is too large for the outline"
+  zh-CN: "文档过大，无法显示大纲"
+explorer.new_file_title:
+  en: "New File"
+  zh-CN: "新建文件"
+explorer.new_folder_title:
+  en: "New Folder"
+  zh-CN: "新建文件夹"
+explorer.rename_title:
+  en: "Rename"
+  zh-CN: "重命名"
+explorer.create:
+  en: "Create"
+  zh-CN: "创建"
+explorer.name_placeholder:
+  en: "Name"
+  zh-CN: "名称"
+explorer.new_file:
+  en: "New File"
+  zh-CN: "新建文件"
+explorer.new_folder:
+  en: "New Folder"
+  zh-CN: "新建文件夹"
+explorer.rename:
+  en: "Rename"
+  zh-CN: "重命名"
+explorer.delete:
+  en: "Delete"
+  zh-CN: "删除"
+explorer.refresh:
+  en: "Refresh"
+  zh-CN: "刷新"
+explorer.copy_path:
+  en: "Copy Path"
+  zh-CN: "复制路径"
+explorer.reveal:
+  en: "Show in File Manager"
+  zh-CN: "在文件管理器中显示"
+explorer.indexing:
+  en: "Indexing workspace…"
+  zh-CN: "正在索引工作区…"
+explorer.index_truncated:
+  en: "The workspace index reached its file limit"
+  zh-CN: "工作区索引已达到文件上限"
+explorer.delete_title:
+  en: "Delete %{name}"
+  zh-CN: "删除 %{name}"
+explorer.delete_detail:
+  en: "The item is moved to the trash. Choose \"Delete Permanently\" only if the trash is unavailable."
+  zh-CN: "该项目会移到回收站。仅在回收站不可用时选择“永久删除”。"
+explorer.deleted:
+  en: "Deleted %{name}"
+  zh-CN: "已删除 %{name}"
+explorer.delete_failed:
+  en: "Could not delete the item: %{error}"
+  zh-CN: "无法删除项目：%{error}"
+explorer.delete_failed_title:
+  en: "Could Not Move to Trash"
+  zh-CN: "无法移到回收站"
+explorer.delete_permanent_detail:
+  en: "The item was not moved to the trash. Delete it permanently? This cannot be undone."
+  zh-CN: "该项目未能移到回收站。要永久删除吗？此操作无法撤销。"
+explorer.move_to_trash:
+  en: "Move to Trash"
+  zh-CN: "移到回收站"
+explorer.delete_permanently:
+  en: "Delete Permanently"
+  zh-CN: "永久删除"
+explorer.cannot_delete_root:
+  en: "A workspace root cannot be deleted here"
+  zh-CN: "不能在此删除工作区根目录"
+explorer.delete_dirty:
+  en: "Save or close the modified tabs below this item first"
+  zh-CN: "请先保存或关闭该项目下未保存的标签页"
+explorer.cannot_rename_root:
+  en: "A workspace root cannot be renamed"
+  zh-CN: "不能重命名工作区根目录"
+explorer.no_workspace:
+  en: "Open a folder or workspace first"
+  zh-CN: "请先打开文件夹或工作区"
+explorer.no_selection:
+  en: "Select a file or folder first"
+  zh-CN: "请先选择文件或文件夹"
+settings.import_title:
+  en: "Import Settings"
+  zh-CN: "导入设置"
+settings.import_detail:
+  en: "The imported file replaces the current global settings. Workspace overrides are kept."
+  zh-CN: "导入文件将替换当前全局设置，工作区覆盖保持不变。"
+settings.export:
+  en: "Export Settings…"
+  zh-CN: "导出设置…"
+settings.import:
+  en: "Import Settings…"
+  zh-CN: "导入设置…"
+settings.reset:
+  en: "Reset Settings…"
+  zh-CN: "重置设置…"
+settings.export_failed:
+  en: "Could not export settings: %{error}"
+  zh-CN: "无法导出设置：%{error}"
+settings.exported:
+  en: "Settings exported to %{path}"
+  zh-CN: "设置已导出到 %{path}"
+settings.import_failed:
+  en: "Could not import settings: %{error}"
+  zh-CN: "无法导入设置：%{error}"
+settings.imported:
+  en: "Settings imported from %{path}"
+  zh-CN: "已从 %{path} 导入设置"
+settings.reset_done:
+  en: "Settings restored to defaults"
+  zh-CN: "设置已恢复默认值"
+settings.reset_title:
+  en: "Reset Settings"
+  zh-CN: "重置设置"
+settings.reset_detail:
+  en: "Restore the default global settings? Shortcuts, macros, per-language settings, recent files and recent workspaces are cleared. Open documents and workspace files are kept."
+  zh-CN: "恢复默认全局设置？快捷键、宏、每语言设置、最近文件和最近工作区将被清空。已打开的文档和工作区文件会保留。"
+settings.import_confirm:
+  en: "Import"
+  zh-CN: "导入"
+settings.keep:
+  en: "Keep Current"
+  zh-CN: "保留当前"
+settings.reset_confirm:
+  en: "Reset"
+  zh-CN: "重置"
+replace.skip_disk_engine:
+  en: "disk-engine tab is skipped"
+  zh-CN: "跳过磁盘引擎标签"
+replace.skip_partial:
+  en: "partially opened tab is skipped"
+  zh-CN: "跳过部分打开标签"
+replace.skip_non_text:
+  en: "non-text tab is skipped"
+  zh-CN: "跳过非文本标签"
+replace.skip_large:
+  en: "large-file tab is skipped"
+  zh-CN: "跳过大文件标签"
+replace.skip_binary:
+  en: "binary file is skipped"
+  zh-CN: "跳过二进制文件"
+replace.skip_changed:
+  en: "the file changed after the preview"
+  zh-CN: "文件在预览后已改变"
+replace.skip_open_mode:
+  en: "the open tab mode does not support replacement"
+  zh-CN: "已打开标签的模式不支持替换"
+replace.previewing:
+  en: "Calculating the replacement preview…"
+  zh-CN: "正在计算替换预览…"
+replace.preview_ready:
+  en: "Preview: %{files} file(s), %{matches} match(es), %{skipped} skipped"
+  zh-CN: "预览：%{files} 个文件，%{matches} 处匹配，跳过 %{skipped} 个"
+replace.no_matches:
+  en: "The preview has no matches to replace"
+  zh-CN: "预览中没有可替换的匹配"
+replace.preview_required:
+  en: "Calculate the preview first"
+  zh-CN: "请先计算预览"
+replace.confirm_title:
+  en: "Replace in Workspace"
+  zh-CN: "在工作区中替换"
+replace.confirm_detail:
+  en: "Replace matches in %{files} file(s) in memory? Nothing is written until you save."
+  zh-CN: "在内存中替换 %{files} 个文件的 %{matches} 处匹配？保存前不会写入磁盘。"
+replace.confirm_button:
+  en: "Replace"
+  zh-CN: "替换"
+replace.applied:
+  en: "Modified %{count} file(s) in memory; %{skipped} skipped. Save to write them to disk."
+  zh-CN: "已在内存中修改 %{count} 个文件，跳过 %{skipped} 个。保存后写入磁盘。"
+replace.nothing_to_undo:
+  en: "There is no workspace replace to undo"
+  zh-CN: "没有可撤销的工作区替换"
+replace.undone:
+  en: "Workspace replace undone"
+  zh-CN: "已撤销工作区替换"
+ff.workspace:
+  en: "Workspace"
+  zh-CN: "工作区"
+ff.respect_gitignore:
+  en: "Respect .gitignore"
+  zh-CN: "遵守 .gitignore"
+ff.use_workspace_filter:
+  en: "Use Workspace Filter"
+  zh-CN: "使用工作区设置"
+ff.show_replace:
+  en: "Replace"
+  zh-CN: "替换"
+ff.hide_replace:
+  en: "Hide Replace"
+  zh-CN: "隐藏替换"
+ff.preview_replace:
+  en: "Preview Replace"
+  zh-CN: "预览替换"
+ff.replace_all:
+  en: "Replace All"
+  zh-CN: "全部替换"
+ff.undo_replace:
+  en: "Undo Replace"
+  zh-CN: "撤销替换"
+ff.include_placeholder:
+  en: "Include: *.rs, src/**"
+  zh-CN: "包含：*.rs, src/**"
+ff.exclude_placeholder:
+  en: "Exclude: target/**, *.min.js"
+  zh-CN: "排除：target/**, *.min.js"
+ff.replacement_placeholder:
+  en: "Replace with…"
+  zh-CN: "替换为…"
+ff.more_matches:
+  en: "%{count} more match(es)"
+  zh-CN: "还有 %{count} 处匹配"
+ff.no_workspace:
+  en: "No workspace is open"
+  zh-CN: "没有打开的工作区"
+menu.file.new_window:
+  en: "New Window"
+  zh-CN: "新建窗口"
+menu.file.open_workspace:
+  en: "Open Workspace…"
+  zh-CN: "打开工作区…"
+menu.file.save_workspace:
+  en: "Save Workspace"
+  zh-CN: "保存工作区"
+menu.file.save_workspace_as:
+  en: "Save Workspace As…"
+  zh-CN: "工作区另存为…"
+menu.file.add_folder:
+  en: "Add Folder to Workspace…"
+  zh-CN: "添加文件夹到工作区…"
+menu.file.close_workspace:
+  en: "Close Workspace"
+  zh-CN: "关闭工作区"
+menu.file.recent_workspace:
+  en: "Workspace: %{path}"
+  zh-CN: "工作区：%{path}"
+menu.view.outline:
+  en: "Outline"
+  zh-CN: "大纲"
+menu.view.breadcrumbs:
+  en: "Breadcrumbs"
+  zh-CN: "面包屑"
+menu.view.split_right:
+  en: "Split Right"
+  zh-CN: "向右分屏"
+menu.view.split_down:
+  en: "Split Down"
+  zh-CN: "向下分屏"
+menu.view.unsplit:
+  en: "Unsplit"
+  zh-CN: "取消分屏"
+menu.view.switch_group:
+  en: "Switch Editor Group"
+  zh-CN: "切换编辑组"
+menu.view.switch_group_back:
+  en: "Switch Editor Group Back"
+  zh-CN: "反向切换编辑组"
+menu.view.document_map:
+  en: "Document Map"
+  zh-CN: "文档地图"
+menu.view.whitespace:
+  en: "Show Whitespace"
+  zh-CN: "显示空白字符"
+menu.view.indent_guides:
+  en: "Indent Guides"
+  zh-CN: "缩进参考线"
+menu.view.ruler:
+  en: "Column Ruler"
+  zh-CN: "列标尺"
+menu.view.bracket_colors:
+  en: "Bracket Colors"
+  zh-CN: "括号配色"
+menu.navigation.back:
+  en: "Back"
+  zh-CN: "后退"
+menu.navigation.forward:
+  en: "Forward"
+  zh-CN: "前进"
+menu.search.workspace_replace:
+  en: "Replace in Workspace…"
+  zh-CN: "在工作区中替换…"
+menu.search.undo_workspace_replace:
+  en: "Undo Workspace Replace"
+  zh-CN: "撤销工作区替换"
+menu.tabs.move_to_new_window:
+  en: "Move Tab to New Window"
+  zh-CN: "移动标签到新窗口"
+menu.tabs.move_to_other_group:
+  en: "Move Tab to Other Group"
+  zh-CN: "移动标签到另一组"
+menu.settings.import:
+  en: "Import Settings…"
+  zh-CN: "导入设置…"
+menu.settings.export:
+  en: "Export Settings…"
+  zh-CN: "导出设置…"
+menu.settings.reset:
+  en: "Reset Settings…"
+  zh-CN: "重置设置…"
+prefs.search_placeholder:
+  en: "Search settings…"
+  zh-CN: "搜索设置…"
+prefs.no_matches:
+  en: "No matching settings"
+  zh-CN: "没有匹配的设置"
+prefs.view:
+  en: "View"
+  zh-CN: "视图"
+prefs.workspace:
+  en: "Workspace"
+  zh-CN: "工作区"
+prefs.workspace_name:
+  en: "Name: %{name}"
+  zh-CN: "名称：%{name}"
+prefs.workspace_file:
+  en: "File: %{path}"
+  zh-CN: "文件：%{path}"
+prefs.files:
+  en: "Files"
+  zh-CN: "文件"
+prefs.max_file_size:
+  en: "Open limit"
+  zh-CN: "打开上限"
+prefs.import_export:
+  en: "Import, Export and Reset"
+  zh-CN: "导入、导出与重置"
+dialog.open_workspace:
+  en: "Open Workspace"
+  zh-CN: "打开工作区"
+dialog.save_workspace:
+  en: "Save Workspace"
+  zh-CN: "保存工作区"
+dialog.add_folder:
+  en: "Add Folder"
+  zh-CN: "添加文件夹"
+dialog.import_settings:
+  en: "Import Settings"
+  zh-CN: "导入设置"
+dialog.export_settings:
+  en: "Export Settings"
+  zh-CN: "导出设置"
+status.copied_path:
+  en: "Copied %{path}"
+  zh-CN: "已复制 %{path}"
+
+replace.preview_summary:
+  en: "Preview: %{files} file(s), %{matches} match(es), %{skipped} skipped"
+  zh-CN: "预览：%{files} 个文件，%{matches} 处匹配，跳过 %{skipped} 个"
+
+ff.more_files:
+  en: "%{count} more file(s) not shown"
+  zh-CN: "还有 %{count} 个文件未显示"
+
+replace.preview_stale:
+  en: "The preview is out of date; calculate it again"
+  zh-CN: "预览已过期，请重新计算"
+
+replace.keep:
+  en: "Keep Current"
+  zh-CN: "保留当前"
+explorer.keep_file:
+  en: "Keep File"
+  zh-CN: "保留文件"
+
+explorer.created:
+  en: "Created %{name}"
+  zh-CN: "已创建 %{name}"
+explorer.renamed:
+  en: "Renamed to %{name}"
+  zh-CN: "已重命名为 %{name}"
+
+status.bracket_colors_unavailable:
+  en: "Bracket colors are only available for ordinary text documents up to 2 MB"
+  zh-CN: "括号配色仅适用于不超过 2 MB 的普通文本文档"
+
+menu.file.clear_recent_workspaces:
+  en: "Clear Recent Workspaces"
+  zh-CN: "清除最近工作区"
+
+workspace.recent_cleared:
+  en: "Recent workspaces cleared"
+  zh-CN: "已清除最近工作区"
+
+status.session_save_failed:
+  en: "Could not save the session: %{error}"
+  zh-CN: "无法保存会话：%{error}"
+
+settings.reset_failed:
+  en: "Could not write the default settings: %{error}"
+  zh-CN: "无法写入默认设置：%{error}"
+
+split.group_label:
+  en: "Editor group %{group}"
+  zh-CN: "编辑组 %{group}"
+
+menu.file.open_recent_workspace:
+  en: "Open Recent Workspace"
+  zh-CN: "打开最近工作区"
+
+menu.workspace.remove_root:
+  en: "Remove Folder from Workspace"
+  zh-CN: "从工作区移除文件夹"
+
+menu.navigation.goto_symbol:
+  en: "Go to Symbol…"
+  zh-CN: "跳转到符号…"
+
+workspace.no_recent:
+  en: "There are no recent workspaces"
+  zh-CN: "没有最近工作区"
+
+workspace.not_in_workspace:
+  en: "The selected item is outside the workspace"
+  zh-CN: "所选项目不在工作区内"
+
+prefs.appearance:
+  en: "Appearance"
+  zh-CN: "外观"
+
+prefs.font:
+  en: "Font"
+  zh-CN: "字体"
+
+prefs.keybindings:
+  en: "Keybindings"
+  zh-CN: "快捷键"
+
+prefs.macros:
+  en: "Macros"
+  zh-CN: "宏"
+
+view.whitespace:
+  en: "Show Whitespace"
+  zh-CN: "显示空白字符"
+
+view.indent_guides:
+  en: "Indent Guides"
+  zh-CN: "缩进参考线"
+
+view.ruler:
+  en: "Column Ruler"
+  zh-CN: "列标尺"
+
+view.document_map:
+  en: "Document Map"
+  zh-CN: "文档地图"
+
+view.bracket_colors:
+  en: "Bracket Colors"
+  zh-CN: "括号配色"
+
+view.outline:
+  en: "Outline"
+  zh-CN: "大纲"
+
+view.breadcrumbs:
+  en: "Breadcrumbs"
+  zh-CN: "面包屑"

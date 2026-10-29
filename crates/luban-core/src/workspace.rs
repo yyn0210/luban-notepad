@@ -4,10 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ignore::WalkBuilder;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::encoding::{decode, looks_binary};
 use crate::error::{Error, Result};
+use crate::globs::GlobFilter;
 use crate::search::{SearchEngine, SearchOptions};
 use crate::text::{char_to_byte, LineIndex};
 
@@ -107,6 +109,153 @@ pub struct FindInFilesOutcome {
     pub files_with_matches: usize,
     pub truncated: bool,
     pub cancelled: bool,
+}
+
+/// Search every workspace root with include/exclude filters and an optional
+/// `.gitignore`-aware walk.
+#[derive(Clone, Debug)]
+pub struct WorkspaceSearchOptions {
+    pub roots: Vec<PathBuf>,
+    pub query: String,
+    pub options: SearchOptions,
+    /// Compiled include/exclude patterns, matched against root-relative paths.
+    pub filter: GlobFilter,
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
+    pub max_results: usize,
+    pub max_file_size: u64,
+}
+
+impl Default for WorkspaceSearchOptions {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            query: String::new(),
+            options: SearchOptions::default(),
+            filter: GlobFilter::default(),
+            respect_gitignore: true,
+            include_hidden: false,
+            max_results: 20_000,
+            max_file_size: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// Search all workspace roots. Symlinks are not followed, `.git` is skipped,
+/// and a missing root is ignored so the remaining roots still return results.
+pub fn search_workspace(
+    options: &WorkspaceSearchOptions,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(usize),
+) -> Result<FindInFilesOutcome> {
+    if options.query.is_empty() {
+        return Err(Error::Other(crate::i18n::tr("core.search.empty_text")));
+    }
+    let engine = SearchEngine::new(options.query.clone(), options.options);
+    if let Some(err) = engine.error() {
+        return Err(Error::Other(crate::i18n::tr_args(
+            "core.search.invalid_regex",
+            &[("error", err.to_string())],
+        )));
+    }
+
+    let mut outcome = FindInFilesOutcome::default();
+    for root in &options.roots {
+        if cancel.load(Ordering::Relaxed) {
+            outcome.cancelled = true;
+            break;
+        }
+        if !root.is_dir() {
+            continue;
+        }
+        let walker = WalkBuilder::new(root)
+            .hidden(!options.include_hidden)
+            .follow_links(false)
+            .git_ignore(options.respect_gitignore)
+            .git_global(options.respect_gitignore)
+            .git_exclude(options.respect_gitignore)
+            .ignore(false)
+            .require_git(false)
+            .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+            .build();
+        for entry in walker {
+            if cancel.load(Ordering::Relaxed) {
+                outcome.cancelled = true;
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !options.filter.matches(&relative) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > options.max_file_size {
+                continue;
+            }
+            let Ok(bytes) = fs::read(path) else { continue };
+            if looks_binary(&bytes) {
+                continue;
+            }
+            let decoded = decode(&bytes);
+            let matches = engine.find_all(
+                &decoded.text,
+                None,
+                options.max_results.saturating_sub(outcome.matches.len()),
+            );
+            outcome.files_scanned += 1;
+            on_progress(outcome.files_scanned);
+            if matches.is_empty() {
+                continue;
+            }
+            outcome.files_with_matches += 1;
+            let index = LineIndex::new(&decoded.text);
+            for matched in matches {
+                let (line, column) = index.line_col(matched.start);
+                let line_text = index.line_text(&decoded.text, line.saturating_sub(1));
+                let b0 = char_to_byte(&decoded.text, matched.start);
+                let b1 = char_to_byte(&decoded.text, matched.end);
+                outcome.matches.push(FileMatch {
+                    path: path.to_path_buf(),
+                    line,
+                    column,
+                    line_text: line_text.trim_end_matches(['\r', '\n']).to_string(),
+                    match_text: decoded.text[b0..b1].to_string(),
+                    match_len: matched.len(),
+                });
+                if outcome.matches.len() >= options.max_results {
+                    outcome.truncated = true;
+                    break;
+                }
+            }
+            if outcome.truncated {
+                break;
+            }
+        }
+        if outcome.truncated || outcome.cancelled {
+            break;
+        }
+    }
+
+    outcome.matches.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.column.cmp(&b.column))
+    });
+    Ok(outcome)
 }
 
 const IGNORED_DIRS: &[&str] = &[
@@ -453,5 +602,79 @@ mod tests {
         assert_eq!(outcome.matches.len(), 1);
         assert_eq!(outcome.matches[0].column, 3);
         assert_eq!(outcome.matches[0].match_text, "世界");
+    }
+
+    #[test]
+    fn workspace_search_covers_multiple_roots_and_honours_gitignore() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write(a.path(), "one.rs", "needle");
+        write(a.path(), "ignored.rs", "needle");
+        write(a.path(), "nested/two.rs", "needle");
+        write(b.path(), "three.rs", "needle");
+        fs::write(a.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        let options = WorkspaceSearchOptions {
+            roots: vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            query: "needle".into(),
+            ..WorkspaceSearchOptions::default()
+        };
+        let outcome = search_workspace(&options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(outcome.matches.len(), 3);
+        assert!(!outcome
+            .matches
+            .iter()
+            .any(|matched| matched.path.ends_with("ignored.rs")));
+    }
+
+    #[test]
+    fn workspace_search_applies_include_and_exclude_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/main.rs", "needle");
+        write(dir.path(), "src/main.py", "needle");
+        write(dir.path(), "tests/main.rs", "needle");
+        let options = WorkspaceSearchOptions {
+            roots: vec![dir.path().to_path_buf()],
+            query: "needle".into(),
+            filter: GlobFilter::new("*.rs", "tests/**").unwrap(),
+            ..WorkspaceSearchOptions::default()
+        };
+        let outcome = search_workspace(&options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(outcome.matches.len(), 1);
+        assert!(outcome.matches[0].path.ends_with("src/main.rs"));
+    }
+
+    #[test]
+    fn workspace_search_skips_binaries_and_missing_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ok.txt", "needle");
+        fs::write(dir.path().join("bin.dat"), [0u8, 1, 0]).unwrap();
+        let options = WorkspaceSearchOptions {
+            roots: vec![dir.path().join("missing"), dir.path().to_path_buf()],
+            query: "needle".into(),
+            ..WorkspaceSearchOptions::default()
+        };
+        let outcome = search_workspace(&options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(outcome.matches.len(), 1);
+        assert!(outcome.matches[0].path.ends_with("ok.txt"));
+    }
+
+    #[test]
+    fn workspace_search_cancels_and_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", "x x x x\n");
+        let options = WorkspaceSearchOptions {
+            roots: vec![dir.path().to_path_buf()],
+            query: "x".into(),
+            max_results: 2,
+            ..WorkspaceSearchOptions::default()
+        };
+        let outcome = search_workspace(&options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(outcome.matches.len(), 2);
+        assert!(outcome.truncated);
+
+        let cancel = AtomicBool::new(true);
+        let outcome = search_workspace(&options, &cancel, &mut |_| {}).unwrap();
+        assert!(outcome.cancelled);
+        assert!(outcome.matches.is_empty());
     }
 }

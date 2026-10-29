@@ -54,6 +54,39 @@ pub struct Settings {
     pub show_toolbar: bool,
     pub show_file_explorer: bool,
     pub show_hidden_files: bool,
+    /// Draw spaces and tabs as visible markers.
+    #[serde(default)]
+    pub show_whitespace: bool,
+    /// Draw vertical indentation guides.
+    #[serde(default = "default_true")]
+    pub show_indent_guides: bool,
+    /// Draw column rulers in unwrapped documents.
+    #[serde(default)]
+    pub show_ruler: bool,
+    /// 1-based columns that receive a ruler. Invalid entries are dropped.
+    #[serde(default = "default_ruler_columns")]
+    pub ruler_columns: Vec<usize>,
+    /// Show the document map on the right edge of the editor.
+    #[serde(default)]
+    pub show_document_map: bool,
+    /// Colour paired brackets by nesting depth.
+    #[serde(default)]
+    pub bracket_colors: bool,
+    /// Show the symbol outline below the file tree.
+    #[serde(default = "default_true")]
+    pub show_outline: bool,
+    /// Show the breadcrumb row above the editor.
+    #[serde(default = "default_true")]
+    pub show_breadcrumbs: bool,
+    /// Apply `.gitignore` rules to the file tree, index and workspace search.
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    /// Default include globs for workspace search.
+    #[serde(default)]
+    pub search_include: String,
+    /// Default exclude globs for workspace search.
+    #[serde(default)]
+    pub search_exclude: String,
     pub highlight_current_line: bool,
     pub highlight_matching_brackets: bool,
     pub auto_indent: bool,
@@ -63,6 +96,9 @@ pub struct Settings {
     pub session_interval_secs: u64,
     pub max_recent_files: usize,
     pub recent_files: Vec<PathBuf>,
+    /// Recently opened workspaces, most recent first.
+    #[serde(default)]
+    pub recent_workspaces: Vec<PathBuf>,
     pub large_file_threshold: usize,
     /// Show the large-file controller automatically for files at or above the
     /// controller threshold.
@@ -127,6 +163,13 @@ fn default_ui_language() -> String {
     "system".to_string()
 }
 
+fn default_ruler_columns() -> Vec<usize> {
+    vec![80, 120]
+}
+
+/// Maximum number of remembered workspaces.
+pub const MAX_RECENT_WORKSPACES: usize = 20;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -142,6 +185,17 @@ impl Default for Settings {
             show_toolbar: true,
             show_file_explorer: false,
             show_hidden_files: false,
+            show_whitespace: false,
+            show_indent_guides: true,
+            show_ruler: false,
+            ruler_columns: default_ruler_columns(),
+            show_document_map: false,
+            bracket_colors: false,
+            show_outline: true,
+            show_breadcrumbs: true,
+            respect_gitignore: true,
+            search_include: String::new(),
+            search_exclude: String::new(),
             highlight_current_line: true,
             highlight_matching_brackets: true,
             auto_indent: true,
@@ -151,6 +205,7 @@ impl Default for Settings {
             session_interval_secs: 20,
             max_recent_files: 20,
             recent_files: Vec::new(),
+            recent_workspaces: Vec::new(),
             large_file_threshold: 100 * 1024 * 1024,
             large_file_controller: true,
             large_file_controller_threshold: 200 * 1024 * 1024,
@@ -207,7 +262,7 @@ impl Settings {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fs::write(path, json)
+        crate::atomic_write::write_atomic(path, json.as_bytes())
     }
 
     pub fn path() -> PathBuf {
@@ -261,6 +316,12 @@ impl Settings {
         self.recent_files.retain(|p| !p.as_os_str().is_empty());
         self.recent_files.dedup_by(|a, b| paths_equal(a, b));
         self.recent_files.truncate(self.max_recent_files);
+        self.recent_workspaces.retain(|p| !p.as_os_str().is_empty());
+        self.recent_workspaces.dedup_by(|a, b| paths_equal(a, b));
+        self.recent_workspaces.truncate(MAX_RECENT_WORKSPACES);
+        normalize_ruler_columns(&mut self.ruler_columns);
+        self.search_include = self.search_include.trim().to_string();
+        self.search_exclude = self.search_exclude.trim().to_string();
         let language = self.ui_language.trim();
         if language.is_empty()
             || (language != "system" && !crate::i18n::SUPPORTED.contains(&language))
@@ -285,6 +346,80 @@ impl Settings {
 
     pub fn clear_recent(&mut self) {
         self.recent_files.clear();
+    }
+
+    /// Push a workspace path to the top of the recent list, removing duplicates.
+    pub fn add_recent_workspace(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.recent_workspaces.retain(|p| !paths_equal(p, &path));
+        self.recent_workspaces.insert(0, path);
+        self.recent_workspaces.truncate(MAX_RECENT_WORKSPACES);
+    }
+
+    pub fn remove_recent_workspace(&mut self, path: &Path) {
+        self.recent_workspaces.retain(|p| !paths_equal(p, path));
+    }
+
+    /// Serialize the complete global settings document.
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    /// Parse and validate an exported settings document.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let mut settings: Settings =
+            serde_json::from_str(json).map_err(|error| error.to_string())?;
+        settings.validate();
+        Ok(settings)
+    }
+
+    /// Drop every per-user customization while preserving the active window.
+    pub fn reset_to_default(&mut self) {
+        *self = Settings::default();
+    }
+
+    /// Copy fields that are never overridden by a workspace file from
+    /// `other`, leaving the overridable editor fields untouched.
+    pub fn merge_global_fields_from(&mut self, other: &Settings) {
+        self.theme = other.theme;
+        self.syntax_theme = other.syntax_theme.clone();
+        self.font_family = other.font_family.clone();
+        self.font_size = other.font_size;
+        self.show_status_bar = other.show_status_bar;
+        self.show_toolbar = other.show_toolbar;
+        self.show_file_explorer = other.show_file_explorer;
+        self.show_hidden_files = other.show_hidden_files;
+        self.show_outline = other.show_outline;
+        self.show_breadcrumbs = other.show_breadcrumbs;
+        self.bracket_colors = other.bracket_colors;
+        self.highlight_current_line = other.highlight_current_line;
+        self.highlight_matching_brackets = other.highlight_matching_brackets;
+        self.auto_indent = other.auto_indent;
+        self.trim_trailing_whitespace_on_save = other.trim_trailing_whitespace_on_save;
+        self.restore_session = other.restore_session;
+        self.autosave_session = other.autosave_session;
+        self.session_interval_secs = other.session_interval_secs;
+        self.max_recent_files = other.max_recent_files;
+        self.recent_files = other.recent_files.clone();
+        self.recent_workspaces = other.recent_workspaces.clone();
+        self.large_file_threshold = other.large_file_threshold;
+        self.large_file_controller = other.large_file_controller;
+        self.large_file_controller_threshold = other.large_file_controller_threshold;
+        self.large_file_partial_size = other.large_file_partial_size;
+        self.large_file_display_unit = other.large_file_display_unit;
+        self.max_file_size_mb = other.max_file_size_mb;
+        self.default_encoding = other.default_encoding;
+        self.default_eol = other.default_eol;
+        self.ui_language = other.ui_language.clone();
+        self.local_history_enabled = other.local_history_enabled;
+        self.local_history_days = other.local_history_days;
+        self.local_history_max_mb = other.local_history_max_mb;
+        self.keybindings = other.keybindings.clone();
+        self.search_history = other.search_history.clone();
+        self.replace_history = other.replace_history.clone();
+        self.macros = other.macros.clone();
+        self.language_settings = other.language_settings.clone();
+        self.syntax_theme_path = other.syntax_theme_path.clone();
     }
 
     pub fn max_file_size_bytes(&self) -> u64 {
@@ -334,6 +469,13 @@ impl Settings {
     }
 }
 
+/// Keep valid 1-based ruler columns, sorted and de-duplicated.
+pub fn normalize_ruler_columns(columns: &mut Vec<usize>) {
+    columns.retain(|column| (1..=500).contains(column));
+    columns.sort_unstable();
+    columns.dedup();
+}
+
 fn normalize_history(history: &mut Vec<String>) {
     let mut out: Vec<String> = Vec::new();
     for entry in history.drain(..) {
@@ -359,7 +501,7 @@ fn push_history(history: &mut Vec<String>, value: &str) {
     history.truncate(20);
 }
 
-fn paths_equal(a: &Path, b: &Path) -> bool {
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
         a.to_string_lossy()
             .eq_ignore_ascii_case(&b.to_string_lossy())
@@ -639,6 +781,75 @@ mod tests {
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path).theme, ThemeChoice::System);
         assert!(fs::read_to_string(&path).unwrap().contains("\"system\""));
+    }
+
+    #[test]
+    fn settings_json_round_trips_and_rejects_invalid_documents() {
+        let mut settings = Settings {
+            font_size: 16.0,
+            theme: ThemeChoice::Dark,
+            ..Settings::default()
+        };
+        settings.add_recent("/tmp/a.txt");
+        settings.add_recent_workspace("/tmp/w.luban-workspace");
+        let json = settings.to_json().unwrap();
+        let loaded = Settings::from_json(&json).unwrap();
+        assert_eq!(loaded.font_size, 16.0);
+        assert_eq!(loaded.theme, ThemeChoice::Dark);
+        assert_eq!(loaded.recent_workspaces.len(), 1);
+        assert!(Settings::from_json("not json").is_err());
+        assert!(Settings::from_json(r#"{"font_size": "big"}"#).is_err());
+    }
+
+    #[test]
+    fn reset_clears_every_user_customization() {
+        let mut settings = Settings {
+            tab_size: 8,
+            ui_language: "zh-CN".to_string(),
+            ..Settings::default()
+        };
+        settings.add_recent("/tmp/a");
+        settings.add_recent_workspace("/tmp/w");
+        settings
+            .keybindings
+            .insert("file.save".into(), "ctrl+alt+s".into());
+        settings.reset_to_default();
+        assert_eq!(settings.tab_size, Settings::default().tab_size);
+        assert_eq!(settings.ui_language, "system");
+        assert!(settings.recent_files.is_empty());
+        assert!(settings.recent_workspaces.is_empty());
+        assert!(settings.keybindings.is_empty());
+    }
+
+    #[test]
+    fn workspace_overrides_are_kept_when_global_fields_merge() {
+        let effective = Settings {
+            tab_size: 2,
+            theme: ThemeChoice::Dark,
+            bracket_colors: true,
+            ..Settings::default()
+        };
+        let mut global = Settings {
+            theme: ThemeChoice::Light,
+            ..Settings::default()
+        };
+        global.merge_global_fields_from(&effective);
+        assert_eq!(global.theme, ThemeChoice::Dark);
+        assert!(global.bracket_colors);
+        // Overridable fields stay out of the global copy.
+        assert_eq!(global.tab_size, Settings::default().tab_size);
+    }
+
+    #[test]
+    fn ruler_columns_are_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"ruler_columns": [120, 0, 80, 80, 501]}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.ruler_columns, vec![80, 120]);
+        assert!(!loaded.show_ruler);
+        assert!(loaded.show_indent_guides);
+        assert!(loaded.respect_gitignore);
     }
 
     #[test]

@@ -63,6 +63,25 @@ mod tests {
             catalog.insert(key.as_str());
         }
 
+        for key in [
+            "view.whitespace",
+            "view.indent_guides",
+            "view.ruler",
+            "view.document_map",
+            "view.bracket_colors",
+            "view.outline",
+            "view.breadcrumbs",
+        ] {
+            assert!(catalog.contains(key), "missing view label {key}");
+        }
+        for group in crate::settings_search::SETTINGS_GROUPS {
+            assert!(
+                catalog.contains(group.label_key),
+                "settings group uses missing catalog key {}",
+                group.label_key
+            );
+        }
+
         for source in [
             include_str!("app.rs"),
             include_str!("dialogs.rs"),
@@ -96,6 +115,11 @@ mod tests {
             "about.",
             "shortcuts.",
             "prefs.",
+            "replace.",
+            "outline.",
+            "workspace.",
+            "breadcrumbs.",
+            "split.",
         ];
         let mut keys = Vec::new();
         let mut rest = source;

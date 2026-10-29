@@ -142,3 +142,26 @@ core.disk_engine.recovery_source_changed:
 core.disk_engine.recovery_corrupt:
   en: "the recovery data is inconsistent and cannot be replayed"
   zh-CN: "恢复数据不一致，无法重放"
+
+core.file_ops.name_empty:
+  en: "the name cannot be empty"
+  zh-CN: "名称不能为空"
+core.file_ops.name_dot:
+  en: "the name cannot be . or .."
+  zh-CN: "名称不能是 . 或 .."
+core.file_ops.name_separator:
+  en: "the name cannot contain a path separator"
+  zh-CN: "名称不能包含路径分隔符"
+core.file_ops.name_nul:
+  en: "the name cannot contain a NUL character"
+  zh-CN: "名称不能包含空字符"
+core.file_ops.exists:
+  en: "a file or folder with that name already exists"
+  zh-CN: "同名文件或文件夹已存在"
+core.file_ops.trash_failed:
+  en: "could not move the item to the trash: %{error}"
+  zh-CN: "无法将项目移到回收站：%{error}"
+
+core.file_ops.rename_same_parent:
+  en: "a rename must stay in the same folder; use Save As to move a file"
+  zh-CN: "重命名不能跨文件夹；移动文件请使用另存为"

@@ -13,7 +13,7 @@ use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandSt
 use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, FoldRange, Indent, Input, InputEvent, InputState, Outdent,
     Paste, Position, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo,
-    RopeExt, Search, SelectAll, TabSize, Undo,
+    RopeExt, Search, SelectAll, TabSize, TextDecoration, TextDecorationCollection, Undo,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarMode};
@@ -30,6 +30,8 @@ use luban_core::document::{DiskStatus, Document, PartialRange};
 use luban_core::encoding::{self, TextEncoding};
 use luban_core::eol::{self, Eol};
 use luban_core::export::{self, ExportFormat};
+use luban_core::file_ops;
+use luban_core::globs::GlobFilter;
 use luban_core::i18n::language_display_name;
 use luban_core::language;
 use luban_core::large_file::{format_bytes, RangeMode, SizeUnit};
@@ -37,13 +39,16 @@ use luban_core::line_ops::{self, SortMode};
 use luban_core::local_history::{HistoryEntry, HistoryStore};
 use luban_core::macros::SavedMacro;
 use luban_core::search::{ByteMatch, Match, ReplacePreview};
-use luban_core::session::{Session, SessionTab};
+use luban_core::session::{GroupSession, Session, SessionTab, SplitLayout, WindowSession};
 use luban_core::settings::{LanguageSettings, Settings, ThemeChoice};
 use luban_core::text as textutil;
 use luban_core::undo::EditKind;
 use luban_core::workspace::{
-    list_directory, FileEntry, FileMatch, FindInFilesOptions, FindInFilesOutcome,
+    list_directory, search_workspace, FileEntry, FileMatch, FindInFilesOptions, FindInFilesOutcome,
+    WorkspaceSearchOptions,
 };
+use luban_core::workspace_file::{WorkspaceFile, WorkspaceSettings};
+use luban_core::workspace_index::{build_index, IndexOptions, WorkspaceIndex};
 
 use crate::column_editor::ColumnEditorState;
 use crate::commands::{self, CommandContext, Keymap};
@@ -51,6 +56,7 @@ use crate::dialogs::{
     next_listing_generation, CloseIntent, ConfirmState, FileDialogMode, FileDialogPurpose,
     FileDialogState, FileFilter, GoToLineState, LanguagePickerState, SaveAsRequest, SaveThen,
 };
+use crate::document_map;
 use crate::explorer::ExplorerState;
 use crate::file_watch::{FileWatcher, WatchEventKind};
 use crate::find::{FindInFilesPanel, FindPanel};
@@ -65,15 +71,37 @@ use crate::i18n::{active_language_name, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
 use crate::logging;
 use crate::macro_ui::MacroUiState;
-use crate::palette::{self, QuickTarget};
+use crate::navigation::{BreadcrumbAction, NavigationEntry, NavigationHistory};
+use crate::outline::OutlineState;
+use crate::palette;
+use crate::path_prompt::{NamePromptKind, NamePromptState};
 use crate::preferences::{matching_fonts, FontPickerState, PreferencesState};
+use crate::quick_open::{self, QuickRow};
+use crate::settings_search;
 use crate::syntax_theme::{self, THEME_OPTIONS};
+use crate::tab_groups::{self, SplitDirection};
 use crate::theme::apply_theme;
 use crate::util::{self, language_key};
+use crate::window_registry;
+use crate::workspace_replace::{
+    self, FilePreview, ReplacePreview as WorkspaceReplacePreview, ReplaceUndo, SkippedFile,
+    UndoEntry,
+};
+
+/// What a freshly opened window starts with.
+#[derive(Clone, Debug, Default)]
+pub enum WindowInit {
+    /// One untitled document.
+    #[default]
+    Blank,
+    /// Restore the saved window layout.
+    Session(Box<WindowSession>),
+    /// Open these tabs (used by "move tab to new window").
+    Tabs(Vec<SessionTab>),
+}
 
 pub struct LaunchOptions {
     pub files: Vec<PathBuf>,
-    pub new_window: bool,
     pub smoke_test: bool,
     /// The platform has no client-decorated shadow margin to blend against, so
     /// the application removes the window manager titlebar itself and draws the
@@ -81,6 +109,13 @@ pub struct LaunchOptions {
     pub manual_window_chrome: bool,
     /// Disk-engine documents left behind by a crash, in display order.
     pub recoveries: Vec<RecoveryInfo>,
+    /// Initial content for this window.
+    pub init: WindowInit,
+    /// Restore the queued crash-recovery entry immediately (used when a dirty
+    /// disk-engine tab moves to a new window).
+    pub auto_recovery: bool,
+    /// Process-local window identifier used by the session registry.
+    pub window_id: u64,
 }
 
 /// A file on disk no longer matches the buffer's recorded identity.
@@ -117,19 +152,43 @@ struct HistoryDialogState {
 struct PaletteOverlay {
     kind: PaletteKind,
     state: Entity<CommandState>,
-    /// Flat command IDs for the command palette, grouped for quick open.
+    /// Flat command IDs for the command palette.
     command_groups: Vec<Vec<&'static str>>,
-    quick_targets: Vec<Vec<QuickTarget>>,
 }
-
-/// Rows backing the quick-open overlay, kept separate from the palette state
-/// so rendering does not need to rebuild them.
-type QuickOpenRows = (Vec<(u64, String, String)>, Vec<(PathBuf, String, String)>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaletteKind {
     Commands,
     QuickOpen,
+}
+
+/// Quick-open rows and the current query error.
+#[derive(Default)]
+struct QuickOpenState {
+    rows: Vec<QuickRow>,
+    error: Option<String>,
+}
+
+/// Workspace replace preview, pending state and the one-level undo record.
+#[derive(Default)]
+pub(crate) struct WorkspaceReplaceState {
+    preview: Option<WorkspaceReplacePreview>,
+    running: bool,
+    cancel: Option<Arc<AtomicBool>>,
+    undo: Option<ReplaceUndo>,
+    /// Query and replacement captured by the preview so apply uses the same
+    /// options.
+    query: String,
+    replacement: String,
+    options: Option<luban_core::search::SearchOptions>,
+    filter: GlobFilter,
+    error: Option<String>,
+    status: String,
+    generation: u64,
+    /// Whether the buffered preview has been confirmed once.
+    confirmed: bool,
+    /// Query/options signature the preview was computed for.
+    preview_signature: String,
 }
 
 /// A tab closed during this session, available through Ctrl+Shift+T.
@@ -196,6 +255,8 @@ struct TrimPlan {
     queue: Vec<u64>,
     /// Modified tabs among the queue, saved before anything is closed.
     save_queue: Vec<u64>,
+    /// Remove this workspace root once the queue is closed.
+    remove_root: Option<PathBuf>,
 }
 
 /// Drag payload for reordering tabs.
@@ -227,6 +288,10 @@ pub struct Tab {
     pub editor: Entity<EditorState>,
     pub decorations: RangeDecorationCollection,
     pub bookmark_decorations: RangeDecorationCollection,
+    /// Bracket-colour text decorations.
+    pub bracket_decorations: TextDecorationCollection,
+    /// Tab group (0 or 1).
+    pub group: usize,
     pub bookmarks: BookmarkSet,
     pub bookmark_revision: u64,
     pub fold_generation: u64,
@@ -245,6 +310,8 @@ pub struct Tab {
     /// mode: no syntax highlighting, wrapping, bracket matching or live find.
     pub large_file: bool,
     decorations_key: Option<DecorationKey>,
+    /// Revision and enable flag the bracket decorations were computed for.
+    bracket_key: Option<(u64, bool)>,
     _subscription: Subscription,
     /// Re-renders the app when the editor notifies without an `InputEvent`
     /// (wheel scrolling, cursor motion), so the file scrollbar and the global
@@ -291,6 +358,8 @@ struct RestoreSpec {
     huge_line: Option<u64>,
     huge_column: Option<u64>,
     bookmarks: Vec<usize>,
+    /// Editor group the tab belongs to.
+    group: usize,
 }
 
 impl RestoreSpec {
@@ -344,23 +413,20 @@ impl RestoreSpec {
             match opened {
                 Ok(mut doc) => {
                     if let Some(text) = &self.text {
-                        if self.range.is_none() {
-                            // Ordinary buffers are stored LF-normalized;
-                            // non-text buffers are stored raw and must keep
-                            // their bytes.
-                            doc.attach_text(if doc.is_non_text() {
-                                text.clone()
-                            } else {
-                                eol::to_lf(text)
-                            });
-                            doc.encoding = self.encoding;
-                            doc.eol = self.eol;
-                            doc.language = self.language.clone();
-                            if self.modified {
-                                doc.touch();
-                            } else {
-                                doc.mark_saved();
-                            }
+                        // Ordinary buffers are stored LF-normalized; non-text
+                        // buffers are stored raw and must keep their bytes.
+                        doc.attach_text(if doc.is_non_text() {
+                            text.clone()
+                        } else {
+                            eol::to_lf(text)
+                        });
+                        doc.encoding = self.encoding;
+                        doc.eol = self.eol;
+                        doc.language = self.language.clone();
+                        if self.modified {
+                            doc.touch();
+                        } else {
+                            doc.mark_saved();
                         }
                     }
                     doc
@@ -448,6 +514,41 @@ pub struct LubanApp {
     pub find: FindPanel,
     pub find_in_files: FindInFilesPanel,
     pub explorer: ExplorerState,
+    /// Focus target for the file tree so arrow keys act on rows.
+    explorer_focus: FocusHandle,
+    /// Focus target and selection for the symbol outline.
+    outline_focus: FocusHandle,
+    outline_selected: Option<usize>,
+    /// Additional workspace roots beyond `workspace_root`.
+    pub workspace_roots: Vec<PathBuf>,
+    pub workspace_file: Option<PathBuf>,
+    pub workspace_name: String,
+    pub workspace_settings: WorkspaceSettings,
+    /// Settings loaded from disk, without workspace overrides.
+    global_settings: Settings,
+    pub workspace_index: Option<WorkspaceIndex>,
+    pub indexing: bool,
+    index_cancel: Option<Arc<AtomicBool>>,
+    index_generation: u64,
+    pub outline: OutlineState,
+    pub nav: NavigationHistory,
+    /// Active editor group (0 or 1).
+    pub active_group: usize,
+    active_in_group: [Option<u64>; 2],
+    /// Active tab positions restored from the session, per group.
+    restore_group_active: [usize; 2],
+    pub split: SplitDirection,
+    quick: QuickOpenState,
+    /// Query string mirrored from the quick-open palette for filtering.
+    quick_query: String,
+    pub(crate) replace_state: WorkspaceReplaceState,
+    pub name_prompt: Option<NamePromptState>,
+    pending_settings_import: Option<PathBuf>,
+    /// Process-local window id and whether the session registry knows it.
+    window_id: u64,
+    window_registered: bool,
+    /// Recover the moved disk-engine tab as soon as the window exists.
+    auto_recovery: bool,
     pub large_file: LargeFilePanel,
     large_loads: Vec<LargeLoadJob>,
     next_load_generation: u64,
@@ -464,7 +565,6 @@ pub struct LubanApp {
     pub shortcuts_open: bool,
     history_dialog: Option<HistoryDialogState>,
     palette: Option<PaletteOverlay>,
-    quick_open_rows: Option<QuickOpenRows>,
     shortcut_editor: Option<ShortcutEditorState>,
     pub column_editor: ColumnEditorState,
     pub macro_ui: MacroUiState,
@@ -498,6 +598,7 @@ pub struct LubanApp {
     pending_find_next: bool,
     pending_replace: bool,
     pending_file_confirm: bool,
+    pending_name_confirm: bool,
     pending_go_to_line: bool,
     pending_close_all_after_saves: bool,
     /// Huge tabs queued by Save All / Close All / Exit.
@@ -536,6 +637,7 @@ pub struct LubanApp {
     window_title: String,
     window_width: f32,
     window_height: f32,
+    window_maximized: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -649,8 +751,69 @@ fn count_words(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+fn session_tab_from(tab: &Tab) -> SessionTab {
+    let huge = tab.doc.is_huge();
+    let (huge_line, huge_column, huge_scroll) = match tab.doc.huge() {
+        Some(state) => {
+            let (line, column) = state
+                .engine
+                .try_read()
+                .map(|engine| engine.line_col_at(state.cursor).unwrap_or((1, 1)))
+                .unwrap_or((1, 1));
+            (Some(line), Some(column), Some(state.scroll_line as f32))
+        }
+        None => (None, None, None),
+    };
+    SessionTab {
+        path: tab.doc.path.clone(),
+        // Large buffers are never written to the session: the file is restored
+        // from disk instead.
+        text: if !tab.large_file
+            && !huge
+            && tab.doc.partial_range().is_none()
+            && (tab.doc.is_modified() || tab.doc.is_untitled())
+        {
+            Some(tab.doc.text.clone())
+        } else {
+            None
+        },
+        encoding: tab.doc.encoding,
+        eol: tab.doc.eol,
+        language: tab.doc.language.clone(),
+        cursor: if huge { 0 } else { tab.doc.cursor },
+        anchor: if huge { 0 } else { tab.doc.anchor },
+        scroll_offset: 0.0,
+        modified: !tab.large_file
+            && !huge
+            && tab.doc.partial_range().is_none()
+            && tab.doc.is_modified(),
+        range: tab
+            .doc
+            .partial_range()
+            .map(|range| [range.start, range.end]),
+        source_size: tab.doc.partial_range().map(|range| range.total),
+        huge,
+        huge_line,
+        huge_column,
+        huge_scroll,
+        huge_modified: huge && tab.doc.is_modified(),
+        recovery_id: tab.doc.huge().and_then(|state| {
+            state
+                .engine
+                .try_read()
+                .ok()
+                .and_then(|engine| engine.recovery_id().map(str::to_string))
+        }),
+        bookmarks: if huge {
+            Vec::new()
+        } else {
+            tab.bookmarks.as_vec()
+        },
+    }
+}
+
 impl LubanApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, options: LaunchOptions) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, mut options: LaunchOptions) -> Self {
         let mut settings = Settings::load();
         // Drop entries for commands this build no longer knows about, and
         // entries that cannot be parsed. Conflicts stay visible in the editor
@@ -665,6 +828,10 @@ impl LubanApp {
             valid
         });
         let keybindings = settings.keybindings.clone();
+        let global_settings = settings.clone();
+        let init = std::mem::take(&mut options.init);
+        let window_id = options.window_id;
+        let options_auto_recovery = options.auto_recovery;
         crate::i18n::apply_language(&settings.ui_language);
         apply_theme(&settings, Some(window), cx);
         if let Err(error) = syntax_theme::apply(&settings, cx) {
@@ -673,6 +840,29 @@ impl LubanApp {
 
         let mut app = Self {
             settings,
+            global_settings,
+            workspace_roots: Vec::new(),
+            workspace_file: None,
+            workspace_name: String::new(),
+            workspace_settings: WorkspaceSettings::default(),
+            workspace_index: None,
+            indexing: false,
+            index_cancel: None,
+            index_generation: 0,
+            outline: OutlineState::default(),
+            nav: NavigationHistory::new(),
+            active_group: 0,
+            active_in_group: [None, None],
+            restore_group_active: [0, 0],
+            split: SplitDirection::None,
+            quick: QuickOpenState::default(),
+            quick_query: String::new(),
+            replace_state: WorkspaceReplaceState::default(),
+            name_prompt: None,
+            pending_settings_import: None,
+            window_id,
+            window_registered: true,
+            auto_recovery: options_auto_recovery,
             tabs: Vec::new(),
             active: 0,
             next_tab_id: 1,
@@ -682,6 +872,9 @@ impl LubanApp {
             find: FindPanel::new(window, cx),
             find_in_files: FindInFilesPanel::new(window, cx),
             explorer: ExplorerState::new(),
+            explorer_focus: cx.focus_handle(),
+            outline_focus: cx.focus_handle(),
+            outline_selected: None,
             large_file: LargeFilePanel::new(window, cx),
             large_loads: Vec::new(),
             next_load_generation: 1,
@@ -701,7 +894,6 @@ impl LubanApp {
             shortcuts_open: false,
             history_dialog: None,
             palette: None,
-            quick_open_rows: None,
             shortcut_editor: None,
             column_editor: ColumnEditorState::new(window, cx),
             macro_ui: MacroUiState::new(window, cx),
@@ -730,6 +922,7 @@ impl LubanApp {
             pending_find_next: false,
             pending_replace: false,
             pending_file_confirm: false,
+            pending_name_confirm: false,
             pending_go_to_line: false,
             pending_close_all_after_saves: false,
             pending_huge_saves: Vec::new(),
@@ -752,6 +945,7 @@ impl LubanApp {
             window_title: "Luban Notepad".to_string(),
             window_width: 1280.0,
             window_height: 820.0,
+            window_maximized: false,
             _subscriptions: Vec::new(),
         };
 
@@ -771,6 +965,11 @@ impl LubanApp {
                                 true
                             } else if app.file_dialog.is_some() {
                                 app.cancel_file_dialog(cx);
+                                true
+                            } else if app.name_prompt.is_some() {
+                                app.name_prompt = None;
+                                app.focus_editor = true;
+                                cx.notify();
                                 true
                             } else if app.confirm.is_some() {
                                 app.confirm_cancel(cx);
@@ -870,6 +1069,11 @@ impl LubanApp {
         for entity in [
             app.find_in_files.query.clone(),
             app.find_in_files.folder.clone(),
+            app.find_in_files.masks.clone(),
+            app.find_in_files.include.clone(),
+            app.find_in_files.exclude.clone(),
+            app.find_in_files.replacement.clone(),
+            app.preferences.search.clone(),
         ] {
             app._subscriptions
                 .push(cx.subscribe(&entity, |_, _, event, cx| {
@@ -929,13 +1133,22 @@ impl LubanApp {
                 app.new_file(window, cx);
                 app.status = status;
             }
-        } else if !options.new_window && app.settings.restore_session {
-            let session = Session::load();
-            app.restore_session(session, window, cx);
         } else {
-            app.new_file(window, cx);
+            match init {
+                WindowInit::Session(window_session) => {
+                    app.restore_window_session(*window_session, window, cx);
+                }
+                WindowInit::Tabs(tabs) => {
+                    app.restore_tabs(tabs, window, cx);
+                }
+                WindowInit::Blank => app.new_file(window, cx),
+            }
         }
         app.advance_recovery_prompt();
+        if app.auto_recovery && app.recovery_prompt.is_some() {
+            app.auto_recovery = false;
+            app.start_recovery_restore(window, cx);
+        }
 
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -953,8 +1166,8 @@ impl LubanApp {
                 .timer(Duration::from_secs(interval))
                 .await;
             if this
-                .update(cx, |app, _| {
-                    app.autosave_session();
+                .update(cx, |app, cx| {
+                    app.autosave_session(cx);
                 })
                 .is_err()
             {
@@ -1059,6 +1272,7 @@ impl LubanApp {
         Entity<EditorState>,
         RangeDecorationCollection,
         RangeDecorationCollection,
+        TextDecorationCollection,
         Subscription,
         Subscription,
     ) {
@@ -1105,12 +1319,18 @@ impl LubanApp {
             );
             // The application owns Ctrl+F / Ctrl+H and the find UI.
             state.set_searchable(false, cx);
+            let plain = !large_file && !doc.is_huge() && !doc.is_non_text();
+            state.set_show_whitespaces(plain && self.settings.show_whitespace, window, cx);
+            state.set_indent_guides(plain && self.settings.show_indent_guides, window, cx);
         });
         let decorations = editor.update(cx, |state, cx| {
             state.create_range_decorations_collection(Vec::new(), cx)
         });
         let bookmark_decorations = editor.update(cx, |state, cx| {
             state.create_range_decorations_collection(Vec::new(), cx)
+        });
+        let bracket_decorations = editor.update(cx, |state, cx| {
+            state.create_decorations_collection(Vec::new(), cx)
         });
 
         if doc.is_huge() {
@@ -1158,10 +1378,12 @@ impl LubanApp {
         // tab must re-render the app so the file-global scrollbar and gutter
         // are recomputed from the fresh scroll offset.
         let notification = cx.observe(&editor, |this, editor, cx| {
-            let follows_editor = this
-                .tabs
-                .get(this.active)
-                .is_some_and(|tab| tab.editor == editor && tab.huge.is_some());
+            let follows_editor = this.tabs.get(this.active).is_some_and(|tab| {
+                tab.editor == editor
+                    && (tab.huge.is_some()
+                        || this.settings.show_document_map
+                        || (this.settings.show_ruler && !this.settings.word_wrap))
+            });
             if follows_editor {
                 cx.notify();
             }
@@ -1171,6 +1393,7 @@ impl LubanApp {
             editor,
             decorations,
             bookmark_decorations,
+            bracket_decorations,
             subscription,
             notification,
         )
@@ -1188,14 +1411,22 @@ impl LubanApp {
             .as_ref()
             .map(|window| HugeFileUi::new(window.clone()));
         let huge_cursor = doc.huge().map(|huge| huge.cursor);
-        let (editor, decorations, bookmark_decorations, subscription, notification) =
-            self.new_editor(&mut doc, large_file, initial, huge_cursor, window, cx);
+        let (
+            editor,
+            decorations,
+            bookmark_decorations,
+            bracket_decorations,
+            subscription,
+            notification,
+        ) = self.new_editor(&mut doc, large_file, initial, huge_cursor, window, cx);
         self.tabs.push(Tab {
             id,
             doc,
             editor,
             decorations,
             bookmark_decorations,
+            bracket_decorations,
+            group: self.active_group,
             bookmarks: BookmarkSet::default(),
             bookmark_revision: 0,
             fold_generation: 0,
@@ -1207,16 +1438,19 @@ impl LubanApp {
             external: None,
             large_file,
             decorations_key: None,
+            bracket_key: None,
             _subscription: subscription,
             _notification: notification,
         });
         self.active = self.tabs.len() - 1;
+        self.active_in_group[self.active_group] = Some(id);
         self.focus_editor = true;
         self.status.clear();
         self.find.clear();
         self.apply_fold_candidates(self.active, cx);
         self.schedule_fold_candidates(self.active, window, cx);
         self.refresh_bookmark_decorations(self.active, cx);
+        self.record_navigation(cx);
         cx.notify();
     }
 
@@ -1325,9 +1559,13 @@ impl LubanApp {
                 .as_ref()
                 .is_some_and(|p| util::same_path(p, &path))
         }) {
+            self.record_navigation(cx);
             self.active = index;
+            self.active_group = self.tabs[index].group;
+            self.active_in_group[self.active_group] = Some(self.tabs[index].id);
             self.focus_editor = true;
             self.find.dirty = true;
+            self.record_navigation(cx);
             cx.notify();
             return true;
         }
@@ -1434,7 +1672,7 @@ impl LubanApp {
             Ok(doc) => {
                 let non_text = doc.is_non_text();
                 self.settings.add_recent(path.clone());
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.add_document(doc, window, cx);
                 let status = if non_text {
                     tr_args(
@@ -1549,7 +1787,7 @@ impl LubanApp {
             Ok(doc) => {
                 let non_text = doc.is_non_text();
                 self.settings.add_recent(path.clone());
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.add_document(doc, window, cx);
                 let status = if non_text {
                     tr_args(
@@ -1855,7 +2093,7 @@ impl LubanApp {
                     .map(|range| range.end.saturating_sub(range.start))
                     .unwrap_or(size);
                 self.settings.add_recent(path.clone());
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.add_document(doc, window, cx);
                 let tab_id = self.active_tab().map(|tab| tab.id);
                 if is_current_target {
@@ -2099,7 +2337,7 @@ impl LubanApp {
                 let total = doc.file_size;
                 let partial = doc.partial_range();
                 self.settings.add_recent(path.clone());
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.add_document(doc, window, cx);
                 let tab_id = self.active_tab().map(|tab| tab.id);
                 if is_current_target {
@@ -2501,7 +2739,10 @@ impl LubanApp {
                 .as_ref()
                 .is_some_and(|open| util::same_path(open, &path))
         }) {
+            self.record_navigation(cx);
             self.active = index;
+            self.active_group = self.tabs[index].group;
+            self.active_in_group[self.active_group] = Some(self.tabs[index].id);
             if self.tabs[index].doc.is_huge() {
                 if self.tabs[index].doc.is_partial() {
                     // Range views use local line numbers; a file-global line
@@ -2581,118 +2822,189 @@ impl LubanApp {
         cx.notify();
     }
 
-    fn restore_session(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
-        self.workspace_root = session.workspace_root.clone();
-        self.explorer.set_root(session.workspace_root.clone());
-        self.window_width = session.window_width;
-        self.window_height = session.window_height;
+    /// Restore one saved window: workspace, roots, split layout and tab groups.
+    fn restore_window_session(
+        &mut self,
+        session: WindowSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_width = session.width;
+        self.window_height = session.height;
         window.resize(size(px(self.window_width), px(self.window_height)));
-
-        if session.tabs.is_empty() {
-            self.new_file(window, cx);
-            return;
+        self.set_workspace_environment(
+            session.workspace_file.clone(),
+            session.workspace_roots.clone(),
+            window,
+            cx,
+        );
+        self.rebuild_index(cx);
+        self.split = match session.split {
+            SplitLayout::Right => SplitDirection::Right,
+            SplitLayout::Down => SplitDirection::Down,
+            SplitLayout::None => SplitDirection::None,
+        };
+        self.active_group = session
+            .active_group
+            .min(session.groups.len().saturating_sub(1));
+        for (index, group) in session.groups.iter().take(2).enumerate() {
+            self.restore_group_active[index] = group.active_tab;
         }
-
-        let active = session.active_tab;
-        let max_size = self.settings.max_file_size_bytes();
-        let threshold = self.settings.large_file_threshold as u64;
-        // Tabs whose unsaved edits are waiting in a recovery prompt are opened
-        // by the recovery flow instead of from the session snapshot.
-        let pending_recovery_ids: HashSet<&str> = self
-            .recovery_queue
-            .iter()
-            .chain(self.recovery_prompt.iter().map(|prompt| &prompt.info))
-            .map(|info| info.id.as_str())
-            .collect();
-        let mut any_large = false;
-        let mut specs = Vec::with_capacity(session.tabs.len());
-        for tab in session.tabs {
-            if tab
-                .recovery_id
-                .as_deref()
-                .is_some_and(|id| pending_recovery_ids.contains(id))
-            {
-                any_large = true;
-                continue;
-            }
-            let large = tab
-                .path
-                .as_ref()
-                .and_then(|path| fs::metadata(path).ok())
-                .map(|metadata| metadata.len() >= threshold)
-                .unwrap_or(false);
-            any_large |= large || tab.huge;
-            let fallback_name = if let Some(path) = &tab.path {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string())
-            } else {
-                self.untitled_counter += 1;
-                tr_args(
-                    "untitled.name",
-                    &[("number", self.untitled_counter.to_string())],
-                )
-            };
-            specs.push(RestoreSpec {
-                path: tab.path,
-                text: tab.text,
-                encoding: tab.encoding,
-                eol: tab.eol,
-                language: tab.language,
-                cursor: tab.cursor,
-                anchor: tab.anchor,
-                modified: tab.modified,
-                fallback_name,
-                range: tab.range,
-                huge: tab.huge,
-                huge_line: tab.huge_line,
-                huge_column: tab.huge_column,
-                bookmarks: tab.bookmarks,
-            });
-        }
-
+        let specs = self.session_specs(session);
         if specs.is_empty() {
-            // Everything in the session is handled by the recovery prompt.
             self.new_file(window, cx);
             return;
         }
+        self.begin_restore(specs, window, cx);
+    }
+
+    /// Restore tabs moved into a new window. Every tab starts in group 0.
+    fn restore_tabs(&mut self, tabs: Vec<SessionTab>, window: &mut Window, cx: &mut Context<Self>) {
+        let group_count = self.active_group + 1;
+        let groups = (0..group_count)
+            .map(|index| GroupSession {
+                active_tab: if index == self.active_group {
+                    tabs.len().saturating_sub(1)
+                } else {
+                    0
+                },
+                tabs: if index == self.active_group {
+                    tabs.clone()
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        let session = WindowSession {
+            id: self.window_id,
+            width: self.window_width,
+            height: self.window_height,
+            split: match self.split {
+                SplitDirection::Right => SplitLayout::Right,
+                SplitDirection::Down => SplitLayout::Down,
+                SplitDirection::None => SplitLayout::None,
+            },
+            active_group: self.active_group,
+            groups,
+            workspace_file: self.workspace_file.clone(),
+            workspace_roots: self.workspace_roots.clone(),
+            ..WindowSession::default()
+        };
+        let specs = self.session_specs(session);
+        if specs.is_empty() {
+            self.new_file(window, cx);
+            return;
+        }
+        self.begin_restore(specs, window, cx);
+    }
+
+    /// Convert session groups into flat restore specs with group membership.
+    fn session_specs(&mut self, session: WindowSession) -> Vec<RestoreSpec> {
+        let pending_recovery_ids: HashSet<&str> = if self.auto_recovery {
+            HashSet::new()
+        } else {
+            self.recovery_queue
+                .iter()
+                .chain(self.recovery_prompt.iter().map(|prompt| &prompt.info))
+                .map(|info| info.id.as_str())
+                .collect()
+        };
+        let mut specs = Vec::new();
+        for (group, group_session) in session.groups.iter().enumerate() {
+            for tab in &group_session.tabs {
+                if tab
+                    .recovery_id
+                    .as_deref()
+                    .is_some_and(|id| pending_recovery_ids.contains(id))
+                {
+                    continue;
+                }
+                let fallback_name = if let Some(path) = &tab.path {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                } else {
+                    self.untitled_counter += 1;
+                    tr_args(
+                        "untitled.name",
+                        &[("number", self.untitled_counter.to_string())],
+                    )
+                };
+                specs.push(RestoreSpec {
+                    path: tab.path.clone(),
+                    text: tab.text.clone(),
+                    encoding: tab.encoding,
+                    eol: tab.eol,
+                    language: tab.language.clone(),
+                    cursor: tab.cursor,
+                    anchor: tab.anchor,
+                    modified: tab.modified,
+                    fallback_name,
+                    range: tab.range,
+                    huge: tab.huge,
+                    huge_line: tab.huge_line,
+                    huge_column: tab.huge_column,
+                    bookmarks: tab.bookmarks.clone(),
+                    group,
+                });
+            }
+        }
+        specs
+    }
+
+    fn begin_restore(
+        &mut self,
+        specs: Vec<RestoreSpec>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let max_size = self.settings.max_file_size_bytes();
+        let any_large = specs.iter().any(|spec| {
+            spec.huge
+                || spec.path.as_ref().is_some_and(|path| {
+                    fs::metadata(path)
+                        .map(|metadata| metadata.len() >= self.settings.large_file_threshold as u64)
+                        .unwrap_or(false)
+                })
+        });
         if !any_large {
             for spec in specs {
+                let group = spec.group;
                 let bookmarks = spec.bookmarks.clone();
                 let doc = spec.load(max_size);
                 self.add_document(doc, window, cx);
+                let group_limit = self.group_count().saturating_sub(1);
+                if let Some(tab) = self.tabs.last_mut() {
+                    tab.group = group.min(group_limit);
+                }
                 self.restore_tab_bookmarks(bookmarks, cx);
             }
-            self.active = active.min(self.tabs.len().saturating_sub(1));
-            self.focus_editor = true;
-            cx.notify();
+            self.finish_restore_groups(cx);
             return;
         }
-
-        // A large tab in the session must not block startup.
         self.set_status(tr("status.restoring_session"), cx);
         let task = cx.background_executor().spawn(async move {
             specs
                 .into_iter()
                 .map(|spec| {
+                    let group = spec.group;
                     let bookmarks = spec.bookmarks.clone();
-                    (bookmarks, spec.load(max_size))
+                    (group, bookmarks, spec.load(max_size))
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let docs = task.await;
             let _ = this.update_in(cx, |app, window, cx| {
-                app.finish_restore(docs, active, window, cx);
+                app.finish_restore_groups_with(docs, window, cx);
             });
         })
         .detach();
     }
 
-    fn finish_restore(
+    fn finish_restore_groups_with(
         &mut self,
-        docs: Vec<(Vec<usize>, Document)>,
-        active: usize,
+        docs: Vec<(usize, Vec<usize>, Document)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2700,13 +3012,743 @@ impl LubanApp {
             self.new_file(window, cx);
             return;
         }
-        for (bookmarks, doc) in docs {
+        for (group, bookmarks, doc) in docs {
             self.add_document(doc, window, cx);
+            let group_limit = self.group_count().saturating_sub(1);
+            if let Some(tab) = self.tabs.last_mut() {
+                tab.group = group.min(group_limit);
+            }
             self.restore_tab_bookmarks(bookmarks, cx);
         }
-        self.active = active.min(self.tabs.len().saturating_sub(1));
+        self.finish_restore_groups(cx);
+    }
+
+    /// Select the restored group's active tab and refresh derived state.
+    fn finish_restore_groups(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            self.active = 0;
+            return;
+        }
+        self.active_group = self.active_group.min(self.group_count().saturating_sub(1));
+        self.active_in_group = [None, None];
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        for group in 0..self.group_count() {
+            let indices = tab_groups::group_tabs(&memberships, group);
+            if indices.is_empty() {
+                continue;
+            }
+            let position = self.restore_group_active[group].min(indices.len() - 1);
+            let index = indices[position];
+            self.active_in_group[group] = Some(self.tabs[index].id);
+        }
+        if let Some(index) =
+            self.active_in_group[self.active_group].and_then(|id| self.tab_index_by_id(id))
+        {
+            self.active = index;
+        } else if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.group == self.active_group)
+        {
+            self.active = index;
+        }
+        self.focus_editor = true;
+        self.nav.clear();
+        self.refresh_outline(cx);
+        cx.notify();
+    }
+
+    /// Number of visible editor groups.
+    fn group_count(&self) -> usize {
+        if self.split.is_split() {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub fn split_editor(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.split.is_split() {
+            self.split = direction;
+            cx.notify();
+            return;
+        }
+        if !self.tabs.iter().any(|tab| tab.group == 0) {
+            self.split = direction;
+            self.active_group = 1;
+            cx.notify();
+            return;
+        }
+        self.sync_active(window, cx);
+        self.split = direction;
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        let first_group = tab_groups::group_tabs(&memberships, 0);
+        if first_group.len() > 1 {
+            let index = self.active;
+            let id = self.tabs[index].id;
+            self.tabs[index].group = 1;
+            self.active_group = 1;
+            self.active_in_group[1] = Some(id);
+            let remaining: Vec<usize> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, tab)| (tab.group == 0).then_some(index))
+                .collect();
+            self.active_in_group[0] = remaining.last().map(|index| self.tabs[*index].id);
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .unwrap_or(self.active);
+        } else {
+            self.active_group = 1;
+            self.active_in_group[1] = None;
+        }
+        self.save_session_now(cx);
+        cx.notify();
+    }
+
+    pub fn unsplit_editor(&mut self, cx: &mut Context<Self>) {
+        if !self.split.is_split() {
+            return;
+        }
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        let order = tab_groups::merge_groups(&memberships);
+        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        let mut old: Vec<Option<Tab>> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tabs = order
+            .into_iter()
+            .filter_map(|index| old.get_mut(index).and_then(Option::take))
+            .collect();
+        for tab in &mut self.tabs {
+            tab.group = 0;
+        }
+        self.split = SplitDirection::None;
+        self.active_group = 0;
+        self.active = active_id
+            .and_then(|id| self.tab_index_by_id(id))
+            .unwrap_or(0);
+        self.active_in_group = [self.tabs.get(self.active).map(|tab| tab.id), None];
+        self.save_session_now(cx);
+        cx.notify();
+    }
+
+    pub fn switch_group(
+        &mut self,
+        target: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.split.is_split() {
+            return;
+        }
+        let target = target.unwrap_or(usize::from(self.active_group == 0));
+        let target = target.min(1);
+        if target == self.active_group {
+            return;
+        }
+        self.sync_active(window, cx);
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.active_in_group[self.active_group] = Some(tab.id);
+        }
+        self.active_group = target;
+        if let Some(index) = self.active_in_group[target]
+            .and_then(|id| self.tab_index_by_id(id))
+            .filter(|index| self.tabs[*index].group == target)
+        {
+            self.active = index;
+        } else if let Some(index) = self.tabs.iter().position(|tab| tab.group == target) {
+            self.active = index;
+            self.active_in_group[target] = Some(self.tabs[index].id);
+        }
         self.focus_editor = true;
         cx.notify();
+    }
+
+    /// Move a tab to the other group, creating a split when needed.
+    pub fn move_tab_to_group(
+        &mut self,
+        id: u64,
+        target: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target >= tab_groups::MAX_GROUPS {
+            return;
+        }
+        if !self.split.is_split() && target == 1 {
+            self.split_editor(SplitDirection::Right, window, cx);
+        }
+        let Some(from) = self.tab_index_by_id(id) else {
+            return;
+        };
+        if self.tabs[from].group == target {
+            self.activate_tab_index(from, window, cx);
+            return;
+        }
+        self.sync_active(window, cx);
+        let mut tab = self.tabs.remove(from);
+        tab.group = target;
+        self.tabs.push(tab);
+        let new_index = self.tabs.len() - 1;
+        self.active_group = target;
+        self.active = new_index;
+        self.active_in_group[target] = Some(id);
+        self.save_session_now(cx);
+        cx.notify();
+    }
+
+    pub fn move_active_tab_to_other_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let target = if tab.group == 0 { 1 } else { 0 };
+        let id = tab.id;
+        self.move_tab_to_group(id, target, window, cx);
+    }
+
+    pub fn new_window(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) =
+            window_registry::open_window(WindowInit::Blank, self.manual_window_chrome, cx)
+        {
+            self.set_status(
+                tr_args("window.open_failed", &[("error", error.to_string())]),
+                cx,
+            );
+        }
+    }
+
+    /// Move the active tab into a new window without a save prompt.
+    pub fn move_tab_to_new_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_active(window, cx);
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let mut snapshot = session_tab_from(tab);
+        let id = tab.id;
+        if tab.large_file && tab.doc.is_modified() {
+            snapshot.text = Some(tab.editor.read(cx).text().to_string());
+            snapshot.modified = true;
+        } else if tab.doc.partial_range().is_some() && tab.doc.is_modified() && !tab.doc.is_huge() {
+            snapshot.text = Some(tab.doc.text.clone());
+            snapshot.modified = true;
+        }
+        let mut recovery = None;
+        if snapshot.huge && snapshot.huge_modified {
+            let Some(recovery_id) = snapshot.recovery_id.clone() else {
+                self.set_status(tr("window.move_unsaved_huge_failed"), cx);
+                return;
+            };
+            recovery = luban_core::disk_engine::scan_recovery(luban_core::disk_engine::RETENTION)
+                .into_iter()
+                .find(|info| info.id == recovery_id);
+            if recovery.is_none() {
+                self.set_status(tr("window.move_unsaved_huge_failed"), cx);
+                return;
+            }
+        }
+        match window_registry::open_window_for_tab(
+            snapshot,
+            recovery,
+            self.manual_window_chrome,
+            cx,
+        ) {
+            Ok(_) => {
+                if let Some(index) = self.tab_index_by_id(id) {
+                    self.cancel_tab_jobs(index);
+                    self.tabs.remove(index);
+                    self.nav.remove_tab(id);
+                    if self.active >= self.tabs.len() {
+                        self.active = self.tabs.len().saturating_sub(1);
+                    }
+                    self.active_in_group = [None, None];
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        self.active_group = tab.group;
+                        self.active_in_group[tab.group] = Some(tab.id);
+                    }
+                    if self.tabs.is_empty() {
+                        self.new_file(window, cx);
+                    }
+                }
+                self.save_session_now(cx);
+                cx.notify();
+            }
+            Err(error) => self.set_status(
+                tr_args("window.open_failed", &[("error", error.to_string())]),
+                cx,
+            ),
+        }
+    }
+
+    /// Activate the workspace roots and apply the workspace file's overrides.
+    fn set_workspace_environment(
+        &mut self,
+        file: Option<PathBuf>,
+        roots: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_file = file.clone();
+        self.workspace_roots = roots;
+        self.workspace_root = self.workspace_roots.first().cloned();
+        self.workspace_name.clear();
+        self.workspace_settings = WorkspaceSettings::default();
+        self.settings = self.global_settings.clone();
+        if let Some(path) = file {
+            match WorkspaceFile::load(&path) {
+                Ok(loaded) => {
+                    let resolved = loaded.workspace.resolved_roots(&path);
+                    if !resolved.is_empty() {
+                        self.workspace_roots = resolved;
+                        self.workspace_root = self.workspace_roots.first().cloned();
+                    }
+                    self.workspace_name = loaded.workspace.display_name(&path);
+                    self.workspace_settings = loaded.workspace.settings.clone();
+                    self.workspace_settings.apply_to(&mut self.settings);
+                    self.settings.validate();
+                    for warning in &loaded.warnings {
+                        log::warn!("{warning}");
+                    }
+                    if let Some(warning) = loaded.warnings.first() {
+                        self.status = warning.clone();
+                    }
+                }
+                Err(error) => {
+                    self.set_status(
+                        tr_args("workspace.open_failed", &[("error", error.to_string())]),
+                        cx,
+                    );
+                }
+            }
+        }
+        if self.workspace_name.is_empty() {
+            self.workspace_name = match (&self.workspace_file, self.workspace_roots.first()) {
+                (Some(file), _) => file
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string()),
+                (None, Some(root)) => self.explorer.root_name_for(root),
+                (None, None) => String::new(),
+            };
+        }
+        self.explorer.set_roots(self.workspace_roots.clone());
+        self.apply_settings_impl(window, cx, false);
+    }
+
+    /// Rebuild the workspace index in the background.
+    fn rebuild_index(&mut self, cx: &mut Context<Self>) {
+        self.index_generation = self.index_generation.wrapping_add(1);
+        if let Some(cancel) = self.index_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let roots = self.workspace_roots.clone();
+        if roots.is_empty() {
+            self.workspace_index = None;
+            self.indexing = false;
+            cx.notify();
+            return;
+        }
+        let options = IndexOptions {
+            respect_gitignore: self.settings.respect_gitignore,
+            include_hidden: self.settings.show_hidden_files,
+            ..IndexOptions::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.index_cancel = Some(cancel.clone());
+        self.indexing = true;
+        let generation = self.index_generation;
+        let task = cx
+            .background_executor()
+            .spawn(async move { build_index(&roots, options, &cancel) });
+        cx.spawn(async move |this, cx| {
+            let index = task.await;
+            let _ = this.update(cx, |app, cx| {
+                if app.index_generation != generation {
+                    return;
+                }
+                app.indexing = false;
+                app.workspace_index = Some(index);
+                if app.palette.is_some() {
+                    app.rebuild_quick_rows(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stop_index(&mut self) {
+        self.index_generation = self.index_generation.wrapping_add(1);
+        if let Some(cancel) = self.index_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.workspace_index = None;
+        self.indexing = false;
+    }
+
+    /// Refresh the symbol outline for the active tab.
+    fn refresh_outline(&mut self, _cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.outline.clear();
+            return;
+        };
+        if tab.doc.is_huge()
+            || tab.large_file
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text()
+        {
+            self.outline.clear();
+            self.outline.error = Some(tr("outline.unavailable"));
+            return;
+        }
+        if tab.doc.text.len() > 8 * 1024 * 1024 {
+            self.outline.clear();
+            self.outline.error = Some(tr("outline.too_large"));
+            return;
+        }
+        let revision = tab.doc.revision();
+        let language = tab.doc.language.clone();
+        self.outline.refresh(&language, &tab.doc.text, revision);
+    }
+
+    /// Open a workspace file and replace the current roots.
+    pub fn open_workspace(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let path = util::absolutize(path);
+        let roots = match WorkspaceFile::load(&path) {
+            Ok(loaded) => loaded.workspace.resolved_roots(&path),
+            Err(error) => {
+                self.set_status(
+                    tr_args("workspace.open_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+                return;
+            }
+        };
+        self.set_workspace_environment(Some(path.clone()), roots, window, cx);
+        self.settings.show_file_explorer = true;
+        self.global_settings.add_recent_workspace(path.clone());
+        self.settings.add_recent_workspace(path);
+        let _ = self.global_settings.save();
+        self.apply_settings(window, cx);
+        self.rebuild_index(cx);
+        self.save_session_now(cx);
+        self.set_status(
+            tr_args("workspace.opened", &[("name", self.workspace_name.clone())]),
+            cx,
+        );
+    }
+
+    /// Open a folder as an in-memory single-root workspace.
+    pub fn open_folder_workspace(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = util::absolutize(path);
+        if !path.is_dir() {
+            self.set_status(
+                tr_args(
+                    "status.open_failed",
+                    &[
+                        ("path", path.display().to_string()),
+                        ("error", tr("workspace.not_a_folder")),
+                    ],
+                ),
+                cx,
+            );
+            return;
+        }
+        self.set_workspace_environment(None, vec![path], window, cx);
+        self.settings.show_file_explorer = true;
+        self.apply_settings(window, cx);
+        self.rebuild_index(cx);
+        self.save_session_now(cx);
+    }
+
+    /// Write the workspace definition to its file, or the given new path.
+    fn write_workspace(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
+        let mut global = self.global_settings.clone();
+        global.merge_global_fields_from(&self.settings);
+        self.workspace_settings = WorkspaceSettings::capture(&self.settings, &global);
+        let workspace = WorkspaceFile {
+            version: luban_core::workspace_file::WORKSPACE_VERSION,
+            name: self.workspace_name.clone(),
+            roots: self
+                .workspace_roots
+                .iter()
+                .map(|root| util::absolutize(root))
+                .collect(),
+            settings: self.workspace_settings.clone(),
+        };
+        match workspace.save_to(path) {
+            Ok(()) => {
+                self.workspace_file = Some(path.to_path_buf());
+                self.settings.add_recent_workspace(path.to_path_buf());
+                self.global_settings
+                    .add_recent_workspace(path.to_path_buf());
+                let _ = self.global_settings.save();
+                self.set_status(
+                    tr_args("workspace.saved", &[("path", path.display().to_string())]),
+                    cx,
+                );
+                true
+            }
+            Err(error) => {
+                self.set_status(
+                    tr_args("workspace.save_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    pub fn save_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_roots.is_empty() {
+            self.set_status(tr("workspace.none"), cx);
+            return;
+        }
+        if let Some(path) = self.workspace_file.clone() {
+            self.write_workspace(&path, cx);
+            self.save_session_now(cx);
+            return;
+        }
+        let root = self
+            .workspace_roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let suggested = WorkspaceFile::suggested_path(&root);
+        self.show_file_dialog(
+            FileDialogMode::Save,
+            FileDialogPurpose::SaveWorkspace,
+            root,
+            suggested
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "new.luban-workspace".to_string()),
+            window,
+            cx,
+        );
+    }
+
+    pub fn save_workspace_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_roots.is_empty() {
+            self.set_status(tr("workspace.none"), cx);
+            return;
+        }
+        let root = self.workspace_roots.first().cloned().unwrap_or_default();
+        let directory = self
+            .workspace_file
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        let name = self
+            .workspace_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                WorkspaceFile::suggested_path(&root)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "new.luban-workspace".to_string())
+            });
+        self.show_file_dialog(
+            FileDialogMode::Save,
+            FileDialogPurpose::SaveWorkspaceAs,
+            directory,
+            name,
+            window,
+            cx,
+        );
+    }
+
+    pub fn close_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_file = None;
+        self.workspace_roots.clear();
+        self.workspace_root = None;
+        self.workspace_name.clear();
+        self.workspace_settings = WorkspaceSettings::default();
+        self.settings = self.global_settings.clone();
+        self.stop_index();
+        self.explorer.clear();
+        self.apply_settings_impl(window, cx, false);
+        self.save_session_now(cx);
+        cx.notify();
+    }
+
+    pub fn add_workspace_root(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let path = util::absolutize(path);
+        if !path.is_dir()
+            || self
+                .workspace_roots
+                .iter()
+                .any(|root| util::same_path(root, &path))
+        {
+            return;
+        }
+        self.workspace_roots.push(path);
+        self.workspace_root = self.workspace_roots.first().cloned();
+        self.explorer.set_roots(self.workspace_roots.clone());
+        self.rebuild_index(cx);
+        if let Some(file) = self.workspace_file.clone() {
+            self.write_workspace(&file, cx);
+        }
+    }
+
+    /// Remove a root from the workspace. Tabs below it are closed when clean;
+    /// dirty tabs keep the root until the user decides.
+    fn remove_selected_workspace_root(&mut self, cx: &mut Context<Self>) {
+        let selected = self.explorer.selected.clone();
+        let Some(selected) = selected else {
+            self.set_status(tr("explorer.no_selection"), cx);
+            return;
+        };
+        let root = self
+            .workspace_roots
+            .iter()
+            .find(|root| selected.starts_with(root))
+            .cloned();
+        match root {
+            Some(root) => self.remove_workspace_root(&root, cx),
+            None => self.set_status(tr("workspace.not_in_workspace"), cx),
+        }
+    }
+
+    pub fn remove_workspace_root(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let dirty: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|file| file.starts_with(path) && tab.doc.is_modified())
+            })
+            .map(|tab| tab.id)
+            .collect();
+        if !dirty.is_empty() {
+            let queue: Vec<u64> = self
+                .tabs
+                .iter()
+                .filter(|tab| {
+                    tab.doc
+                        .path
+                        .as_ref()
+                        .is_some_and(|file| file.starts_with(path))
+                })
+                .map(|tab| tab.id)
+                .collect();
+            let keep_id = self
+                .tabs
+                .iter()
+                .find(|tab| {
+                    tab.doc
+                        .path
+                        .as_ref()
+                        .is_none_or(|file| !file.starts_with(path))
+                })
+                .map(|tab| tab.id)
+                .unwrap_or(0);
+            self.trim_plan = Some(TrimPlan {
+                keep_id,
+                queue,
+                save_queue: dirty,
+                remove_root: Some(path.to_path_buf()),
+            });
+            self.confirm = Some(ConfirmState::new(
+                CloseIntent::TrimTabs,
+                tr("workspace.remove_root_title"),
+                tr_args(
+                    "workspace.remove_root_dirty",
+                    &[(
+                        "count",
+                        self.trim_plan
+                            .as_ref()
+                            .map(|p| p.save_queue.len())
+                            .unwrap_or(0)
+                            .to_string(),
+                    )],
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+        self.remove_workspace_root_now(path, cx);
+    }
+
+    pub fn remove_workspace_root_now(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.workspace_roots
+            .retain(|root| !util::same_path(root, path));
+        if self
+            .workspace_root
+            .as_deref()
+            .is_some_and(|root| util::same_path(root, path))
+        {
+            self.workspace_root = self.workspace_roots.first().cloned();
+        }
+        let closing: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|file| file.starts_with(path))
+            })
+            .map(|tab| tab.id)
+            .collect();
+        for id in closing {
+            self.close_tab_by_id_without_prompt(id, cx);
+        }
+        self.explorer.set_roots(self.workspace_roots.clone());
+        self.rebuild_index(cx);
+        if let Some(file) = self.workspace_file.clone() {
+            self.write_workspace(&file, cx);
+        } else if self.workspace_roots.is_empty() {
+            self.close_workspace_no_window(cx);
+        }
+        self.save_session_now(cx);
+        cx.notify();
+    }
+
+    fn close_workspace_no_window(&mut self, cx: &mut Context<Self>) {
+        self.workspace_file = None;
+        self.workspace_roots.clear();
+        self.workspace_root = None;
+        self.workspace_name.clear();
+        self.workspace_settings = WorkspaceSettings::default();
+        self.settings = self.global_settings.clone();
+        self.stop_index();
+        self.explorer.clear();
+        cx.notify();
+    }
+
+    fn close_tab_by_id_without_prompt(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.tab_index_by_id(id) {
+            self.cancel_tab_jobs(index);
+            self.tabs.remove(index);
+            self.nav.remove_tab(id);
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len().saturating_sub(1);
+            }
+            self.active_in_group[self.active_group] = None;
+            self.find.dirty = true;
+            cx.notify();
+        }
     }
 
     /// Pull the active editor's text/cursor into the document model. The
@@ -4814,7 +5856,7 @@ impl LubanApp {
                     self.large_file.bound_tab = Some(tab_id);
                 }
                 self.settings.add_recent(target.clone());
-                let _ = self.settings.save();
+                self.commit_settings();
                 if lossy {
                     let encoding = self.tabs[index].doc.encoding;
                     self.set_status(
@@ -5271,7 +6313,7 @@ impl LubanApp {
                     .note_saved(&path, tab.doc.file_size, tab.doc.last_modified);
             }
         }
-        let _ = self.settings.save();
+        self.commit_settings();
         match (saved, error) {
             (Some(lossy), _) if lossy => self.set_status(
                 tr_args(
@@ -5553,7 +6595,7 @@ impl LubanApp {
         } else {
             self.settings.language_settings.insert(language, entry);
         }
-        let _ = self.settings.save();
+        self.commit_settings();
     }
 
     fn apply_language_indent_to_open_tabs(&mut self, cx: &mut Context<Self>) {
@@ -5631,7 +6673,7 @@ impl LubanApp {
                     );
                     return;
                 }
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.set_status(
                     tr_args(
                         "status.theme_imported",
@@ -5669,7 +6711,7 @@ impl LubanApp {
         self.settings.syntax_theme = id.to_string();
         match syntax_theme::apply(&self.settings, cx) {
             Ok(()) => {
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.set_status(tr("status.theme_applied"), cx);
             }
             Err(error) => {
@@ -5809,7 +6851,7 @@ impl LubanApp {
                 .note_saved(&request.path, tab.doc.file_size, tab.doc.last_modified);
         }
         self.settings.add_recent(request.path.clone());
-        let _ = self.settings.save();
+        self.commit_settings();
         if lossy {
             self.set_status(
                 tr_args(
@@ -5881,6 +6923,158 @@ impl LubanApp {
             window,
             cx,
         );
+    }
+
+    pub fn open_workspace_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self
+            .workspace_file
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| self.workspace_root.clone())
+            .or_else(dirs::home_dir)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.show_file_dialog(
+            FileDialogMode::Open,
+            FileDialogPurpose::OpenWorkspace,
+            dir,
+            String::new(),
+            window,
+            cx,
+        );
+    }
+
+    pub fn open_add_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self
+            .workspace_root
+            .clone()
+            .or_else(dirs::home_dir)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.show_file_dialog(
+            FileDialogMode::Folder,
+            FileDialogPurpose::AddFolder,
+            dir,
+            String::new(),
+            window,
+            cx,
+        );
+    }
+
+    pub fn open_import_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = dirs::config_dir()
+            .or_else(dirs::home_dir)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.show_file_dialog(
+            FileDialogMode::Open,
+            FileDialogPurpose::ImportSettings,
+            dir,
+            String::new(),
+            window,
+            cx,
+        );
+    }
+
+    pub fn open_export_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = dirs::config_dir()
+            .or_else(dirs::home_dir)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.show_file_dialog(
+            FileDialogMode::Save,
+            FileDialogPurpose::ExportSettings,
+            dir,
+            "luban-settings.json".to_string(),
+            window,
+            cx,
+        );
+    }
+
+    fn export_settings(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let json = match self.global_settings.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                self.set_status(tr_args("settings.export_failed", &[("error", error)]), cx);
+                return;
+            }
+        };
+        match write_atomic(path, json.as_bytes()) {
+            Ok(()) => self.set_status(
+                tr_args("settings.exported", &[("path", path.display().to_string())]),
+                cx,
+            ),
+            Err(error) => self.set_status(
+                tr_args("settings.export_failed", &[("error", error.to_string())]),
+                cx,
+            ),
+        }
+    }
+
+    fn apply_imported_settings(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let json = match fs::read_to_string(path) {
+            Ok(json) => json,
+            Err(error) => {
+                self.set_status(
+                    tr_args("settings.import_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+                return;
+            }
+        };
+        let imported = match Settings::from_json(&json) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.set_status(tr_args("settings.import_failed", &[("error", error)]), cx);
+                return;
+            }
+        };
+        if let Err(error) = imported.save() {
+            self.set_status(
+                tr_args("settings.import_failed", &[("error", error.to_string())]),
+                cx,
+            );
+            return;
+        }
+        self.global_settings = imported;
+        // A workspace keeps its overrides; the imported global settings become
+        // the inherited base.
+        self.settings = self.global_settings.clone();
+        self.workspace_settings.apply_to(&mut self.settings);
+        self.settings.validate();
+        crate::i18n::apply_language(&self.settings.ui_language);
+        self.apply_settings_impl(window, cx, false);
+        self.set_status(
+            tr_args("settings.imported", &[("path", path.display().to_string())]),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn reset_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut defaults = Settings::default();
+        defaults.validate();
+        if let Err(error) = defaults.save() {
+            self.set_status(
+                tr_args("settings.reset_failed", &[("error", error.to_string())]),
+                cx,
+            );
+            return;
+        }
+        self.global_settings = defaults;
+        self.settings = self.global_settings.clone();
+        self.workspace_settings.apply_to(&mut self.settings);
+        self.settings.validate();
+        crate::i18n::apply_language(&self.settings.ui_language);
+        self.apply_settings_impl(window, cx, false);
+        self.set_status(tr("settings.reset_done"), cx);
+        cx.notify();
     }
 
     fn show_file_dialog(
@@ -6269,10 +7463,24 @@ impl LubanApp {
                     self.file_dialog = Some(dialog);
                     self.file_dialog_navigate(candidate, window, cx);
                 } else if candidate.is_file() {
-                    if matches!(dialog.purpose, FileDialogPurpose::ImportTheme) {
-                        self.import_syntax_theme(&candidate, window, cx);
-                    } else {
-                        self.open_path(&candidate, window, cx);
+                    match dialog.purpose {
+                        FileDialogPurpose::ImportTheme => {
+                            self.import_syntax_theme(&candidate, window, cx);
+                        }
+                        FileDialogPurpose::OpenWorkspace => {
+                            self.open_workspace(&candidate, window, cx);
+                        }
+                        FileDialogPurpose::ImportSettings => {
+                            self.pending_settings_import = Some(candidate);
+                            self.confirm = Some(ConfirmState::new(
+                                CloseIntent::ImportSettings,
+                                tr("settings.import_title"),
+                                tr("settings.import_detail"),
+                            ));
+                        }
+                        _ => {
+                            self.open_path(&candidate, window, cx);
+                        }
                     }
                 } else {
                     self.file_dialog = Some(dialog);
@@ -6334,6 +7542,19 @@ impl LubanApp {
                             self.write_export(&candidate, format, window, cx);
                         }
                     }
+                    FileDialogPurpose::SaveWorkspace | FileDialogPurpose::SaveWorkspaceAs => {
+                        let candidate = if candidate.extension().is_none() {
+                            candidate
+                                .with_extension(luban_core::workspace_file::WORKSPACE_EXTENSION)
+                        } else {
+                            candidate
+                        };
+                        self.write_workspace(&candidate, cx);
+                        self.save_session_now(cx);
+                    }
+                    FileDialogPurpose::ExportSettings => {
+                        self.export_settings(&candidate, cx);
+                    }
                     _ => {}
                 }
             }
@@ -6365,10 +7586,14 @@ impl LubanApp {
                 }
                 match dialog.purpose {
                     FileDialogPurpose::OpenFolder => {
-                        self.workspace_root = Some(candidate.clone());
-                        self.explorer.set_root(Some(candidate));
                         self.settings.show_file_explorer = true;
-                        let _ = self.settings.save();
+                        self.open_folder_workspace(&candidate, window, cx);
+                        self.apply_settings(window, cx);
+                    }
+                    FileDialogPurpose::AddFolder => {
+                        self.add_workspace_root(&candidate, cx);
+                        self.settings.show_file_explorer = true;
+                        self.apply_settings(window, cx);
                     }
                     FileDialogPurpose::FindInFilesFolder => {
                         let value = candidate.display().to_string();
@@ -6516,18 +7741,53 @@ impl LubanApp {
         if index >= self.tabs.len() {
             return;
         }
+        let closed = self.tabs[index].id;
+        let closed_group = self.tabs[index].group;
+        let closed_position = self.tabs[..index]
+            .iter()
+            .filter(|tab| tab.group == closed_group)
+            .count();
+        let closed_active = index == self.active;
         self.record_closed_tab(index, cx);
         self.cancel_tab_jobs(index);
         self.tabs.remove(index);
+        self.nav.remove_tab(closed);
+        if self.active_in_group[closed_group] == Some(closed) {
+            self.active_in_group[closed_group] = None;
+        }
         if self.tabs.is_empty() {
             self.active = 0;
+            self.active_group = 0;
+            self.active_in_group = [None, None];
             self.new_file(window, cx);
             return;
         }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if self.active > index {
-            self.active -= 1;
+        if !closed_active {
+            if self.active > index {
+                self.active -= 1;
+            } else if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            }
+        } else {
+            let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+            let members = tab_groups::group_tabs(&memberships, closed_group);
+            if let Some(next) = members
+                .get(closed_position.min(members.len().saturating_sub(1)))
+                .copied()
+            {
+                self.active = next;
+                self.active_group = closed_group;
+            } else if let Some(other) = tab_groups::fallback_group(closed_group, self.split) {
+                if let Some(first) = self.tabs.iter().position(|tab| tab.group == other) {
+                    self.active = first;
+                    self.active_group = other;
+                }
+            } else {
+                self.active = self.active.min(self.tabs.len() - 1);
+            }
+            let group = self.tabs[self.active].group;
+            self.active_group = group;
+            self.active_in_group[group] = Some(self.tabs[self.active].id);
         }
         self.focus_editor = true;
         self.find.clear();
@@ -6565,6 +7825,9 @@ impl LubanApp {
         }
         self.tabs.clear();
         self.active = 0;
+        self.active_group = 0;
+        self.active_in_group = [None, None];
+        self.nav.clear();
         self.find.clear();
         self.new_file(window, cx);
     }
@@ -6589,7 +7852,16 @@ impl LubanApp {
         }
         self.sync_active(window, cx);
         if self.modified_tabs().is_empty() {
+            let last = cx.windows().len() <= 1;
             self.persist_state(window, cx);
+            self.allow_close = true;
+            if self.window_registered {
+                window_registry::unregister(self.window_id);
+                self.window_registered = false;
+            }
+            if last {
+                cx.quit();
+            }
             return true;
         }
         self.request_exit(window, cx);
@@ -6763,6 +8035,30 @@ impl LubanApp {
             CloseIntent::TrimTabs => {
                 self.save_next_trim(window, cx);
             }
+            CloseIntent::DeletePath { path, permanent } => {
+                if !self.delete_path_now(&path, permanent, cx) && !permanent {
+                    self.confirm = Some(ConfirmState::new(
+                        CloseIntent::DeletePath {
+                            path,
+                            permanent: true,
+                        },
+                        tr("explorer.delete_failed_title"),
+                        tr("explorer.delete_permanent_detail"),
+                    ));
+                    cx.notify();
+                }
+            }
+            CloseIntent::ImportSettings => {
+                if let Some(path) = self.pending_settings_import.take() {
+                    self.apply_imported_settings(&path, window, cx);
+                }
+            }
+            CloseIntent::ResetSettings => {
+                self.reset_settings(window, cx);
+            }
+            CloseIntent::WorkspaceReplace => {
+                self.apply_workspace_replace(window, cx);
+            }
         }
     }
 
@@ -6832,6 +8128,16 @@ impl LubanApp {
             CloseIntent::TrimTabs => {
                 self.close_trim_now(true, window, cx);
             }
+            CloseIntent::DeletePath { path, .. } => {
+                if self.delete_path_now(&path, false, cx) {
+                    self.confirm = None;
+                }
+            }
+            CloseIntent::ImportSettings => {
+                self.pending_settings_import = None;
+            }
+            CloseIntent::ResetSettings => {}
+            CloseIntent::WorkspaceReplace => {}
         }
     }
 
@@ -6842,14 +8148,13 @@ impl LubanApp {
         cx.notify();
     }
 
-    fn persist_state(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+    fn persist_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let size = window.bounds().size;
         self.window_width = size.width.into();
         self.window_height = size.height.into();
-        self.save_session_now();
-        if let Err(err) = self.settings.save() {
-            log::warn!("could not save settings: {err}");
-        }
+        self.window_maximized = window.is_maximized();
+        self.save_session_now(cx);
+        self.commit_settings();
     }
 
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6859,97 +8164,85 @@ impl LubanApp {
         }
         self.persist_state(window, cx);
         self.allow_close = true;
-        cx.quit();
+        if self.window_registered {
+            window_registry::unregister(self.window_id);
+            self.window_registered = false;
+        }
+        if cx.windows().len() > 1 {
+            // File > Exit closes the current window; the application keeps
+            // running while another window remains.
+            window.remove_window();
+        } else {
+            cx.quit();
+        }
     }
 
     // ------------------------------------------------------------------
     // Session
     // ------------------------------------------------------------------
 
-    fn build_session(&self) -> Session {
-        let tabs = self
-            .tabs
-            .iter()
-            .map(|tab| {
-                let huge = tab.doc.is_huge();
-                let (huge_line, huge_column, huge_scroll) = match tab.doc.huge() {
-                    Some(state) => {
-                        let (line, column) = state
-                            .engine
-                            .try_read()
-                            .map(|engine| engine.line_col_at(state.cursor).unwrap_or((1, 1)))
-                            .unwrap_or((1, 1));
-                        (Some(line), Some(column), Some(state.scroll_line as f32))
-                    }
-                    None => (None, None, None),
-                };
-                SessionTab {
-                    path: tab.doc.path.clone(),
-                    // Large buffers are never written to the session: the file
-                    // is restored from disk instead.
-                    text: if !tab.large_file
-                        && !huge
-                        && tab.doc.partial_range().is_none()
-                        && (tab.doc.is_modified() || tab.doc.is_untitled())
-                    {
-                        Some(tab.doc.text.clone())
-                    } else {
-                        None
-                    },
-                    encoding: tab.doc.encoding,
-                    eol: tab.doc.eol,
-                    language: tab.doc.language.clone(),
-                    cursor: if huge { 0 } else { tab.doc.cursor },
-                    anchor: if huge { 0 } else { tab.doc.anchor },
-                    scroll_offset: 0.0,
-                    modified: !tab.large_file
-                        && !huge
-                        && tab.doc.partial_range().is_none()
-                        && tab.doc.is_modified(),
-                    range: tab
-                        .doc
-                        .partial_range()
-                        .map(|range| [range.start, range.end]),
-                    source_size: tab.doc.partial_range().map(|range| range.total),
-                    huge,
-                    huge_line,
-                    huge_column,
-                    huge_scroll,
-                    huge_modified: huge && tab.doc.is_modified(),
-                    recovery_id: tab.doc.huge().and_then(|state| {
-                        state
-                            .engine
-                            .try_read()
-                            .ok()
-                            .and_then(|engine| engine.recovery_id().map(str::to_string))
-                    }),
-                    bookmarks: if huge {
-                        Vec::new()
-                    } else {
-                        tab.bookmarks.as_vec()
-                    },
-                }
-            })
-            .collect();
-        Session {
-            version: luban_core::session::SESSION_VERSION,
-            tabs,
-            active_tab: self.active,
-            workspace_root: self.workspace_root.clone(),
-            window_width: self.window_width,
-            window_height: self.window_height,
+    pub(crate) fn build_window_session(&self) -> WindowSession {
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        let mut groups = Vec::new();
+        for group in 0..self.group_count() {
+            let indices = tab_groups::group_tabs(&memberships, group);
+            let active_id = self.active_in_group[group].or_else(|| {
+                (group == self.active_group)
+                    .then(|| self.tabs.get(self.active).map(|tab| tab.id))
+                    .flatten()
+            });
+            let active_tab = active_id
+                .and_then(|id| self.tab_index_by_id(id))
+                .and_then(|index| indices.iter().position(|candidate| *candidate == index))
+                .unwrap_or(0);
+            groups.push(GroupSession {
+                active_tab,
+                tabs: indices
+                    .iter()
+                    .filter_map(|index| self.tabs.get(*index))
+                    .map(session_tab_from)
+                    .collect(),
+            });
+        }
+        WindowSession {
+            id: self.window_id,
+            x: None,
+            y: None,
+            width: self.window_width,
+            height: self.window_height,
+            maximized: self.window_maximized,
+            workspace_file: self.workspace_file.clone(),
+            workspace_roots: self.workspace_roots.clone(),
+            split: match self.split {
+                SplitDirection::Right => SplitLayout::Right,
+                SplitDirection::Down => SplitLayout::Down,
+                SplitDirection::None => SplitLayout::None,
+            },
+            active_group: self.active_group,
+            groups,
         }
     }
 
-    fn save_session_now(&self) {
-        let session = self.build_session();
+    fn save_session_now(&mut self, cx: &mut Context<Self>) {
+        let current = self.build_window_session();
+        let windows = window_registry::collect(cx, current);
+        let session = Session {
+            version: luban_core::session::SESSION_VERSION,
+            windows,
+        };
         match session.save() {
             Ok(()) => {}
-            Err(err) => log::warn!("could not save session: {err}"),
+            Err(err) => {
+                log::warn!("could not save session: {err}");
+                self.set_status(
+                    tr_args("status.session_save_failed", &[("error", err.to_string())]),
+                    cx,
+                );
+            }
         }
     }
 
-    fn autosave_session(&mut self) {
+    fn autosave_session(&mut self, cx: &mut Context<Self>) {
         if !self.settings.autosave_session {
             return;
         }
@@ -6958,7 +8251,7 @@ impl LubanApp {
             return;
         }
         self.last_session_save = Instant::now();
-        self.save_session_now();
+        self.save_session_now(cx);
     }
 
     // ------------------------------------------------------------------
@@ -7796,17 +9089,21 @@ impl LubanApp {
 
     pub fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.font_size = (self.settings.font_size + delta).clamp(6.0, 48.0);
-        let _ = self.settings.save();
+        self.commit_settings();
         cx.notify();
     }
 
     pub fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         self.settings.font_size = 14.0;
-        let _ = self.settings.save();
+        self.commit_settings();
         cx.notify();
     }
 
     pub fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_settings_impl(window, cx, true);
+    }
+
+    fn apply_settings_impl(&mut self, window: &mut Window, cx: &mut Context<Self>, persist: bool) {
         apply_theme(&self.settings, Some(window), cx);
         if let Err(error) = syntax_theme::apply(&self.settings, cx) {
             log::warn!("could not apply syntax theme: {error}");
@@ -7815,22 +9112,54 @@ impl LubanApp {
         self.rebuild_macro_keymap();
         let line_numbers = self.settings.show_line_numbers;
         let wrap = self.settings.word_wrap;
+        let whitespace = self.settings.show_whitespace;
+        let indent_guides = self.settings.show_indent_guides;
         for index in 0..self.tabs.len() {
             let wrap = !self.tabs[index].large_file && wrap;
             // Disk-engine tabs draw document-global numbers in the app.
             let line_numbers = line_numbers && !self.tabs[index].doc.is_huge();
             let tab = self.editor_tab_size(&self.tabs[index].doc, self.tabs[index].large_file);
+            let plain = !self.tabs[index].doc.is_huge() && !self.tabs[index].large_file;
             self.tabs[index].editor.update(cx, |state, cx| {
                 state.set_line_number(line_numbers, window, cx);
                 state.set_soft_wrap(wrap, window, cx);
                 state.set_tab_size(tab, cx);
+                state.set_show_whitespaces(plain && whitespace, window, cx);
+                state.set_indent_guides(plain && indent_guides, window, cx);
             });
+            self.tabs[index].decorations_key = None;
+            self.tabs[index].bracket_key = None;
         }
-        if let Err(err) = self.settings.save() {
-            log::warn!("could not save settings: {err}");
+        if persist {
+            self.commit_settings();
         }
         self.explorer.refresh();
         cx.notify();
+    }
+
+    /// Persist global-only fields globally and overridable fields either to
+    /// the workspace file or to the global settings.
+    fn commit_settings(&mut self) {
+        let mut global = self.global_settings.clone();
+        global.merge_global_fields_from(&self.settings);
+        if let Some(path) = self.workspace_file.clone() {
+            self.workspace_settings = WorkspaceSettings::capture(&self.settings, &global);
+            let workspace = WorkspaceFile {
+                version: luban_core::workspace_file::WORKSPACE_VERSION,
+                name: self.workspace_name.clone(),
+                roots: self.workspace_roots.clone(),
+                settings: self.workspace_settings.clone(),
+            };
+            if let Err(error) = workspace.save_to(&path) {
+                log::warn!("could not save workspace {}: {error}", path.display());
+            }
+            self.global_settings = global;
+        } else {
+            self.global_settings = self.settings.clone();
+        }
+        if let Err(err) = self.global_settings.save() {
+            log::warn!("could not save settings: {err}");
+        }
     }
 
     fn mark_find_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7875,7 +9204,7 @@ impl LubanApp {
     fn clear_search_history(&mut self, cx: &mut Context<Self>) {
         self.settings.search_history.clear();
         self.settings.replace_history.clear();
-        let _ = self.settings.save();
+        self.commit_settings();
         self.set_status(tr("status.search_history_cleared"), cx);
         cx.notify();
     }
@@ -7934,7 +9263,7 @@ impl LubanApp {
             .upsert(&name, self.macro_recorded.clone())
         {
             Ok(()) => {
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.macro_ui.open = false;
                 self.macro_ui.error = None;
                 self.macro_ui.overwrite_pending = None;
@@ -7997,7 +9326,7 @@ impl LubanApp {
 
     fn delete_macro(&mut self, name: &str, cx: &mut Context<Self>) {
         self.settings.macros.remove(name);
-        let _ = self.settings.save();
+        self.commit_settings();
         self.rebuild_macro_keymap();
         self.macro_ui.selected = None;
         self.set_status(
@@ -8016,7 +9345,7 @@ impl LubanApp {
         let new = self.macro_ui.name_input.read(cx).value().trim().to_string();
         match self.settings.macros.rename(&old, &new) {
             Ok(()) => {
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.macro_ui.selected = Some(new.clone());
                 self.macro_ui.error = None;
                 self.rebuild_macro_keymap();
@@ -8039,7 +9368,7 @@ impl LubanApp {
         let text = self.macro_ui.shortcut_input.read(cx).value().to_string();
         if text.trim().is_empty() {
             self.settings.macros.remove_binding(&name);
-            let _ = self.settings.save();
+            self.commit_settings();
             self.rebuild_macro_keymap();
             self.macro_ui.error = None;
             self.set_status(tr("status.macro_shortcut_removed"), cx);
@@ -8054,7 +9383,7 @@ impl LubanApp {
         ) {
             Ok(formatted) => {
                 self.settings.macros.set_binding(&name, formatted);
-                let _ = self.settings.save();
+                self.commit_settings();
                 self.rebuild_macro_keymap();
                 self.macro_ui.error = None;
                 self.set_status(tr("status.macro_shortcut_saved"), cx);
@@ -8109,9 +9438,7 @@ impl LubanApp {
     fn set_ui_language(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.ui_language = value.to_string();
         crate::i18n::apply_language(value);
-        if let Err(err) = self.settings.save() {
-            log::warn!("could not save settings: {err}");
-        }
+        self.commit_settings();
         for tab in &mut self.tabs {
             if tab.doc.path.is_some() {
                 continue;
@@ -8173,7 +9500,8 @@ impl LubanApp {
             return;
         }
         self.settings.record_search(&query);
-        let _ = self.settings.save();
+        self.commit_settings();
+        self.record_navigation(cx);
         if self.find.in_selection && self.find.scope.is_none() {
             let (a, b) = self.active_selection();
             if a != b {
@@ -8256,6 +9584,7 @@ impl LubanApp {
                 self.find.generation = self.find.generation.wrapping_add(1);
                 self.select_char_range(matched.start, matched.end, window, cx);
                 self.focus_editor = true;
+                self.record_navigation(cx);
                 cx.notify();
             }
             None => {
@@ -8278,7 +9607,7 @@ impl LubanApp {
         }
         self.settings.record_search(&query);
         self.settings.record_replacement(&replacement);
-        let _ = self.settings.save();
+        self.commit_settings();
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -8411,7 +9740,7 @@ impl LubanApp {
         }
         self.settings.record_search(&query);
         self.settings.record_replacement(&replacement);
-        let _ = self.settings.save();
+        self.commit_settings();
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -8464,7 +9793,7 @@ impl LubanApp {
         }
         self.settings.record_search(&query);
         self.settings.record_replacement(&replacement);
-        let _ = self.settings.save();
+        self.commit_settings();
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -8532,8 +9861,509 @@ impl LubanApp {
     // Find in files
     // ------------------------------------------------------------------
 
+    pub fn open_workspace_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_in_files.workspace = !self.workspace_roots.is_empty();
+        self.find_in_files.show_replace = true;
+        self.find_in_files.respect_gitignore = self.settings.respect_gitignore;
+        self.find_in_files.open = true;
+        self.find_in_files
+            .replacement
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.find_in_files
+            .query
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Signature of every input the replace preview depends on.
+    fn replace_signature(&self, cx: &gpui_kit::App) -> String {
+        let panel = &self.find_in_files;
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            panel.query_text(cx),
+            panel.replacement_text(cx),
+            panel.include_text(cx),
+            panel.exclude_text(cx),
+            panel.match_case,
+            panel.whole_word,
+            panel.regex,
+            panel.enhanced_regex,
+            panel.workspace,
+            panel.respect_gitignore,
+        )
+    }
+
+    /// Drop a preview whose inputs changed after it was computed.
+    fn invalidate_stale_preview(&mut self, cx: &mut Context<Self>) {
+        if self.replace_state.preview.is_some()
+            && self.replace_state.preview_signature != self.replace_signature(cx)
+        {
+            self.replace_state.preview = None;
+            self.replace_state.status = tr("replace.preview_stale");
+            cx.notify();
+        }
+    }
+
+    /// Compute the workspace replace preview in the background.
+    pub fn start_workspace_replace_preview(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.replace_state.running {
+            return;
+        }
+        let query = self.find_in_files.query_text(cx);
+        let replacement = self.find_in_files.replacement_text(cx);
+        if query.is_empty() {
+            self.replace_state.error = Some(tr("ff.enter_query"));
+            self.replace_state.status = tr("ff.enter_query");
+            cx.notify();
+            return;
+        }
+        let filter = match self.find_in_files.filter(cx) {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.replace_state.error = Some(error.clone());
+                self.replace_state.status = error;
+                cx.notify();
+                return;
+            }
+        };
+        if self.workspace_roots.is_empty() {
+            self.replace_state.error = Some(tr("ff.no_workspace"));
+            self.replace_state.status = tr("ff.no_workspace");
+            cx.notify();
+            return;
+        }
+        let roots = self.workspace_roots.clone();
+        let search_options = self.find_in_files.search_options();
+        let max_file_size = self.settings.max_file_size_bytes();
+        let respect_gitignore = self.find_in_files.respect_gitignore;
+        let include_hidden = self.settings.show_hidden_files;
+        let mut skipped_open: Vec<(PathBuf, String)> = Vec::new();
+        for tab in &self.tabs {
+            let Some(path) = &tab.doc.path else { continue };
+            let reason = if tab.doc.is_huge() {
+                Some(tr("replace.skip_disk_engine"))
+            } else if tab.doc.partial_range().is_some() {
+                Some(tr("replace.skip_partial"))
+            } else if tab.doc.is_non_text() {
+                Some(tr("replace.skip_non_text"))
+            } else if tab.large_file {
+                Some(tr("replace.skip_large"))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                skipped_open.push((path.clone(), reason));
+            }
+        }
+        self.replace_state.running = true;
+        self.replace_state.error = None;
+        self.replace_state.preview = None;
+        self.replace_state.confirmed = false;
+        self.replace_state.generation = self.replace_state.generation.wrapping_add(1);
+        let generation = self.replace_state.generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.replace_state.cancel = Some(cancel.clone());
+        self.replace_state.query = query.clone();
+        self.replace_state.replacement = replacement.clone();
+        self.replace_state.options = Some(search_options);
+        self.replace_state.filter = filter.clone();
+        self.replace_state.preview_signature = self.replace_signature(cx);
+        self.replace_state.status = tr("replace.previewing");
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            let mut progress = |_files: usize| {};
+            let options = WorkspaceSearchOptions {
+                roots: roots.clone(),
+                query: query.clone(),
+                options: search_options,
+                filter,
+                respect_gitignore,
+                include_hidden,
+                max_results: 20_000,
+                max_file_size,
+            };
+            let outcome = match search_workspace(&options, &cancel, &mut progress) {
+                Ok(outcome) => outcome,
+                Err(error) => return Err(error.to_string()),
+            };
+            let mut files: Vec<FilePreview> = Vec::new();
+            let mut skipped: Vec<SkippedFile> = Vec::new();
+            let mut seen: Vec<PathBuf> = Vec::new();
+            for matched in &outcome.matches {
+                if seen.iter().any(|path| path == &matched.path) {
+                    continue;
+                }
+                seen.push(matched.path.clone());
+                if let Some((_, reason)) =
+                    skipped_open.iter().find(|(path, _)| path == &matched.path)
+                {
+                    skipped.push(SkippedFile {
+                        path: matched.path.clone(),
+                        reason: reason.clone(),
+                    });
+                    continue;
+                }
+                let bytes = match std::fs::read(&matched.path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                if encoding::looks_binary(&bytes) {
+                    skipped.push(SkippedFile {
+                        path: matched.path.clone(),
+                        reason: crate::i18n::tr("replace.skip_binary"),
+                    });
+                    continue;
+                }
+                let decoded = encoding::decode(&bytes);
+                let engine = luban_core::search::SearchEngine::new(query.clone(), search_options);
+                let (replaced, count) = match engine.replace_all(&decoded.text, &replacement, None)
+                {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                };
+                if count == 0 || replaced == decoded.text {
+                    continue;
+                }
+                let samples: Vec<(String, String)> = outcome
+                    .matches
+                    .iter()
+                    .filter(|candidate| candidate.path == matched.path)
+                    .take(5)
+                    .filter_map(|candidate| {
+                        workspace_replace::replacement_sample(
+                            &candidate.line_text,
+                            &query,
+                            search_options,
+                            &replacement,
+                        )
+                    })
+                    .collect();
+                files.push(FilePreview {
+                    path: matched.path.clone(),
+                    relative: workspace_replace::relative_path(&roots, &matched.path),
+                    matches: count,
+                    samples,
+                    fingerprint: workspace_replace::fingerprint(&bytes),
+                    size: bytes.len() as u64,
+                });
+            }
+            let total = files.iter().map(|file| file.matches).sum();
+            Ok::<WorkspaceReplacePreview, String>(WorkspaceReplacePreview {
+                files,
+                skipped,
+                total_matches: total,
+                truncated: outcome.truncated,
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |app, cx| {
+                if app.replace_state.generation != generation {
+                    return;
+                }
+                app.replace_state.running = false;
+                app.replace_state.cancel = None;
+                match outcome {
+                    Ok(preview) => {
+                        app.replace_state.status = tr_args(
+                            "replace.preview_ready",
+                            &[
+                                ("files", preview.file_count().to_string()),
+                                ("matches", preview.total_matches.to_string()),
+                                ("skipped", preview.skipped.len().to_string()),
+                            ],
+                        );
+                        if preview.confirmable() {
+                            app.replace_state.error = None;
+                        } else {
+                            app.replace_state.error = Some(tr("replace.no_matches"));
+                        }
+                        app.replace_state.preview = Some(preview);
+                    }
+                    Err(error) => {
+                        app.replace_state.error = Some(error.clone());
+                        app.replace_state.status = error;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn confirm_workspace_replace(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.invalidate_stale_preview(cx);
+        let Some(preview) = &self.replace_state.preview else {
+            self.replace_state.error = Some(tr("replace.preview_required"));
+            cx.notify();
+            return;
+        };
+        if !preview.confirmable() {
+            return;
+        }
+        self.confirm = Some(ConfirmState::new(
+            CloseIntent::WorkspaceReplace,
+            tr("replace.confirm_title"),
+            tr_args(
+                "replace.confirm_detail",
+                &[
+                    ("files", preview.file_count().to_string()),
+                    ("matches", preview.total_matches.to_string()),
+                ],
+            ),
+        ));
+        cx.notify();
+    }
+
+    /// Apply the computed preview after re-reading every file and comparing
+    /// its fingerprint. In-memory buffers only; nothing is written to disk.
+    fn apply_workspace_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = self.replace_state.preview.clone() else {
+            return;
+        };
+        let query = self.replace_state.query.clone();
+        let replacement = self.replace_state.replacement.clone();
+        let options = self
+            .replace_state
+            .options
+            .unwrap_or_else(|| self.find_in_files.search_options());
+        let engine = luban_core::search::SearchEngine::new(query, options);
+        if engine.error().is_some() {
+            return;
+        }
+        let mut undo = ReplaceUndo::default();
+        let mut modified = 0usize;
+        let mut skipped = preview.skipped.clone();
+        for file in &preview.files {
+            let bytes = match std::fs::read(&file.path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    skipped.push(SkippedFile {
+                        path: file.path.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if bytes.len() as u64 != file.size
+                || workspace_replace::fingerprint(&bytes) != file.fingerprint
+            {
+                skipped.push(SkippedFile {
+                    path: file.path.clone(),
+                    reason: tr("replace.skip_changed"),
+                });
+                continue;
+            }
+            let decoded = encoding::decode(&bytes);
+            let (replaced, count) = match engine.replace_all(&decoded.text, &replacement, None) {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
+            if count == 0 {
+                continue;
+            }
+            let new_text = eol::to_lf_owned(replaced);
+            if let Some(index) = self.tabs.iter().position(|tab| {
+                tab.doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| util::same_path(path, &file.path))
+            }) {
+                let tab = &self.tabs[index];
+                if tab.doc.is_huge()
+                    || tab.large_file
+                    || tab.doc.partial_range().is_some()
+                    || tab.doc.is_non_text()
+                {
+                    skipped.push(SkippedFile {
+                        path: file.path.clone(),
+                        reason: tr("replace.skip_open_mode"),
+                    });
+                    continue;
+                }
+                undo.entries.push(UndoEntry {
+                    tab_id: Some(tab.id),
+                    path: tab.doc.path.clone(),
+                    text: tab.doc.text.clone(),
+                    modified: tab.doc.is_modified(),
+                    cursor: tab.doc.cursor,
+                    anchor: tab.doc.anchor,
+                    was_open: true,
+                });
+                self.apply_replacement_to_tab(index, new_text, window, cx);
+                modified += 1;
+            } else {
+                let mut doc = match Document::open_with_limit(&file.path, u64::MAX) {
+                    Ok(doc) => doc,
+                    Err(error) => {
+                        skipped.push(SkippedFile {
+                            path: file.path.clone(),
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if doc.is_non_text() {
+                    skipped.push(SkippedFile {
+                        path: file.path.clone(),
+                        reason: tr("replace.skip_non_text"),
+                    });
+                    continue;
+                }
+                doc.attach_text(new_text);
+                doc.touch();
+                let path = file.path.clone();
+                self.add_document(doc, window, cx);
+                undo.entries.push(UndoEntry {
+                    tab_id: self.tabs.last().map(|tab| tab.id),
+                    path: Some(path),
+                    text: String::new(),
+                    modified: false,
+                    cursor: 0,
+                    anchor: 0,
+                    was_open: false,
+                });
+                modified += 1;
+            }
+        }
+        self.replace_state.undo = Some(undo);
+        self.replace_state.preview = None;
+        self.replace_state.status = tr_args(
+            "replace.applied",
+            &[
+                ("count", modified.to_string()),
+                ("skipped", skipped.len().to_string()),
+            ],
+        );
+        self.replace_state.error = None;
+        self.set_status(self.replace_state.status.clone(), cx);
+        cx.notify();
+    }
+
+    fn apply_replacement_to_tab(
+        &mut self,
+        index: usize,
+        new_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let total = tab.doc.char_count();
+        let cursor = tab.doc.cursor.min(total);
+        let anchor = tab.doc.anchor.min(total);
+        tab.doc
+            .apply_edit(0, total, &new_text, EditKind::Other, cursor, anchor);
+        tab.highlighted_revision = u64::MAX;
+        tab.decorations_key = None;
+        tab.bracket_key = None;
+        tab.needs_sync = false;
+        tab.pending_edit = false;
+        let char_count = textutil::char_count(&new_text);
+        let cursor = cursor.min(char_count);
+        let anchor = anchor.min(char_count);
+        let b0 = textutil::char_to_byte(&new_text, anchor.min(cursor));
+        let b1 = textutil::char_to_byte(&new_text, anchor.max(cursor));
+        let editor = tab.editor.clone();
+        let doc_cursor = cursor;
+        let doc_anchor = anchor;
+        self.tabs[index].doc.set_selection(doc_anchor, doc_cursor);
+        editor.update(cx, |state, cx| {
+            state.replace_all(new_text, window, cx);
+            state.set_selected_range(b0..b1, cx);
+        });
+    }
+
+    pub fn undo_workspace_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(undo) = self.replace_state.undo.take() else {
+            self.set_status(tr("replace.nothing_to_undo"), cx);
+            return;
+        };
+        for entry in undo.entries.into_iter().rev() {
+            if !entry.was_open {
+                if let Some(path) = &entry.path {
+                    if let Some(index) = self.tabs.iter().position(|tab| {
+                        tab.doc
+                            .path
+                            .as_ref()
+                            .is_some_and(|open| util::same_path(open, path))
+                    }) {
+                        self.close_tab_by_id_without_prompt(self.tabs[index].id, cx);
+                    }
+                }
+                continue;
+            }
+            let index = entry
+                .tab_id
+                .and_then(|id| self.tab_index_by_id(id))
+                .or_else(|| {
+                    entry.path.as_ref().and_then(|path| {
+                        self.tabs.iter().position(|tab| {
+                            tab.doc
+                                .path
+                                .as_ref()
+                                .is_some_and(|open| util::same_path(open, path))
+                        })
+                    })
+                });
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    let mut doc = Document::with_text(entry.text.clone());
+                    doc.path = entry.path.clone();
+                    doc.touch();
+                    self.add_document(doc, window, cx);
+                    self.tabs.len() - 1
+                }
+            };
+            let total = self.tabs[index].doc.char_count();
+            let old_modified = entry.modified;
+            {
+                let tab = &mut self.tabs[index];
+                tab.doc.apply_edit(
+                    0,
+                    total,
+                    &entry.text,
+                    EditKind::Other,
+                    entry.cursor.min(textutil::char_count(&entry.text)),
+                    entry.anchor.min(textutil::char_count(&entry.text)),
+                );
+                if !old_modified {
+                    tab.doc.mark_saved();
+                }
+                tab.highlighted_revision = u64::MAX;
+                tab.decorations_key = None;
+                tab.bracket_key = None;
+                tab.needs_sync = false;
+                tab.pending_edit = false;
+            }
+            let text = entry.text.clone();
+            let total_chars = textutil::char_count(&text);
+            let cursor = entry.cursor.min(total_chars);
+            let anchor = entry.anchor.min(total_chars);
+            let b0 = textutil::char_to_byte(&text, anchor.min(cursor));
+            let b1 = textutil::char_to_byte(&text, anchor.max(cursor));
+            let editor = self.tabs[index].editor.clone();
+            self.tabs[index].doc.set_selection(anchor, cursor);
+            editor.update(cx, |state, cx| {
+                state.replace_all(text, window, cx);
+                state.set_selected_range(b0..b1, cx);
+            });
+        }
+        self.replace_state.status = tr("replace.undone");
+        self.set_status(tr("replace.undone"), cx);
+        cx.notify();
+    }
+
     pub fn open_find_in_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_in_files.open = true;
+        self.find_in_files.respect_gitignore = self.settings.respect_gitignore;
         if self.find_in_files.folder.read(cx).value().is_empty() {
             let folder = self
                 .workspace_root
@@ -8565,13 +10395,67 @@ impl LubanApp {
             return;
         }
         self.settings.record_search(&query);
-        let _ = self.settings.save();
+        self.commit_settings();
         if self.find_in_files.open_documents {
             self.search_open_documents(cx);
             return;
         }
+        let filter = match self.find_in_files.filter(cx) {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.find_in_files.error = Some(error.clone());
+                self.find_in_files.status = error;
+                cx.notify();
+                return;
+            }
+        };
+        self.find_in_files.error = None;
+        self.find_in_files.generation += 1;
+        let generation = self.find_in_files.generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.find_in_files.cancel = Some(cancel.clone());
+        self.find_in_files.running = true;
+        self.find_in_files.clear_results();
+        self.find_in_files.status = tr("ff.searching");
+        cx.notify();
+
+        if self.find_in_files.workspace {
+            if self.workspace_roots.is_empty() {
+                self.find_in_files.running = false;
+                self.find_in_files.cancel = None;
+                self.find_in_files.status = tr("ff.no_workspace");
+                cx.notify();
+                return;
+            }
+            let options = WorkspaceSearchOptions {
+                roots: self.workspace_roots.clone(),
+                query,
+                options: self.find_in_files.search_options(),
+                filter,
+                respect_gitignore: self.find_in_files.respect_gitignore,
+                include_hidden: self.settings.show_hidden_files,
+                max_results: 20_000,
+                max_file_size: self.settings.max_file_size_bytes(),
+            };
+            let cancel_for_task = cancel.clone();
+            let task = cx.background_executor().spawn(async move {
+                let mut progress = |_files: usize| {};
+                search_workspace(&options, &cancel_for_task, &mut progress)
+            });
+            cx.spawn(async move |this, cx| {
+                let outcome = task.await;
+                this.update(cx, |this, cx| {
+                    this.finish_find_in_files(outcome, generation, cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let folder = self.find_in_files.folder_path(cx);
         if !folder.is_dir() {
+            self.find_in_files.running = false;
+            self.find_in_files.cancel = None;
             self.find_in_files.status =
                 tr_args("ff.not_a_folder", &[("path", folder.display().to_string())]);
             cx.notify();
@@ -8587,15 +10471,6 @@ impl LubanApp {
             include_hidden: false,
             skip_common_ignored_folders: true,
         };
-        self.find_in_files.generation += 1;
-        let generation = self.find_in_files.generation;
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.find_in_files.cancel = Some(cancel.clone());
-        self.find_in_files.running = true;
-        self.find_in_files.clear_results();
-        self.find_in_files.status = tr("ff.searching");
-        cx.notify();
-
         let cancel_for_task = cancel.clone();
         let task = cx.background_executor().spawn(async move {
             let mut progress = |_files: usize| {};
@@ -8693,8 +10568,10 @@ impl LubanApp {
         match outcome {
             Ok(outcome) => {
                 self.find_in_files.files_scanned = outcome.files_scanned;
-                self.find_in_files.results = outcome.matches;
                 self.find_in_files.truncated = outcome.truncated;
+                self.find_in_files.cancelled = outcome.cancelled;
+                let roots = self.workspace_roots.clone();
+                self.find_in_files.set_results(outcome.matches, &roots);
                 self.find_in_files.status = if outcome.cancelled {
                     tr("ff.cancelled")
                 } else if outcome.truncated {
@@ -8816,6 +10693,58 @@ impl LubanApp {
         tab.decorations.set(decorations, cx);
         tab.decorations_key = Some(key);
         tab.highlighted_revision = tab.doc.revision();
+        self.refresh_bracket_decorations(index, cx);
+    }
+
+    /// Recolour paired brackets when the document or the setting changed.
+    fn refresh_bracket_decorations(&mut self, index: usize, cx: &mut Context<Self>) {
+        let enabled = self.settings.bracket_colors;
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let plain = !tab.doc.is_huge()
+            && !tab.large_file
+            && tab.doc.partial_range().is_none()
+            && !tab.doc.is_non_text();
+        let supported = enabled
+            && plain
+            && tab.doc.text.len() <= luban_core::bracket_colors::MAX_BRACKET_COLOR_BYTES;
+        let key = (tab.doc.revision(), supported);
+        if tab.bracket_key == Some(key) {
+            return;
+        }
+        if !supported {
+            tab.bracket_decorations.clear(cx);
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.bracket_key = Some(key);
+            }
+            return;
+        }
+        let colors = [
+            rgba(0xE0A458FF),
+            rgba(0x6CB6FFFF),
+            rgba(0x8BD49CFF),
+            rgba(0xE57BB8FF),
+        ];
+        let pairs = luban_core::bracket_colors::scan_brackets(&tab.doc.text);
+        let mut decorations = Vec::with_capacity(pairs.len() * 2);
+        for pair in pairs {
+            let color =
+                colors[luban_core::bracket_colors::depth_color_index(pair.depth, colors.len())];
+            for offset in [pair.open, pair.close] {
+                decorations.push(TextDecoration::new(
+                    offset..offset + 1,
+                    HighlightStyle {
+                        color: Some(color.into()),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
+        }
+        tab.bracket_decorations.set(decorations, cx);
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.bracket_key = Some(key);
+        }
     }
 
     fn process_enter_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8834,6 +10763,10 @@ impl LubanApp {
         if self.pending_find_next {
             self.pending_find_next = false;
             self.find_next(true, window, cx);
+        }
+        if self.pending_name_confirm {
+            self.pending_name_confirm = false;
+            self.confirm_name_prompt(window, cx);
         }
     }
 
@@ -8902,6 +10835,8 @@ impl LubanApp {
                     && tab.doc.partial_range().is_none()
                     && !tab.doc.is_non_text()
             }),
+            can_go_back: self.nav.can_back(),
+            can_go_forward: self.nav.can_forward(),
         }
     }
 
@@ -8938,8 +10873,35 @@ impl LubanApp {
                 .then(|| self.macro_state_signature());
         match id {
             "file.new" => self.new_file(window, cx),
+            "file.new-window" => self.new_window(cx),
             "file.open" => self.open_file_dialog(window, cx),
             "file.open-folder" => self.open_folder_dialog(window, cx),
+            "file.open-workspace" => self.open_workspace_dialog(window, cx),
+            "file.save-workspace" => self.save_workspace(window, cx),
+            "file.save-workspace-as" => self.save_workspace_as(window, cx),
+            "file.add-folder" => self.open_add_folder_dialog(window, cx),
+            "file.close-workspace" => self.close_workspace(window, cx),
+            "file.open-recent-workspace" => {
+                if let Some(path) = self.settings.recent_workspaces.first().cloned() {
+                    self.open_workspace(&path, window, cx);
+                } else {
+                    self.set_status(tr("workspace.no_recent"), cx);
+                }
+            }
+            "file.remove-workspace-root" => self.remove_selected_workspace_root(cx),
+            "navigation.goto-symbol" => {
+                self.open_quick_open_with("@".to_string(), window, cx);
+            }
+            "file.clear-recent-workspaces" => {
+                self.settings.recent_workspaces.clear();
+                self.global_settings.recent_workspaces.clear();
+                self.commit_settings();
+                self.set_status(tr("workspace.recent_cleared"), cx);
+            }
+            "tree.new-file" | "tree.new-folder" | "tree.rename" | "tree.delete"
+            | "tree.refresh" | "tree.copy-path" | "tree.reveal" => {
+                self.explorer_command(id, window, cx)
+            }
             "file.save" => self.save_active(window, cx),
             "file.save-as" => self.save_active_as(window, cx),
             "file.save-all" => self.save_all(window, cx),
@@ -9008,6 +10970,8 @@ impl LubanApp {
             "search.find-previous" => self.find_next(false, window, cx),
             "search.go-to-line" => self.open_go_to_line(window, cx),
             "search.find-in-files" => self.open_find_in_files(window, cx),
+            "search.workspace-replace" => self.open_workspace_replace(window, cx),
+            "search.undo-workspace-replace" => self.undo_workspace_replace(window, cx),
             "search.clear-highlights" => {
                 self.find.clear();
                 cx.notify();
@@ -9075,6 +11039,60 @@ impl LubanApp {
                 cx.notify();
             }
             "view.choose-language" => self.open_language_picker(window, cx),
+            "view.whitespace" => {
+                self.settings.show_whitespace = !self.settings.show_whitespace;
+                self.apply_settings(window, cx);
+            }
+            "view.indent-guides" => {
+                self.settings.show_indent_guides = !self.settings.show_indent_guides;
+                self.apply_settings(window, cx);
+            }
+            "view.ruler" => {
+                self.settings.show_ruler = !self.settings.show_ruler;
+                self.apply_settings(window, cx);
+            }
+            "view.document-map" => {
+                self.settings.show_document_map = !self.settings.show_document_map;
+                self.apply_settings(window, cx);
+            }
+            "view.bracket-colors" => {
+                self.settings.bracket_colors = !self.settings.bracket_colors;
+                if self.settings.bracket_colors
+                    && self.active_tab().is_some_and(|tab| {
+                        tab.doc.is_huge()
+                            || tab.large_file
+                            || tab.doc.partial_range().is_some()
+                            || tab.doc.is_non_text()
+                    })
+                {
+                    self.set_status(tr("status.bracket_colors_unavailable"), cx);
+                }
+                self.apply_settings(window, cx);
+            }
+            "navigation.toggle-outline" => {
+                self.settings.show_outline = !self.settings.show_outline;
+                self.apply_settings(window, cx);
+            }
+            "navigation.toggle-breadcrumbs" => {
+                self.settings.show_breadcrumbs = !self.settings.show_breadcrumbs;
+                self.apply_settings(window, cx);
+            }
+            "navigation.back" => self.navigate_back(window, cx),
+            "navigation.forward" => self.navigate_forward(window, cx),
+            "window.move-tab-to-new-window" => self.move_tab_to_new_window(window, cx),
+            "window.split-right" => {
+                self.split_editor(SplitDirection::Right, window, cx);
+            }
+            "window.split-down" => {
+                self.split_editor(SplitDirection::Down, window, cx);
+            }
+            "window.unsplit" => self.unsplit_editor(cx),
+            "window.switch-group" | "window.switch-group-back" => {
+                self.switch_group(None, window, cx);
+            }
+            "window.move-tab-to-other-group" => {
+                self.move_active_tab_to_other_group(window, cx);
+            }
             "tabs.close-others" => self.request_trim_tabs(false, window, cx),
             "tabs.close-right" => self.request_trim_tabs(true, window, cx),
             "tabs.copy-path" => self.copy_active_path(cx),
@@ -9085,6 +11103,16 @@ impl LubanApp {
             "palette.commands" => self.open_command_palette(window, cx),
             "palette.quick-open" => self.open_quick_open(window, cx),
             "settings.preferences" => self.open_preferences(window, cx),
+            "settings.import" => self.open_import_settings_dialog(window, cx),
+            "settings.export" => self.open_export_settings_dialog(window, cx),
+            "settings.reset" => {
+                self.confirm = Some(ConfirmState::new(
+                    CloseIntent::ResetSettings,
+                    tr("settings.reset_title"),
+                    tr("settings.reset_detail"),
+                ));
+                cx.notify();
+            }
             "help.shortcuts" => {
                 self.shortcuts_open = true;
                 cx.notify();
@@ -9299,70 +11327,149 @@ impl LubanApp {
             kind: PaletteKind::Commands,
             state,
             command_groups,
-            quick_targets: Vec::new(),
         });
         cx.notify();
     }
 
     fn open_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_quick_open_with(String::new(), window, cx);
+    }
+
+    fn open_quick_open_with(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             return;
         }
-        let infos: Vec<palette::OpenTabInfo<'_>> = self
-            .tabs
-            .iter()
-            .map(|tab| palette::OpenTabInfo {
-                id: tab.id,
-                name: tab.doc.display_name(),
-                path: tab.doc.path.as_ref(),
-                modified: tab.doc.is_modified(),
-            })
-            .collect();
-        let entries = palette::quick_entries(&infos, &self.settings.recent_files);
-        let mut tab_targets = Vec::new();
-        let mut file_targets = Vec::new();
-        for entry in entries {
-            match entry.target {
-                QuickTarget::Tab(id) => {
-                    tab_targets.push((id, entry.label, entry.detail));
-                }
-                QuickTarget::File(path) => {
-                    file_targets.push((path, entry.label, entry.detail));
-                }
-            }
-        }
-        let mut quick_targets = Vec::new();
-        let mut rows = (Vec::new(), Vec::new());
-        if !tab_targets.is_empty() {
-            quick_targets.push(
-                tab_targets
-                    .iter()
-                    .map(|(id, _, _)| QuickTarget::Tab(*id))
-                    .collect(),
-            );
-            rows.0 = tab_targets;
-        }
-        if !file_targets.is_empty() {
-            quick_targets.push(
-                file_targets
-                    .iter()
-                    .map(|(path, _, _)| QuickTarget::File(path.clone()))
-                    .collect(),
-            );
-            rows.1 = file_targets;
-        }
         let state = cx.new(|cx| CommandState::new(window, cx));
         state.update(cx, |state, cx| state.focus(window, cx));
+        self.quick_query = query;
+        self.rebuild_quick_rows(cx);
         self.palette = Some(PaletteOverlay {
             kind: PaletteKind::QuickOpen,
             state,
             command_groups: Vec::new(),
-            quick_targets,
         });
-        // Store labels/details for rendering by reusing the same ordered
-        // lists; keep them out of `PaletteOverlay` to avoid a third copy.
-        self.quick_open_rows = Some(rows);
         cx.notify();
+    }
+
+    /// Line count of a tab for Goto Anything and the document map. Reduced
+    /// large-file tabs keep their text in the editor, not the document.
+    fn tab_line_count(&self, index: usize, cx: &gpui_kit::App) -> usize {
+        let Some(tab) = self.tabs.get(index) else {
+            return 0;
+        };
+        if tab.doc.is_huge() {
+            tab.doc.line_count().max(1)
+        } else if tab.large_file {
+            tab.editor.read(cx).text().lines_len().max(1)
+        } else {
+            tab.doc.line_count().max(1)
+        }
+    }
+
+    /// Recompute quick-open rows for the current query.
+    fn rebuild_quick_rows(&mut self, cx: &mut Context<Self>) {
+        let query = self.quick_query.clone();
+        let parsed = luban_core::fuzzy::parse_quick_query(&query);
+        self.quick.error = None;
+        let active_tab = self
+            .tabs
+            .get(self.active)
+            .map(|tab| (tab.id, self.tab_line_count(self.active, cx)));
+        match parsed {
+            luban_core::fuzzy::QuickQuery::Line(line) => {
+                match quick_open::line_row(
+                    line,
+                    active_tab.map(|(id, _)| id),
+                    active_tab.map(|(_, lines)| lines).unwrap_or(0),
+                ) {
+                    Ok(row) => self.quick.rows = vec![row],
+                    Err(error) => {
+                        self.quick.rows.clear();
+                        self.quick.error = Some(error);
+                    }
+                }
+            }
+            luban_core::fuzzy::QuickQuery::Symbol(symbol_query) => {
+                let Some((tab_id, _)) = active_tab else {
+                    self.quick.rows.clear();
+                    self.quick.error = Some(tr("command.goto.no_document"));
+                    cx.notify();
+                    return;
+                };
+                if self.outline.symbols.is_empty() {
+                    self.quick.rows.clear();
+                    self.quick.error = Some(if self.outline.error.is_some() {
+                        tr("outline.unavailable")
+                    } else {
+                        tr("command.goto.no_symbols")
+                    });
+                } else {
+                    self.quick.rows =
+                        quick_open::symbol_rows(&symbol_query, &self.outline.symbols, tab_id);
+                    if self.quick.rows.is_empty() {
+                        self.quick.error = Some(tr("command.quick_open.no_matches"));
+                    }
+                }
+            }
+            luban_core::fuzzy::QuickQuery::Files { text, line } => {
+                let mut open = Vec::new();
+                let mut workspace_files = Vec::new();
+                if let Some(index) = &self.workspace_index {
+                    for tab in &self.tabs {
+                        if let Some(path) = &tab.doc.path {
+                            let relative = index
+                                .relative_of(path)
+                                .unwrap_or_else(|| path.display().to_string());
+                            open.push(quick_open::OpenFile {
+                                path: path.clone(),
+                                relative,
+                                name: tab.doc.display_name(),
+                                modified: tab.doc.is_modified(),
+                            });
+                        }
+                    }
+                    for file in index.files() {
+                        workspace_files.push((file.relative.clone(), file.path.clone()));
+                    }
+                } else {
+                    for tab in &self.tabs {
+                        if let Some(path) = &tab.doc.path {
+                            open.push(quick_open::OpenFile {
+                                path: path.clone(),
+                                relative: path.display().to_string(),
+                                name: tab.doc.display_name(),
+                                modified: tab.doc.is_modified(),
+                            });
+                        }
+                    }
+                    for path in &self.settings.recent_files {
+                        if path.is_file() {
+                            workspace_files.push((path.display().to_string(), path.clone()));
+                        }
+                    }
+                }
+                self.quick.rows = quick_open::file_rows(
+                    &text,
+                    line,
+                    &open,
+                    &workspace_files,
+                    quick_open::MAX_QUICK_ROWS,
+                );
+                if self.quick.rows.is_empty() {
+                    self.quick.error = Some(tr("command.quick_open.no_matches"));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Palette query callback: filters the quick-open list.
+    fn set_quick_query(&mut self, query: &str, cx: &mut Context<Self>) {
+        if self.quick_query == query {
+            return;
+        }
+        self.quick_query = query.to_string();
+        self.rebuild_quick_rows(cx);
     }
 
     fn confirm_palette(
@@ -9375,7 +11482,6 @@ impl LubanApp {
         let Some(overlay) = self.palette.take() else {
             return;
         };
-        self.quick_open_rows = None;
         match kind {
             PaletteKind::Commands => {
                 let id = overlay
@@ -9388,19 +11494,23 @@ impl LubanApp {
                 }
             }
             PaletteKind::QuickOpen => {
-                let target = overlay
-                    .quick_targets
-                    .get(index.section)
-                    .and_then(|group| group.get(index.row))
-                    .cloned();
+                let target = self.quick.rows.get(index.row).map(|row| row.target.clone());
+                self.quick.rows.clear();
                 match target {
-                    Some(QuickTarget::Tab(id)) => {
-                        if let Some(index) = self.tab_index_by_id(id) {
-                            self.activate_tab_index(index, window, cx);
+                    Some(quick_open::QuickTarget::File { path, line }) => match line {
+                        Some(line) => {
+                            self.open_path_at(&path, line as usize, 1, 0, window, cx);
                         }
-                    }
-                    Some(QuickTarget::File(path)) => {
-                        self.open_path(&path, window, cx);
+                        None => {
+                            self.open_path(&path, window, cx);
+                        }
+                    },
+                    Some(quick_open::QuickTarget::Line { tab_id, line })
+                    | Some(quick_open::QuickTarget::Symbol { tab_id, line }) => {
+                        if let Some(index) = self.tab_index_by_id(tab_id) {
+                            self.activate_tab_index(index, window, cx);
+                            self.jump_to_line_in_tab(index, line, window, cx);
+                        }
                     }
                     None => {}
                 }
@@ -9412,8 +11522,112 @@ impl LubanApp {
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
-        self.quick_open_rows = None;
+        self.quick.rows.clear();
+        self.quick_query.clear();
         self.focus_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Snapshot the current location for the navigation history.
+    fn current_navigation_entry(&self, cx: &gpui_kit::App) -> Option<NavigationEntry> {
+        let tab = self.tabs.get(self.active)?;
+        Some(NavigationEntry {
+            tab_id: tab.id,
+            cursor: tab.doc.cursor,
+            anchor: tab.doc.anchor,
+            scroll: tab.editor.read(cx).scroll_offset().y.as_f32(),
+        })
+    }
+
+    fn record_navigation(&mut self, cx: &gpui_kit::App) {
+        if let Some(entry) = self.current_navigation_entry(cx) {
+            self.nav.record(entry);
+        }
+    }
+
+    pub fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let alive: HashSet<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        let target = self.nav.back_while(|entry| alive.contains(&entry.tab_id));
+        if let Some(entry) = target {
+            self.apply_navigation_entry(entry, window, cx);
+        }
+    }
+
+    pub fn navigate_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let alive: HashSet<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        let target = self
+            .nav
+            .forward_while(|entry| alive.contains(&entry.tab_id));
+        if let Some(entry) = target {
+            self.apply_navigation_entry(entry, window, cx);
+        }
+    }
+
+    fn apply_navigation_entry(
+        &mut self,
+        entry: NavigationEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(entry.tab_id) else {
+            return;
+        };
+        self.sync_active(window, cx);
+        self.active = index;
+        let group = self.tabs[index].group;
+        self.active_group = group;
+        self.active_in_group[group] = Some(entry.tab_id);
+        let huge = self.tabs[index].doc.is_huge();
+        if huge {
+            self.huge_jump_line(entry.cursor as u64 + 1, entry.anchor as u64 + 1, window, cx);
+        } else {
+            let total = self.tabs[index].editor.read(cx).text().len_chars();
+            let anchor = entry.anchor.min(total);
+            let cursor = entry.cursor.min(total);
+            let editor = self.tabs[index].editor.clone();
+            let rope = editor.read(cx).text().clone();
+            let b0 = rope.char_to_byte_idx(anchor);
+            let b1 = rope.char_to_byte_idx(cursor);
+            let (start, end) = if b0 <= b1 { (b0, b1) } else { (b1, b0) };
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(start..end, cx);
+                state.set_scroll_offset(point(px(0.), px(entry.scroll)), cx);
+                state.focus(window, cx);
+            });
+            self.tabs[index].doc.set_selection(anchor, cursor);
+        }
+        self.focus_editor = true;
+        self.find.dirty = true;
+        cx.notify();
+    }
+
+    /// Move the caret to a 1-based line of a tab and focus the editor.
+    fn jump_to_line_in_tab(
+        &mut self,
+        index: usize,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (huge, group) = match self.tabs.get(index) {
+            Some(tab) => (tab.doc.is_huge(), tab.group),
+            None => return,
+        };
+        self.record_navigation(cx);
+        if huge {
+            self.active = index;
+            self.active_group = group;
+            self.active_in_group[group] = Some(self.tabs[index].id);
+            self.huge_jump_line(line as u64, 1, window, cx);
+            return;
+        }
+        self.active = index;
+        self.active_group = group;
+        self.active_in_group[group] = Some(self.tabs[index].id);
+        let (start, end) = self.line_selection_in_tab(index, line, 1, 0, cx);
+        self.select_char_range(start, end, window, cx);
+        self.focus_editor = true;
+        self.record_navigation(cx);
         cx.notify();
     }
 
@@ -9667,9 +11881,16 @@ impl LubanApp {
             return;
         };
         let keep_id = self.tabs[index].id;
-        let queue: Vec<u64> = trim_queue(self.tabs.len(), index, right)
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        let members = tab_groups::group_tabs(&memberships, self.tabs[index].group);
+        let keep_position = members
+            .iter()
+            .position(|member| *member == index)
+            .unwrap_or(0);
+        let queue: Vec<u64> = trim_queue(members.len(), keep_position, right)
             .into_iter()
-            .filter_map(|index| self.tabs.get(index).map(|tab| tab.id))
+            .filter_map(|position| members.get(position))
+            .filter_map(|index| self.tabs.get(*index).map(|tab| tab.id))
             .collect();
         if queue.is_empty() {
             return;
@@ -9686,6 +11907,7 @@ impl LubanApp {
             keep_id,
             queue,
             save_queue,
+            remove_root: None,
         });
         if self
             .trim_plan
@@ -9784,6 +12006,10 @@ impl LubanApp {
             }
         }
         self.finish_trim(plan.keep_id, cx);
+        if let Some(path) = plan.remove_root {
+            self.remove_workspace_root_now(&path, cx);
+            self.save_session_now(cx);
+        }
     }
 
     fn finish_trim(&mut self, keep_id: u64, cx: &mut Context<Self>) {
@@ -9872,6 +12098,12 @@ impl LubanApp {
                 self.cancel_file_dialog(cx);
                 return true;
             }
+            if self.name_prompt.is_some() {
+                self.name_prompt = None;
+                self.focus_editor(window, cx);
+                cx.notify();
+                return true;
+            }
             if self.confirm.is_some() {
                 self.confirm_cancel(cx);
                 return true;
@@ -9899,9 +12131,7 @@ impl LubanApp {
                 return true;
             }
             if self.preferences.open {
-                self.preferences.open = false;
-                self.focus_editor(window, cx);
-                cx.notify();
+                self.close_preferences(window, cx);
                 return true;
             }
             if self.find_in_files.open {
@@ -9956,6 +12186,14 @@ impl LubanApp {
             return command || alt;
         }
 
+        // The focused file tree owns arrows, Enter, F2, Delete and Ctrl+N.
+        if self.explorer_key(&key, modifiers, window, cx) {
+            return true;
+        }
+        if self.outline_key(&key, modifiers, window, cx) {
+            return true;
+        }
+
         // Registered commands take precedence over the legacy inline
         // handlers below. Editing commands only apply while the editor owns
         // the focus, so a find field or dialog keeps Ctrl+C/V/A. A rebound
@@ -9972,6 +12210,14 @@ impl LubanApp {
                 "=" => "plus",
                 "-" => "minus",
                 "/" => "slash",
+                "\\" => "backslash",
+                "[" => "bracketleft",
+                "]" => "bracketright",
+                "," => "comma",
+                "." => "period",
+                ";" => "semicolon",
+                "'" => "quote",
+                "`" => "backquote",
                 other => other,
             };
             if let Some(id) = self.keymap.lookup(lookup_key, command, shift, alt) {
@@ -10092,15 +12338,15 @@ impl LubanApp {
             ("tab", false) | ("pagedown", false) => self.next_tab(1, window, cx),
             ("tab", true) | ("pageup", false) => self.next_tab(-1, window, cx),
             ("q", false) => self.request_exit(window, cx),
-            ("1", false) => self.activate_tab_index(0, window, cx),
-            ("2", false) => self.activate_tab_index(1, window, cx),
-            ("3", false) => self.activate_tab_index(2, window, cx),
-            ("4", false) => self.activate_tab_index(3, window, cx),
-            ("5", false) => self.activate_tab_index(4, window, cx),
-            ("6", false) => self.activate_tab_index(5, window, cx),
-            ("7", false) => self.activate_tab_index(6, window, cx),
-            ("8", false) => self.activate_tab_index(7, window, cx),
-            ("9", false) => self.activate_tab_index(8, window, cx),
+            ("1", false) => self.activate_group_position(0, window, cx),
+            ("2", false) => self.activate_group_position(1, window, cx),
+            ("3", false) => self.activate_group_position(2, window, cx),
+            ("4", false) => self.activate_group_position(3, window, cx),
+            ("5", false) => self.activate_group_position(4, window, cx),
+            ("6", false) => self.activate_group_position(5, window, cx),
+            ("7", false) => self.activate_group_position(6, window, cx),
+            ("8", false) => self.activate_group_position(7, window, cx),
+            ("9", false) => self.activate_group_position(8, window, cx),
             _ => return false,
         }
         true
@@ -10108,22 +12354,50 @@ impl LubanApp {
 
     fn activate_tab_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
+            if index != self.active {
+                self.record_navigation(cx);
+            }
             self.sync_active(window, cx);
             self.active = index;
+            let group = self.tabs[index].group;
+            self.active_group = group;
+            self.active_in_group[group] = Some(self.tabs[index].id);
             self.focus_editor = true;
             self.find.clear();
             self.find.dirty = true;
+            self.record_navigation(cx);
             cx.notify();
         }
     }
 
+    /// Activate a tab by its position inside the active group.
+    fn activate_group_position(
+        &mut self,
+        position: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        let members = tab_groups::group_tabs(&memberships, self.active_group);
+        if let Some(index) = members.get(position).copied() {
+            self.activate_tab_index(index, window, cx);
+        }
+    }
+
     fn next_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.len() < 2 {
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        let members = tab_groups::group_tabs(&memberships, self.active_group);
+        if members.len() < 2 {
             return;
         }
         self.sync_active(window, cx);
-        let len = self.tabs.len() as isize;
-        self.active = ((self.active as isize + delta).rem_euclid(len)) as usize;
+        let current = members
+            .iter()
+            .position(|index| *index == self.active)
+            .unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(members.len() as isize) as usize;
+        self.active = members[next];
+        self.active_in_group[self.active_group] = Some(self.tabs[self.active].id);
         self.focus_editor = true;
         self.find.clear();
         self.find.dirty = true;
@@ -10163,10 +12437,12 @@ impl LubanApp {
             cx.notify();
             return;
         }
+        self.record_navigation(cx);
         let (position, position_end) = self.line_selection_in_tab(index, line, column, 0, cx);
         let _ = position_end;
         self.select_char_range(position, position, window, cx);
         self.focus_editor = true;
+        self.record_navigation(cx);
         cx.notify();
     }
 
@@ -10233,6 +12509,7 @@ impl LubanApp {
         let weak = cx.weak_entity();
         let settings = self.settings.clone();
         let recent = self.settings.recent_files.clone();
+        let recent_workspaces = self.settings.recent_workspaces.clone();
         let large_file_open = self.large_file.open;
         let tab_count = self.tabs.len();
         let has_doc = tab_count > 0;
@@ -10252,6 +12529,8 @@ impl LubanApp {
         let can_edit_full_text =
             has_doc && !active_huge && !active_partial && !active_large && !active_non_text;
         let closed_tab_count = self.closed_tabs.len();
+        let can_go_back = self.nav.can_back();
+        let can_go_forward = self.nav.can_forward();
 
         let weak_file = weak.clone();
         let weak_edit = weak.clone();
@@ -10278,6 +12557,15 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_file,
+                        Self::command_label("file.new-window"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.new-window", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
                         Self::command_label("file.open"),
                         false,
                         None,
@@ -10292,6 +12580,51 @@ impl LubanApp {
                         None,
                         |this, window, cx| {
                             this.run_command("file.open-folder", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.open-workspace"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.open-workspace", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.save-workspace"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.save-workspace", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.save-workspace-as"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.save-workspace-as", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.add-folder"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.add-folder", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.close-workspace"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.close-workspace", window, cx);
                         },
                     ))
                     .separator();
@@ -10323,6 +12656,37 @@ impl LubanApp {
                             },
                         ));
                     }
+                }
+                if !recent_workspaces.is_empty() {
+                    menu = menu.separator();
+                    for path in &recent_workspaces {
+                        let path = path.clone();
+                        let label = tr_args(
+                            "menu.file.recent_workspace",
+                            &[(
+                                "path",
+                                truncate_middle(&path.display().to_string(), RECENT_PATH_COLUMNS),
+                            )],
+                        );
+                        menu = menu.item(Self::menu_item(
+                            &weak_file,
+                            label,
+                            false,
+                            None,
+                            move |this, window, cx| {
+                                this.open_workspace(&path, window, cx);
+                            },
+                        ));
+                    }
+                    menu = menu.item(Self::menu_item(
+                        &weak_file,
+                        Self::command_label("file.clear-recent-workspaces"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("file.clear-recent-workspaces", window, cx);
+                        },
+                    ));
                 }
                 menu = menu
                     .separator()
@@ -10920,6 +13284,24 @@ impl LubanApp {
                 ))
                 .item(Self::menu_item(
                     &weak_search,
+                    Self::command_label("search.workspace-replace"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("search.workspace-replace", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
+                    Self::command_label("search.undo-workspace-replace"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("search.undo-workspace-replace", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_search,
                     Self::command_label("search.clear-highlights"),
                     false,
                     None,
@@ -11017,7 +13399,7 @@ impl LubanApp {
                         Some(settings.show_toolbar),
                         |this, _window, cx| {
                             this.settings.show_toolbar = !this.settings.show_toolbar;
-                            let _ = this.settings.save();
+                            this.commit_settings();
                             cx.notify();
                         },
                     ))
@@ -11028,7 +13410,7 @@ impl LubanApp {
                         Some(settings.show_status_bar),
                         |this, _window, cx| {
                             this.settings.show_status_bar = !this.settings.show_status_bar;
-                            let _ = this.settings.save();
+                            this.commit_settings();
                             cx.notify();
                         },
                     ))
@@ -11039,7 +13421,7 @@ impl LubanApp {
                         Some(settings.show_file_explorer),
                         |this, _window, cx| {
                             this.settings.show_file_explorer = !this.settings.show_file_explorer;
-                            let _ = this.settings.save();
+                            this.commit_settings();
                             cx.notify();
                         },
                     ))
@@ -11050,6 +13432,144 @@ impl LubanApp {
                         Some(large_file_open),
                         |this, window, cx| {
                             this.toggle_large_file_controller(window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.whitespace"),
+                        false,
+                        Some(settings.show_whitespace),
+                        |this, window, cx| {
+                            this.run_command("view.whitespace", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.indent-guides"),
+                        false,
+                        Some(settings.show_indent_guides),
+                        |this, window, cx| {
+                            this.run_command("view.indent-guides", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.ruler"),
+                        false,
+                        Some(settings.show_ruler),
+                        |this, window, cx| {
+                            this.run_command("view.ruler", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.document-map"),
+                        false,
+                        Some(settings.show_document_map),
+                        |this, window, cx| {
+                            this.run_command("view.document-map", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("view.bracket-colors"),
+                        false,
+                        Some(settings.bracket_colors),
+                        |this, window, cx| {
+                            this.run_command("view.bracket-colors", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("navigation.toggle-outline"),
+                        false,
+                        Some(settings.show_outline),
+                        |this, window, cx| {
+                            this.run_command("navigation.toggle-outline", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("navigation.toggle-breadcrumbs"),
+                        false,
+                        Some(settings.show_breadcrumbs),
+                        |this, window, cx| {
+                            this.run_command("navigation.toggle-breadcrumbs", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("navigation.back"),
+                        !can_go_back,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("navigation.back", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("navigation.forward"),
+                        !can_go_forward,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("navigation.forward", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("window.split-right"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("window.split-right", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("window.split-down"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("window.split-down", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("window.unsplit"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("window.unsplit", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("window.switch-group"),
+                        false,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("window.switch-group", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("window.move-tab-to-other-group"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("window.move-tab-to-other-group", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
+                        Self::command_label("window.move-tab-to-new-window"),
+                        !has_doc,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("window.move-tab-to-new-window", window, cx);
                         },
                     ))
                     .separator()
@@ -11173,6 +13693,34 @@ impl LubanApp {
                     false,
                     None,
                     |this, window, cx| this.open_preferences(window, cx),
+                ))
+                .separator()
+                .item(Self::menu_item(
+                    &weak_settings,
+                    Self::command_label("settings.import"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("settings.import", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_settings,
+                    Self::command_label("settings.export"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("settings.export", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_settings,
+                    Self::command_label("settings.reset"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("settings.reset", window, cx);
+                    },
                 ))
             });
 
@@ -11546,8 +14094,31 @@ impl LubanApp {
             .into_any_element()
     }
 
-    fn render_tabs(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn group_active_index(&self, group: usize) -> Option<usize> {
+        if let Some(index) = self.active_in_group[group]
+            .and_then(|id| self.tab_index_by_id(id))
+            .filter(|index| self.tabs[*index].group == group)
+        {
+            return Some(index);
+        }
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.group == group)
+        {
+            return Some(self.active);
+        }
+        self.tabs.iter().position(|tab| tab.group == group)
+    }
+
+    fn render_tabs(
+        &mut self,
+        group: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let weak = cx.weak_entity();
+        let group_active = self.group_active_index(group);
         let mut tabs_row = div()
             .flex()
             .items_center()
@@ -11556,9 +14127,19 @@ impl LubanApp {
             .border_color(cx.theme().colors.border)
             .bg(cx.theme().colors.background);
         let mut tab_elements = Vec::new();
-        let tab_count = self.tabs.len();
-        for (index, tab) in self.tabs.iter().enumerate() {
-            let active = index == self.active;
+        let members: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| (tab.group == group).then_some(index))
+            .collect();
+        for index in members.iter().copied() {
+            let tab = &self.tabs[index];
+            let position = members
+                .iter()
+                .position(|member| *member == index)
+                .unwrap_or(0);
+            let active = group_active == Some(index);
             let id = tab.id;
             let has_path = tab.doc.path.is_some();
             let label = if tab.doc.is_modified() {
@@ -11576,6 +14157,8 @@ impl LubanApp {
             let weak_menu_copy = weak.clone();
             let weak_menu_reveal = weak.clone();
             let weak_menu_reload = weak.clone();
+            let weak_menu_other_group = weak.clone();
+            let weak_menu_new_window = weak.clone();
             let drag_label: SharedString = label.clone().into();
             let interaction_id = ("tab", id);
             let tab_el = div()
@@ -11647,19 +14230,16 @@ impl LubanApp {
                         let left = event.bounds.origin.x;
                         let right = left + event.bounds.size.width;
                         let _ = weak_drag_move.update(cx, |this, cx| {
-                            let Some(current) = this.tab_index_by_id(id) else {
-                                return;
-                            };
                             if x > right {
-                                this.move_tab_by_id(id, current + 2, window, cx);
-                            } else if x < left && current > 0 {
-                                this.move_tab_by_id(id, current - 1, window, cx);
+                                this.move_tab_by_id(id, group, position + 2, window, cx);
+                            } else if x < left && position > 0 {
+                                this.move_tab_by_id(id, group, position - 1, window, cx);
                             }
                         });
                     })
                     .on_drop(move |drag: &TabDrag, window, cx| {
                         let _ = weak_drop.update(cx, |this, cx| {
-                            this.move_tab_by_id(drag.id, index, window, cx);
+                            this.move_tab_by_id(drag.id, group, position, window, cx);
                         });
                     })
                     .context_menu(move |menu, _, _| {
@@ -11669,6 +14249,8 @@ impl LubanApp {
                         let weak_copy = weak_menu_copy.clone();
                         let weak_reveal = weak_menu_reveal.clone();
                         let weak_reload = weak_menu_reload.clone();
+                        let weak_other_group = weak_menu_other_group.clone();
+                        let weak_new_window = weak_menu_new_window.clone();
                         let mut menu = menu
                             .item(
                                 PopupMenuItem::new(Self::command_label("file.close")).on_click(
@@ -11730,6 +14312,30 @@ impl LubanApp {
                                 ),
                             );
                         }
+                        menu = menu
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(Self::command_label(
+                                    "window.move-tab-to-other-group",
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak_other_group.update(cx, |this, cx| {
+                                        this.activate_tab_index(index, window, cx);
+                                        this.move_active_tab_to_other_group(window, cx);
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(Self::command_label(
+                                    "window.move-tab-to-new-window",
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak_new_window.update(cx, |this, cx| {
+                                        this.activate_tab_index(index, window, cx);
+                                        this.move_tab_to_new_window(window, cx);
+                                    });
+                                }),
+                            );
                         menu
                     });
             tab_elements.push(tab_el.into_any_element());
@@ -11739,7 +14345,7 @@ impl LubanApp {
         let weak_drop_end = weak.clone();
         tabs_row = tabs_row.child(
             div()
-                .id("tab-new")
+                .id(format!("tab-new:{group}"))
                 .px_3()
                 .h_full()
                 .flex()
@@ -11749,39 +14355,103 @@ impl LubanApp {
                 .hover(|this| this.bg(cx.theme().colors.secondary))
                 .child("+")
                 .on_click(move |_, window, cx| {
-                    let _ = weak_new.update(cx, |this, cx| this.new_file(window, cx));
+                    let _ = weak_new.update(cx, |this, cx| {
+                        this.active_group = group;
+                        this.new_file(window, cx);
+                    });
                 })
                 .on_drop(move |drag: &TabDrag, window, cx| {
                     let _ = weak_drop_end.update(cx, |this, cx| {
-                        this.move_tab_by_id(drag.id, tab_count, window, cx);
+                        this.move_tab_by_id(drag.id, group, usize::MAX, window, cx);
                     });
                 }),
         );
         tabs_row.into_any_element()
     }
 
+    /// Move a tab to `target_position` inside `target_group`. `usize::MAX`
+    /// appends at the end. Moving to a group that does not exist yet opens a
+    /// right split.
     fn move_tab_by_id(
         &mut self,
         dragged_id: u64,
-        target_index: usize,
-        _window: &mut Window,
+        target_group: usize,
+        target_position: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(from) = self.tab_index_by_id(dragged_id) else {
             return;
         };
-        let Some(to) = reorder_index(self.tabs.len(), from, target_index) else {
+        if target_group >= tab_groups::MAX_GROUPS {
             return;
-        };
-        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        if let Some(active_id) = active_id {
-            if let Some(index) = self.tab_index_by_id(active_id) {
-                self.active = index;
-            }
         }
-        self.save_session_now();
+        if !self.split.is_split() && target_group == 1 {
+            self.split_editor(SplitDirection::Right, window, cx);
+        }
+        let source_group = self.tabs[from].group;
+        let memberships: Vec<usize> = self.tabs.iter().map(|tab| tab.group).collect();
+        if source_group == target_group {
+            let members = tab_groups::group_tabs(&memberships, target_group);
+            let from_position = members.iter().position(|index| *index == from).unwrap_or(0);
+            let target_position = target_position.min(members.len());
+            if target_position == from_position || target_position == from_position + 1 {
+                return;
+            }
+            let insertion = if target_position < members.len() {
+                members[target_position]
+            } else {
+                members
+                    .last()
+                    .map(|index| index + 1)
+                    .unwrap_or(self.tabs.len())
+            };
+            let Some(to) = reorder_index(self.tabs.len(), from, insertion) else {
+                return;
+            };
+            let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+            let tab = self.tabs.remove(from);
+            self.tabs.insert(to, tab);
+            if let Some(active_id) = active_id {
+                if let Some(index) = self.tab_index_by_id(active_id) {
+                    self.active = index;
+                }
+            }
+            self.save_session_now(cx);
+            cx.notify();
+            return;
+        }
+
+        // Cross-group move: insert at the requested slot in the target group.
+        let target_members: Vec<usize> = memberships
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| (*group == target_group && index != from).then_some(index))
+            .collect();
+        let target_position = target_position.min(target_members.len());
+        let insertion = if target_position < target_members.len() {
+            target_members[target_position]
+        } else {
+            target_members
+                .last()
+                .map(|index| index + 1)
+                .unwrap_or(self.tabs.len())
+        };
+        self.sync_active(window, cx);
+        let mut tab = self.tabs.remove(from);
+        tab.group = target_group;
+        let insertion = if from < insertion {
+            insertion - 1
+        } else {
+            insertion
+        };
+        let insertion = insertion.min(self.tabs.len());
+        self.tabs.insert(insertion, tab);
+        let id = self.tabs[insertion].id;
+        self.active_group = target_group;
+        self.active = insertion;
+        self.active_in_group[target_group] = Some(id);
+        self.save_session_now(cx);
         cx.notify();
     }
 
@@ -12044,9 +14714,87 @@ impl LubanApp {
     // Editor area
     // ------------------------------------------------------------------
 
-    fn render_editor_area(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if !self.split.is_split() {
+            return self.render_group(0, true, window, cx);
+        }
+        let first_active = self.active_group == 0;
+        let first = self.render_group(0, first_active, window, cx);
+        let second = self.render_group(1, !first_active, window, cx);
+        let divider = div()
+            .bg(cx.theme().colors.border)
+            .when(self.split == SplitDirection::Right, |this| {
+                this.w(px(1.)).h_full()
+            })
+            .when(self.split == SplitDirection::Down, |this| {
+                this.h(px(1.)).w_full()
+            });
+        let layout = div().flex_1().min_w(px(0.)).min_h(px(0.)).flex();
+        match self.split {
+            SplitDirection::Right => layout.flex_row().child(first).child(divider).child(second),
+            SplitDirection::Down => layout.flex_col().child(first).child(divider).child(second),
+            SplitDirection::None => layout.child(first),
+        }
+        .into_any_element()
+    }
+
+    fn render_group(
+        &mut self,
+        group: usize,
+        active: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tabs = self.render_tabs(group, window, cx);
+        let editor = match self.group_active_index(group) {
+            Some(index) => self.render_editor_area(index, window, cx),
+            None => div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(cx.theme().colors.muted_foreground)
+                .child(tr("split.empty_group"))
+                .into_any_element(),
+        };
+        let weak_group = cx.weak_entity();
+        div()
+            .id(format!("editor-group:{group}"))
+            .role(Role::Group)
+            .aria_label(tr_args(
+                "split.group_label",
+                &[("group", (group + 1).to_string())],
+            ))
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .when(active && self.split.is_split(), |this| {
+                this.border_t_1().border_color(cx.theme().colors.border)
+            })
+            .child(tabs)
+            .child(editor)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                let _ = weak_group.update(cx, |this, cx| {
+                    if this.active_group != group {
+                        this.switch_group(Some(group), window, cx);
+                    }
+                });
+            })
+            .into_any_element()
+    }
+
+    fn render_editor_area(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let weak = cx.weak_entity();
-        let Some(tab) = self.tabs.get(self.active) else {
+        let Some(tab) = self.tabs.get(index) else {
             return div().size_full().into_any_element();
         };
         let editor = tab.editor.clone();
@@ -12152,55 +14900,426 @@ impl LubanApp {
             ))
         });
 
+        let breadcrumb = self.render_breadcrumbs(index, cx);
+        let ruler = self.render_ruler(index, cx);
+        let map = self.render_document_map(index, cx);
         div()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
             .flex()
             .flex_col()
+            .children(breadcrumb)
             .child(
                 div()
-                    .relative()
                     .flex_1()
+                    .min_w(px(0.))
                     .min_h(px(0.))
-                    .p_1()
+                    .flex()
+                    .flex_row()
                     .child(
                         div()
-                            .flex()
-                            .h_full()
+                            .relative()
+                            .flex_1()
+                            .min_w(px(0.))
                             .min_h(px(0.))
-                            .children(global_gutter)
+                            .p_1()
                             .child(
-                                div().flex_1().min_w(px(0.)).h_full().child(
-                                    Editor::new(&editor)
-                                        .with_size(EDITOR_SIZE)
-                                        .appearance(false)
-                                        .bordered(false)
-                                        .size_full()
-                                        .text_size(px(font_size))
-                                        .when(!font_family.is_empty(), |this| {
-                                            this.font_family(font_family.clone())
-                                        }),
-                                ),
-                            ),
+                                div()
+                                    .flex()
+                                    .h_full()
+                                    .min_h(px(0.))
+                                    .children(global_gutter)
+                                    .child(
+                                        div().flex_1().min_w(px(0.)).h_full().child(
+                                            Editor::new(&editor)
+                                                .with_size(EDITOR_SIZE)
+                                                .appearance(false)
+                                                .bordered(false)
+                                                .size_full()
+                                                .text_size(px(font_size))
+                                                .when(!font_family.is_empty(), |this| {
+                                                    this.font_family(font_family.clone())
+                                                }),
+                                        ),
+                                    ),
+                            )
+                            .children(ruler)
+                            .children(global_scrollbar),
                     )
-                    .children(global_scrollbar),
+                    .children(map),
             )
             .into_any_element()
     }
 
-    fn render_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Breadcrumb row for the tab: workspace ─ directories ─ file ─ symbol.
+    fn render_breadcrumbs(&mut self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.settings.show_breadcrumbs {
+            return None;
+        }
+        let tab = self.tabs.get(index)?;
+        let simple = tab.doc.is_huge()
+            || tab.large_file
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text();
+        let file_name = tab.doc.display_name();
+        let relative = tab
+            .doc
+            .path
+            .as_ref()
+            .and_then(|path| {
+                self.workspace_roots
+                    .iter()
+                    .find_map(|root| path.strip_prefix(root).ok())
+            })
+            .filter(|_| !simple);
+        let root_label = if simple {
+            None
+        } else if !self.workspace_name.is_empty() {
+            Some(self.workspace_name.clone())
+        } else if let Some(path) = &tab.doc.path {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let symbol = if simple || tab.doc.is_untitled() || index != self.active {
+            None
+        } else {
+            let cursor_line = line_ops::line_of_char(&tab.doc.text, tab.doc.cursor) + 1;
+            luban_core::symbols::containing_symbol(&self.outline.symbols, cursor_line)
+                .map(|symbol| (symbol.name.clone(), symbol.line))
+        };
+        let symbol_name = symbol.as_ref().map(|(name, _)| name.as_str());
+        let mut segments = crate::navigation::breadcrumbs(
+            root_label.as_deref(),
+            relative,
+            &file_name,
+            symbol_name,
+        );
+        if let Some((_, line)) = &symbol {
+            if let Some(last) = segments.last_mut() {
+                last.action = BreadcrumbAction::Symbol(*line);
+            }
+        }
         let weak = cx.weak_entity();
-        let width = self.explorer.width;
-        let show_hidden = self.settings.show_hidden_files;
-        let mut panel = div()
-            .w(px(width))
+        let mut row = div()
+            .id("breadcrumbs")
+            .role(Role::Navigation)
+            .aria_label(tr("breadcrumbs.label"))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .text_xs()
+            .text_color(cx.theme().colors.muted_foreground)
+            .border_b_1()
+            .border_color(cx.theme().colors.border);
+        for (position, segment) in segments.into_iter().enumerate() {
+            if position > 0 {
+                row = row.child("›");
+            }
+            let label = segment.label.clone();
+            let action = segment.action.clone();
+            let weak_segment = weak.clone();
+            row = row.child(
+                div()
+                    .id(format!("breadcrumb:{position}"))
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .px_1()
+                    .hover(|this| this.bg(cx.theme().colors.secondary))
+                    .child(label)
+                    .on_click(move |_, window, cx| {
+                        let action = action.clone();
+                        let _ = weak_segment.update(cx, |this, cx| match action {
+                            BreadcrumbAction::Root => {}
+                            BreadcrumbAction::Directory(prefix) => {
+                                let query = crate::quick_open::directory_query(&prefix);
+                                this.open_quick_open_with(query, window, cx);
+                            }
+                            BreadcrumbAction::File(name) => {
+                                this.open_quick_open_with(name, window, cx);
+                            }
+                            BreadcrumbAction::Symbol(line) => {
+                                this.jump_to_line_in_tab(index, line, window, cx);
+                            }
+                        });
+                    }),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// 1px ruler lines at the configured character columns.
+    fn render_ruler(&mut self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.settings.show_ruler || self.settings.word_wrap {
+            return None;
+        }
+        let tab = self.tabs.get(index)?;
+        if tab.doc.is_huge()
+            || tab.large_file
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text()
+        {
+            return None;
+        }
+        let font_size = self.settings.font_size;
+        let char_width = (font_size * 0.6).max(1.0);
+        let scroll_x = tab.editor.read(cx).scroll_offset().x.as_f32();
+        let columns = self.settings.ruler_columns.clone();
+        if columns.is_empty() {
+            return None;
+        }
+        let lines: Vec<AnyElement> = columns
+            .into_iter()
+            .map(|column| {
+                let x = (column as f32 - 1.0) * char_width - scroll_x;
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(x))
+                    .w(px(1.))
+                    .h_full()
+                    .bg(cx.theme().colors.border)
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .overflow_hidden()
+                .children(lines)
+                .into_any_element(),
+        )
+    }
+
+    /// Map on the right edge. Ordinary documents show sampled line widths;
+    /// huge/partial documents show only the viewport proportion.
+    fn render_document_map(&mut self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.settings.show_document_map {
+            return None;
+        }
+        let tab = self.tabs.get(index)?;
+        let state = tab.editor.read(cx);
+        let total_lines = self.tab_line_count(index, cx);
+        let line_height = state
+            .line_height()
+            .map(|height| height.as_f32())
+            .unwrap_or(0.0);
+        let input = state.input_bounds();
+        if !document_map::should_show(total_lines, input.size.height.as_f32()) {
+            return None;
+        }
+        if tab.doc.is_non_text() {
+            return Some(
+                div()
+                    .id("document-map-empty")
+                    .w(px(document_map::MAP_WIDTH))
+                    .h_full()
+                    .border_l_1()
+                    .border_color(cx.theme().colors.border)
+                    .bg(cx.theme().colors.secondary)
+                    .role(Role::List)
+                    .aria_label(tr("view.document_map"))
+                    .into_any_element(),
+            );
+        }
+        let viewport_lines = if line_height > 0.0 {
+            (input.size.height.as_f32() / line_height).floor().max(1.0)
+        } else {
+            1.0
+        };
+        let start_line = if tab.doc.is_huge() {
+            tab.huge
+                .as_ref()
+                .map(|ui| ui.window_line.saturating_sub(1) as f32)
+                .unwrap_or(0.0)
+        } else {
+            let scroll = state.scroll_offset().y.as_f32();
+            (-scroll / line_height.max(1.0)).max(0.0)
+        };
+        let (top, height) = document_map::viewport_rect(total_lines, start_line, viewport_lines);
+        let mut map = div()
+            .id("document-map")
+            .relative()
+            .w(px(document_map::MAP_WIDTH))
+            .h_full()
+            .border_l_1()
+            .border_color(cx.theme().colors.border)
+            .bg(cx.theme().colors.secondary)
+            .overflow_hidden()
+            .role(Role::List)
+            .aria_label(tr("view.document_map"));
+        if !tab.doc.is_huge()
+            && tab.doc.partial_range().is_none()
+            && !tab.large_file
+            && tab.doc.text.len() <= 8 * 1024 * 1024
+        {
+            let samples = document_map::sample(&tab.doc.text, document_map::MAX_MAP_ROWS);
+            let bins = 160usize.min(samples.len());
+            if bins > 0 {
+                let per_bin = (samples.len() as f32 / bins as f32).ceil().max(1.0) as usize;
+                let mut bars = Vec::new();
+                for bin in 0..bins {
+                    let start = bin * per_bin;
+                    if start >= samples.len() {
+                        break;
+                    }
+                    let end = (start + per_bin).min(samples.len());
+                    let width = samples[start..end]
+                        .iter()
+                        .map(|row| row.width)
+                        .fold(0.0f32, f32::max);
+                    bars.push(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .h(px(1.))
+                                    .w(relative(width.clamp(0.03, 1.0)))
+                                    .bg(cx.theme().colors.muted_foreground),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                map = map.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .px_2()
+                        .flex()
+                        .flex_col()
+                        .children(bars),
+                );
+            }
+        }
+        map = map.child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .w_full()
+                .top(relative(top))
+                .h(relative(height.max(0.02)))
+                .bg(cx.theme().colors.selection)
+                .into_any_element(),
+        );
+        let weak_map = cx.weak_entity();
+        let weak_map_move = weak_map.clone();
+        let map_top = input.origin.y.as_f32();
+        let map_height = input.size.height.as_f32().max(1.0);
+        let map_line_height = line_height.max(1.0);
+        let map_total = total_lines;
+        let map = map
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                let ratio = (event.position.y.as_f32() - map_top) / map_height;
+                let line = document_map::line_at_ratio(ratio, map_total);
+                let shift = event.modifiers.shift;
+                let _ = weak_map.update(cx, |this, cx| {
+                    this.map_scroll_to(index, line, shift, map_line_height, window, cx);
+                });
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                let ratio = (event.position.y.as_f32() - map_top) / map_height;
+                let line = document_map::line_at_ratio(ratio, map_total);
+                let _ = weak_map_move.update(cx, |this, cx| {
+                    this.map_scroll_to(index, line, false, map_line_height, window, cx);
+                });
+            });
+        Some(map.into_any_element())
+    }
+
+    /// Scroll the viewport to a document-map line. Shift also moves the caret.
+    fn map_scroll_to(
+        &mut self,
+        index: usize,
+        line: usize,
+        move_caret: bool,
+        line_height: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index != self.active {
+            return;
+        }
+        if self.tabs.get(index).is_some_and(|tab| tab.doc.is_huge()) {
+            let viewport_lines = self
+                .tabs
+                .get(index)
+                .map(|tab| {
+                    let state = tab.editor.read(cx);
+                    let height = state.input_bounds().size.height.as_f32();
+                    (height / line_height).floor().max(1.0) as u64
+                })
+                .unwrap_or(1);
+            self.huge_scroll_to(index, line as u64, viewport_lines, line_height, window, cx);
+            if move_caret {
+                self.huge_jump_line(line as u64, 1, window, cx);
+            }
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let editor = tab.editor.clone();
+        let y = -((line.saturating_sub(1) as f32) * line_height);
+        editor.update(cx, |state, cx| {
+            state.set_scroll_offset(point(px(0.), px(y)), cx);
+        });
+        if move_caret {
+            self.jump_to_line_in_tab(index, line, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_side_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let explorer = self.render_explorer(window, cx);
+        let outline = if self.settings.show_outline {
+            Some(self.render_outline(cx))
+        } else {
+            None
+        };
+        div()
+            .w(px(self.explorer.width))
             .h_full()
             .flex()
             .flex_col()
-            .border_r_1()
+            .child(explorer)
+            .children(outline)
+            .into_any_element()
+    }
+
+    /// Symbol outline below the file tree.
+    fn render_outline(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.outline.rows();
+        let truncated = self.outline.truncated;
+        let error = self.outline.error.clone();
+        let supported = self.outline.supported;
+        let has_document = !self.tabs.is_empty();
+        let weak = cx.weak_entity();
+        let mut panel = div()
+            .h(px(190.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .border_t_1()
             .border_color(cx.theme().colors.border)
-            .bg(cx.theme().colors.background);
+            .bg(cx.theme().colors.background)
+            .id("outline-panel")
+            .track_focus(&self.outline_focus)
+            .tab_stop(true)
+            .focus_visible(|style| style.border_color(cx.theme().colors.ring))
+            .role(Role::List)
+            .aria_label(tr("outline.title"));
         panel = panel.child(
             div()
                 .flex()
@@ -12211,147 +15330,933 @@ impl LubanApp {
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(cx.theme().colors.muted_foreground)
-                .child(tr("explorer.title"))
+                .child(tr("outline.title"))
+                .when(truncated, |this| this.child(tr("outline.truncated"))),
+        );
+        if rows.is_empty() {
+            let message = if !has_document {
+                tr("outline.no_document")
+            } else if let Some(error) = error {
+                error
+            } else if supported {
+                tr("outline.empty")
+            } else {
+                tr("outline.unsupported")
+            };
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(message),
+            );
+            return panel.into_any_element();
+        }
+        let mut list = Vec::new();
+        for row in rows {
+            let symbol = self.outline.symbols[row.index].clone();
+            let line = symbol.line;
+            let weak_row = weak.clone();
+            let weak_toggle = weak.clone();
+            let selected = self.outline_selected == Some(line);
+            list.push(
+                div()
+                    .id(format!("outline-row:{}", symbol.line))
+                    .role(Role::ListItem)
+                    .aria_label(symbol.name.clone())
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl(px(8.0 + row.depth as f32 * 12.0))
+                    .pr_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(cx.theme().colors.secondary))
+                    .hover(|this| this.bg(cx.theme().colors.secondary_hover))
+                    .when(row.has_children, |this| {
+                        this.child(
+                            div()
+                                .id(format!("outline-toggle:{}", symbol.line))
+                                .px_1()
+                                .cursor_pointer()
+                                .child(if row.collapsed { "▸" } else { "▾" })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let _ = weak_toggle.update(cx, |this, cx| {
+                                        this.outline.toggle(line);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(symbol.kind.clone()),
+                    )
+                    .child(div().truncate().child(symbol.name.clone()))
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_row.update(cx, |this, cx| {
+                            this.outline_focus.focus(window, cx);
+                            this.outline_selected = Some(line);
+                            this.jump_to_line_in_tab(this.active, line, window, cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        panel
+            .child(
+                div()
+                    .id("outline-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(list),
+            )
+            .into_any_element()
+    }
+
+    fn render_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.weak_entity();
+        let show_hidden = self.settings.show_hidden_files;
+        let rows = self
+            .explorer
+            .visible_rows(self.workspace_index.as_ref(), show_hidden);
+        let selected = self.explorer.selected.clone();
+        let indexing = self.indexing;
+        let truncated = self
+            .workspace_index
+            .as_ref()
+            .is_some_and(|index| !index.truncated_roots.is_empty());
+        let mut panel = div()
+            .w_full()
+            .flex_1()
+            .min_h(px(120.))
+            .flex()
+            .flex_col()
+            .id("explorer-panel")
+            .border_r_1()
+            .border_color(cx.theme().colors.border)
+            .bg(cx.theme().colors.background)
+            .track_focus(&self.explorer_focus)
+            .tab_stop(true)
+            .focus_visible(|style| style.border_color(cx.theme().colors.ring))
+            .role(Role::Tree)
+            .aria_label(tr("explorer.title"));
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(cx.theme().colors.muted_foreground)
+                .child(div().truncate().child(if self.workspace_name.is_empty() {
+                    tr("explorer.title")
+                } else {
+                    self.workspace_name.clone()
+                }))
                 .child(
                     div()
-                        .id("explorer-open-folder")
-                        .px_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(cx.theme().colors.secondary))
-                        .child(tr("explorer.open_folder"))
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.run_command("file.open-folder", window, cx);
-                        })),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("explorer-open-folder")
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|this| this.bg(cx.theme().colors.secondary))
+                                .child(tr("explorer.open_folder"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.run_command("file.open-folder", window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("explorer-refresh")
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|this| this.bg(cx.theme().colors.secondary))
+                                .child("⟳")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.refresh_workspace(cx);
+                                })),
+                        ),
                 ),
         );
-        if self.explorer.root.is_none() {
+        if indexing {
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(tr("explorer.indexing")),
+            );
+        }
+        if truncated {
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().colors.warning)
+                    .child(tr("explorer.index_truncated")),
+            );
+        }
+        if rows.is_empty() {
             panel = panel.child(
                 div()
                     .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
                     .text_sm()
                     .text_color(cx.theme().colors.muted_foreground)
-                    .child(tr("explorer.empty")),
+                    .child(tr("explorer.empty"))
+                    .child(
+                        div()
+                            .id("explorer-empty-open-workspace")
+                            .cursor_pointer()
+                            .child(tr("workspace.open"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_workspace_dialog(window, cx);
+                            })),
+                    ),
             );
-        } else if let Some(root) = self.explorer.root.clone() {
-            let root_name = self.explorer.root_name().unwrap_or_default();
-            let weak_root = weak.clone();
-            let expanded = self.explorer.is_expanded(&root);
-            panel = panel.child(
-                div()
-                    .id("explorer-root")
+        } else {
+            let mut list = Vec::new();
+            for row in rows {
+                let path = row.path.clone();
+                let name = row.name.clone();
+                let is_dir = row.is_dir;
+                let depth = row.depth;
+                let is_root = depth == 0;
+                let expanded = self.explorer.is_expanded(&path);
+                let is_selected = selected
+                    .as_ref()
+                    .is_some_and(|selected| util::same_path(selected, &path));
+                let weak_click = weak.clone();
+                let weak_menu_new_file = weak.clone();
+                let weak_menu_new_folder = weak.clone();
+                let weak_menu_rename = weak.clone();
+                let weak_menu_delete = weak.clone();
+                let weak_menu_refresh = weak.clone();
+                let weak_menu_copy = weak.clone();
+                let weak_menu_reveal = weak.clone();
+                let weak_menu_remove = weak.clone();
+                let weak_menu_add = weak.clone();
+                let row_context_path = path.clone();
+                let context_is_dir = is_dir;
+                let context_is_root = is_root;
+                let context_root = row.root.clone();
+                let mut element = div()
+                    .id(format!("explorer-row:{}", path.display()))
+                    .role(if is_dir {
+                        Role::TreeItem
+                    } else {
+                        Role::ListItem
+                    })
+                    .aria_label(name.clone())
+                    .aria_selected(is_selected)
                     .flex()
                     .items_center()
-                    .px_2()
-                    .py_1()
                     .gap_1()
+                    .pl(px(8.0 + depth as f32 * 12.0))
+                    .pr_2()
+                    .py_1()
+                    .text_sm()
                     .cursor_pointer()
-                    .hover(|this| this.bg(cx.theme().colors.secondary))
-                    .child(if expanded { "▾" } else { "▸" })
-                    .child(div().text_sm().child(root_name))
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_root.update(cx, |this, cx| {
-                            this.explorer.toggle_directory(
-                                &this.explorer.root.clone().unwrap_or_default(),
-                                this.settings.show_hidden_files,
-                            );
+                    .when(is_selected, |this| this.bg(cx.theme().colors.secondary))
+                    .hover(|this| this.bg(cx.theme().colors.secondary_hover))
+                    .child(match (is_dir, expanded) {
+                        (false, _) => "·".to_string(),
+                        (true, true) => "▾".to_string(),
+                        (true, false) => "▸".to_string(),
+                    })
+                    .child(div().truncate().child(name.clone()))
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_click.update(cx, |this, cx| {
+                            this.explorer_focus.focus(window, cx);
+                            this.explorer.select(path.clone());
+                            if context_is_dir {
+                                this.explorer
+                                    .toggle_directory(&path, this.settings.show_hidden_files);
+                            } else {
+                                this.open_path(&path, window, cx);
+                            }
                             cx.notify();
                         });
-                    }),
-            );
-            let children = self.render_explorer_children(&root, 1, show_hidden, &weak, cx);
+                    })
+                    .context_menu(move |menu, _, _| {
+                        let mut menu = menu
+                            .item(PopupMenuItem::new(tr("explorer.new_file")).on_click({
+                                let weak = weak_menu_new_file.clone();
+                                let dir = if context_is_dir {
+                                    row_context_path.clone()
+                                } else {
+                                    row_context_path
+                                        .parent()
+                                        .map(Path::to_path_buf)
+                                        .unwrap_or_else(|| context_root.clone())
+                                };
+                                move |_, window, cx| {
+                                    let dir = dir.clone();
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.start_name_prompt(
+                                            NamePromptKind::NewFile,
+                                            dir,
+                                            None,
+                                            String::new(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }))
+                            .item(PopupMenuItem::new(tr("explorer.new_folder")).on_click({
+                                let weak = weak_menu_new_folder.clone();
+                                let dir = if context_is_dir {
+                                    row_context_path.clone()
+                                } else {
+                                    row_context_path
+                                        .parent()
+                                        .map(Path::to_path_buf)
+                                        .unwrap_or_else(|| context_root.clone())
+                                };
+                                move |_, window, cx| {
+                                    let dir = dir.clone();
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.start_name_prompt(
+                                            NamePromptKind::NewFolder,
+                                            dir,
+                                            None,
+                                            String::new(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }));
+                        if !context_is_root {
+                            menu = menu
+                                .separator()
+                                .item(PopupMenuItem::new(tr("explorer.rename")).on_click({
+                                    let weak = weak_menu_rename.clone();
+                                    let path = row_context_path.clone();
+                                    let name = name.clone();
+                                    move |_, window, cx| {
+                                        let path = path.clone();
+                                        let name = name.clone();
+                                        let _ = weak.update(cx, |this, cx| {
+                                            let parent = path
+                                                .parent()
+                                                .map(Path::to_path_buf)
+                                                .unwrap_or_default();
+                                            this.start_name_prompt(
+                                                NamePromptKind::Rename,
+                                                parent,
+                                                Some(path),
+                                                name,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }))
+                                .item(PopupMenuItem::new(tr("explorer.delete")).on_click({
+                                    let weak = weak_menu_delete.clone();
+                                    let path = row_context_path.clone();
+                                    move |_, _, cx| {
+                                        let path = path.clone();
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.request_delete_path(path, cx);
+                                        });
+                                    }
+                                }));
+                        }
+                        menu = menu
+                            .separator()
+                            .item(PopupMenuItem::new(tr("explorer.refresh")).on_click({
+                                let weak = weak_menu_refresh.clone();
+                                move |_, _, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.refresh_workspace(cx);
+                                    });
+                                }
+                            }))
+                            .item(PopupMenuItem::new(tr("explorer.copy_path")).on_click({
+                                let weak = weak_menu_copy.clone();
+                                let path = row_context_path.clone();
+                                move |_, _, cx| {
+                                    let path = path.clone();
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.copy_path(&path, cx);
+                                    });
+                                }
+                            }))
+                            .item(PopupMenuItem::new(tr("explorer.reveal")).on_click({
+                                let weak = weak_menu_reveal.clone();
+                                let path = row_context_path.clone();
+                                move |_, _, cx| {
+                                    let path = path.clone();
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.reveal_path(&path, cx);
+                                    });
+                                }
+                            }));
+                        if context_is_root {
+                            menu = menu
+                                .separator()
+                                .item(PopupMenuItem::new(tr("workspace.add_folder")).on_click({
+                                    let weak = weak_menu_add.clone();
+                                    move |_, window, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.open_add_folder_dialog(window, cx);
+                                        });
+                                    }
+                                }))
+                                .item(PopupMenuItem::new(tr("workspace.remove_root")).on_click({
+                                    let weak = weak_menu_remove.clone();
+                                    let root = context_root.clone();
+                                    move |_, _, cx| {
+                                        let root = root.clone();
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.remove_workspace_root(&root, cx);
+                                        });
+                                    }
+                                }));
+                        }
+                        menu
+                    });
+                // The file row has no expander; keep its label aligned with
+                // directory names by inserting the same leading cell.
+                if !is_dir {
+                    element = element.child("");
+                }
+                list.push(element.into_any_element());
+            }
             panel = panel.child(
                 div()
                     .id("explorer-scroll")
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .children(children),
+                    .children(list),
             );
-            let _ = window;
         }
+        let _ = window;
         panel.into_any_element()
     }
 
-    fn render_explorer_children(
-        &mut self,
-        dir: &Path,
-        depth: usize,
-        show_hidden: bool,
-        weak: &WeakEntity<Self>,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        if depth > 32 || !self.explorer.is_expanded(dir) {
-            return Vec::new();
-        }
-        let entries = self.explorer.entries(dir, show_hidden).to_vec();
-        let mut out = Vec::new();
-        for entry in entries {
-            let path = entry.path.clone();
-            let name = entry.name.clone();
-            let is_dir = entry.is_dir;
-            let weak_row = weak.clone();
-            if is_dir {
-                let expanded = self.explorer.is_expanded(&path);
-                let path_toggle = path.clone();
-                let weak_toggle = weak.clone();
-                out.push(
-                    div()
-                        .id(format!("explorer-dir:{}", path.display()))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .pl(px(8.0 + depth as f32 * 12.0))
-                        .pr_2()
-                        .py_1()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(cx.theme().colors.secondary))
-                        .child(if expanded { "▾" } else { "▸" })
-                        .child(name)
-                        .on_click(move |_, _, cx| {
-                            let _ = weak_toggle.update(cx, |this, cx| {
-                                this.explorer.toggle_directory(
-                                    &path_toggle,
-                                    this.settings.show_hidden_files,
-                                );
-                                cx.notify();
-                            });
-                        })
-                        .into_any_element(),
-                );
-                if expanded {
-                    let nested =
-                        self.render_explorer_children(&path, depth + 1, show_hidden, weak, cx);
-                    out.extend(nested);
+    /// Run a file-tree command against the current selection.
+    fn explorer_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.explorer.selected.clone();
+        match id {
+            "tree.new-file" | "tree.new-folder" => {
+                let Some(parent) = self
+                    .explorer
+                    .target_directory()
+                    .or_else(|| self.workspace_roots.first().cloned())
+                else {
+                    self.set_status(tr("explorer.no_workspace"), cx);
+                    return;
+                };
+                let kind = if id == "tree.new-file" {
+                    NamePromptKind::NewFile
+                } else {
+                    NamePromptKind::NewFolder
+                };
+                self.start_name_prompt(kind, parent, None, String::new(), window, cx);
+            }
+            "tree.rename" => {
+                let Some(path) = selected else {
+                    self.set_status(tr("explorer.no_selection"), cx);
+                    return;
+                };
+                if self
+                    .workspace_roots
+                    .iter()
+                    .any(|root| util::same_path(root, &path))
+                {
+                    self.set_status(tr("explorer.cannot_rename_root"), cx);
+                    return;
                 }
-            } else {
-                let _ = weak_row;
-                let weak_open = weak.clone();
-                let path_open = path.clone();
-                out.push(
-                    div()
-                        .id(format!("explorer-file:{}", path.display()))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .pl(px(8.0 + depth as f32 * 12.0 + 12.0))
-                        .pr_2()
-                        .py_1()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(cx.theme().colors.secondary))
-                        .child(name)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak_open.update(cx, |this, cx| {
-                                this.open_path(&path_open, window, cx);
-                            });
-                        })
-                        .into_any_element(),
+                let Some(parent) = path.parent().map(Path::to_path_buf) else {
+                    return;
+                };
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.start_name_prompt(
+                    NamePromptKind::Rename,
+                    parent,
+                    Some(path),
+                    name,
+                    window,
+                    cx,
                 );
             }
+            "tree.delete" => {
+                let Some(path) = selected else {
+                    self.set_status(tr("explorer.no_selection"), cx);
+                    return;
+                };
+                self.request_delete_path(path, cx);
+            }
+            "tree.refresh" => self.refresh_workspace(cx),
+            "tree.copy-path" => {
+                let Some(path) = selected else {
+                    self.set_status(tr("explorer.no_selection"), cx);
+                    return;
+                };
+                self.copy_path(&path, cx);
+            }
+            "tree.reveal" => {
+                let Some(path) = selected else {
+                    self.set_status(tr("explorer.no_selection"), cx);
+                    return;
+                };
+                self.reveal_path(&path, cx);
+            }
+            _ => {}
         }
-        out
+    }
+
+    /// Keyboard handling for the focused symbol outline.
+    fn outline_key(
+        &mut self,
+        key: &str,
+        modifiers: gpui_kit::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if modifiers.control || modifiers.secondary() || modifiers.alt || modifiers.shift {
+            return false;
+        }
+        if !self.settings.show_outline
+            || !self.outline_focus.is_focused(window)
+            || self.palette.is_some()
+            || self.name_prompt.is_some()
+        {
+            return false;
+        }
+        let rows = self.outline.rows();
+        if rows.is_empty() {
+            return false;
+        }
+        let selected_position = self.outline_selected.and_then(|line| {
+            rows.iter()
+                .position(|row| self.outline.symbols[row.index].line == line)
+        });
+        match key {
+            "up" => {
+                let position = selected_position
+                    .map(|position| position.saturating_sub(1))
+                    .unwrap_or(rows.len() - 1);
+                self.outline_selected = Some(self.outline.symbols[rows[position].index].line);
+                cx.notify();
+                true
+            }
+            "down" => {
+                let position = selected_position
+                    .map(|position| (position + 1).min(rows.len() - 1))
+                    .unwrap_or(0);
+                self.outline_selected = Some(self.outline.symbols[rows[position].index].line);
+                cx.notify();
+                true
+            }
+            "left" | "right" => {
+                if let Some(position) = selected_position {
+                    let row = &rows[position];
+                    if row.has_children {
+                        let line = self.outline.symbols[row.index].line;
+                        let collapsed = self.outline.collapsed.contains(&line);
+                        if (key == "left" && !collapsed) || (key == "right" && collapsed) {
+                            self.outline.toggle(line);
+                            cx.notify();
+                        }
+                    }
+                }
+                true
+            }
+            "enter" | "space" => {
+                if let Some(line) = self.outline_selected {
+                    self.jump_to_line_in_tab(self.active, line, window, cx);
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Keyboard handling for the focused file tree. Returns whether the key
+    /// was consumed.
+    fn explorer_key(
+        &mut self,
+        key: &str,
+        modifiers: gpui_kit::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.settings.show_file_explorer
+            || !self.explorer_focus.is_focused(window)
+            || self.palette.is_some()
+            || self.confirm.is_some()
+            || self.name_prompt.is_some()
+        {
+            return false;
+        }
+        let rows = self.explorer.visible_rows(
+            self.workspace_index.as_ref(),
+            self.settings.show_hidden_files,
+        );
+        if rows.is_empty() {
+            return false;
+        }
+        let plain =
+            !modifiers.control && !modifiers.secondary() && !modifiers.alt && !modifiers.shift;
+        if !plain {
+            if key == "n"
+                && (modifiers.control || modifiers.secondary())
+                && !modifiers.shift
+                && !modifiers.alt
+            {
+                self.explorer_command("tree.new-file", window, cx);
+                return true;
+            }
+            return false;
+        }
+        let current = self.explorer.selected.as_ref().and_then(|selected| {
+            rows.iter()
+                .position(|row| util::same_path(&row.path, selected))
+        });
+        match key {
+            "up" => {
+                let next = current.map(|index| index.saturating_sub(1)).unwrap_or(0);
+                self.explorer.select(rows[next].path.clone());
+                cx.notify();
+                true
+            }
+            "down" => {
+                let next = current
+                    .map(|index| (index + 1).min(rows.len() - 1))
+                    .unwrap_or(0);
+                self.explorer.select(rows[next].path.clone());
+                cx.notify();
+                true
+            }
+            "left" => {
+                let Some(index) = current else { return false };
+                let row = &rows[index];
+                if row.is_dir && self.explorer.is_expanded(&row.path) {
+                    self.explorer.collapse(&row.path);
+                } else if let Some(parent) = row.path.parent() {
+                    self.explorer.select(parent.to_path_buf());
+                }
+                cx.notify();
+                true
+            }
+            "right" => {
+                let Some(index) = current else { return false };
+                let row = &rows[index];
+                if row.is_dir {
+                    self.explorer.expand(&row.path);
+                }
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let Some(index) = current else { return false };
+                let row = rows[index].clone();
+                if row.is_dir {
+                    self.explorer
+                        .toggle_directory(&row.path, self.settings.show_hidden_files);
+                } else {
+                    self.open_path(&row.path, window, cx);
+                }
+                cx.notify();
+                true
+            }
+            "f2" => {
+                self.explorer_command("tree.rename", window, cx);
+                true
+            }
+            "delete" => {
+                self.explorer_command("tree.delete", window, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn start_name_prompt(
+        &mut self,
+        kind: NamePromptKind,
+        parent: PathBuf,
+        original: Option<PathBuf>,
+        initial: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = NamePromptState::new(window, cx, kind, parent, original, initial);
+        self._subscriptions
+            .push(cx.subscribe(&prompt.input, |this, _, event, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.pending_name_confirm = true;
+                    cx.notify();
+                }
+            }));
+        self.name_prompt = Some(prompt);
+        cx.notify();
+    }
+
+    pub fn confirm_name_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.name_prompt.take() else {
+            return;
+        };
+        let name = prompt.input.read(cx).value().to_string();
+        let result = match prompt.kind {
+            NamePromptKind::NewFile => file_ops::create_file(&prompt.parent, &name).map(Some),
+            NamePromptKind::NewFolder => file_ops::create_dir(&prompt.parent, &name).map(|_| None),
+            NamePromptKind::Rename => {
+                let Some(original) = &prompt.original else {
+                    return;
+                };
+                let name = file_ops::validate_name(&name)
+                    .map_err(|error| luban_core::Error::Other(error.to_string()));
+                match name {
+                    Ok(name) => {
+                        let target = prompt.parent.join(name);
+                        file_ops::rename_path(original, &target).map(|_| Some(target))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match result {
+            Ok(created) => {
+                if let Some(path) = &created {
+                    if let Some(original) = prompt.original.as_deref() {
+                        self.rename_open_tabs(original, path);
+                        self.explorer.rename_path(original, path);
+                    } else {
+                        self.explorer.select(path.clone());
+                    }
+                }
+                if prompt.kind == NamePromptKind::NewFolder {
+                    self.explorer.expand(&prompt.parent);
+                }
+                if prompt.kind == NamePromptKind::Rename {
+                    self.explorer.expand(&prompt.parent);
+                }
+                self.refresh_workspace(cx);
+                match prompt.kind {
+                    NamePromptKind::NewFile => {
+                        if let Some(path) = created.clone() {
+                            self.open_path(&path, window, cx);
+                        }
+                        if let Some(path) = created {
+                            self.set_status(
+                                tr_args(
+                                    "explorer.created",
+                                    &[("name", path.display().to_string())],
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    NamePromptKind::NewFolder => {
+                        if let Some(path) = created {
+                            self.set_status(
+                                tr_args(
+                                    "explorer.created",
+                                    &[("name", path.display().to_string())],
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    NamePromptKind::Rename => {
+                        if let Some(path) = created {
+                            self.set_status(
+                                tr_args(
+                                    "explorer.renamed",
+                                    &[("name", path.display().to_string())],
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.name_prompt = Some(NamePromptState {
+                    error: Some(message.clone()),
+                    ..prompt
+                });
+                self.set_status(message, cx);
+            }
+        }
+    }
+
+    fn rename_open_tabs(&mut self, from: &Path, to: &Path) {
+        let mut changed = Vec::new();
+        for tab in &mut self.tabs {
+            if let Some(path) = &tab.doc.path {
+                if path == from {
+                    tab.doc.path = Some(to.to_path_buf());
+                    changed.push(to.to_path_buf());
+                } else if let Ok(suffix) = path.strip_prefix(from) {
+                    let new_path = to.join(suffix);
+                    tab.doc.path = Some(new_path.clone());
+                    changed.push(new_path);
+                }
+            }
+        }
+        if let Some(path) = self.find_in_files.results.iter().find_map(|matched| {
+            matched
+                .path
+                .strip_prefix(from)
+                .ok()
+                .map(|suffix| to.join(suffix))
+        }) {
+            let _ = path;
+        }
+        for path in changed {
+            self.settings.add_recent(path);
+        }
+        self.watch.remap(from, to);
+    }
+
+    pub fn request_delete_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self
+            .workspace_roots
+            .iter()
+            .any(|root| util::same_path(root, &path))
+        {
+            self.set_status(tr("explorer.cannot_delete_root"), cx);
+            return;
+        }
+        let has_open = self.tabs.iter().any(|tab| {
+            tab.doc
+                .path
+                .as_ref()
+                .is_some_and(|open| open.starts_with(&path))
+        });
+        let dirty = self.tabs.iter().any(|tab| {
+            tab.doc
+                .path
+                .as_ref()
+                .is_some_and(|open| open.starts_with(&path) && tab.doc.is_modified())
+        });
+        if dirty {
+            self.set_status(tr("explorer.delete_dirty"), cx);
+            return;
+        }
+        let _ = has_open;
+        self.confirm = Some(ConfirmState::new(
+            CloseIntent::DeletePath {
+                path: path.clone(),
+                permanent: false,
+            },
+            tr_args(
+                "explorer.delete_title",
+                &[("name", path.display().to_string())],
+            ),
+            tr("explorer.delete_detail"),
+        ));
+        cx.notify();
+    }
+
+    pub fn delete_path_now(
+        &mut self,
+        path: &Path,
+        permanent: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let result = if permanent {
+            file_ops::delete_permanently(path)
+        } else {
+            file_ops::delete_to_trash(path)
+        };
+        match result {
+            Ok(()) => {
+                let closing: Vec<u64> = self
+                    .tabs
+                    .iter()
+                    .filter(|tab| {
+                        tab.doc
+                            .path
+                            .as_ref()
+                            .is_some_and(|open| open.starts_with(path))
+                    })
+                    .map(|tab| tab.id)
+                    .collect();
+                for id in closing {
+                    self.close_tab_by_id_without_prompt(id, cx);
+                }
+                self.explorer.remove_path(path);
+                self.refresh_workspace(cx);
+                self.set_status(
+                    tr_args("explorer.deleted", &[("name", path.display().to_string())]),
+                    cx,
+                );
+                true
+            }
+            Err(error) => {
+                self.set_status(
+                    tr_args("explorer.delete_failed", &[("error", error.to_string())]),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    pub fn refresh_workspace(&mut self, cx: &mut Context<Self>) {
+        self.explorer.refresh();
+        self.rebuild_index(cx);
+        self.sync_file_watch(cx);
+        cx.notify();
+    }
+
+    fn copy_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        self.set_status(
+            tr_args(
+                "status.copied_path",
+                &[("path", path.display().to_string())],
+            ),
+            cx,
+        );
+    }
+
+    fn reveal_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if let Err(error) = util::reveal_file_command(path).spawn() {
+            self.set_status(
+                tr_args(
+                    "status.open_path_failed",
+                    &[("error", format!("{}: {error}", path.display()))],
+                ),
+                cx,
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -14079,9 +17984,17 @@ impl LubanApp {
         };
         let kind = overlay.kind;
         let state = overlay.state.clone();
+        let quick_rows = self.quick.rows.clone();
+        let quick_error = self.quick.error.clone();
+        let indexing = self.indexing;
+        let truncated = self
+            .workspace_index
+            .as_ref()
+            .is_some_and(|index| !index.truncated_roots.is_empty());
         let context = self.command_context();
         let weak_confirm = cx.weak_entity();
         let weak_cancel = cx.weak_entity();
+        let weak_query = cx.weak_entity();
         let mut command = Command::new(&state)
             .bordered(false)
             .placeholder(match kind {
@@ -14117,29 +18030,68 @@ impl LubanApp {
                 }
             }
             PaletteKind::QuickOpen => {
-                if let Some((tabs, files)) = &self.quick_open_rows {
-                    if !tabs.is_empty() {
-                        command = command.group(
-                            CommandGroup::new()
-                                .label(tr("command.quick_open.tabs"))
-                                .items(tabs.iter().map(|(_, label, detail)| {
-                                    CommandItem::new()
-                                        .label(label.clone())
-                                        .keywords([detail.clone()])
-                                })),
-                        );
-                    }
-                    if !files.is_empty() {
-                        command = command.group(
-                            CommandGroup::new()
-                                .label(tr("command.quick_open.recent"))
-                                .items(files.iter().map(|(_, label, detail)| {
-                                    CommandItem::new()
-                                        .label(label.clone())
-                                        .keywords([detail.clone()])
-                                })),
-                        );
-                    }
+                command = command
+                    .filterable(false)
+                    .on_query(move |query, _, cx| {
+                        let query = query.to_string();
+                        let _ = weak_query.update(cx, |this, cx| {
+                            this.set_quick_query(&query, cx);
+                        });
+                    })
+                    .footer(move |_, _, cx| {
+                        let hint = if indexing {
+                            tr("command.quick_open.indexing")
+                        } else if truncated {
+                            tr("command.quick_open.truncated")
+                        } else {
+                            tr("command.quick_open.hint")
+                        };
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(hint)
+                            .into_any_element()
+                    })
+                    .empty(move |_, _, cx| {
+                        let message = quick_error
+                            .clone()
+                            .unwrap_or_else(|| tr("command.quick_open.no_matches"));
+                        div()
+                            .px_3()
+                            .py_4()
+                            .text_sm()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(message)
+                            .into_any_element()
+                    });
+                if !quick_rows.is_empty() {
+                    let items = quick_rows.into_iter().map(|row| {
+                        let label = row.label.clone();
+                        let detail = row.detail.clone();
+                        CommandItem::new()
+                            .label(label.clone())
+                            .keywords([detail.clone()])
+                            .child(move |_, cx| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .w_full()
+                                    .child(div().truncate().text_sm().child(label.clone()))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(cx.theme().colors.muted_foreground)
+                                            .child(detail.clone()),
+                                    )
+                                    .into_any_element()
+                            })
+                    });
+                    command = command.group(CommandGroup::new().items(items));
                 }
             }
         }
@@ -14466,6 +18418,9 @@ impl LubanApp {
         if self.go_to_line.is_some() {
             overlays.push(self.render_go_to_line(window, cx));
         }
+        if self.name_prompt.is_some() {
+            overlays.push(self.render_name_prompt(window, cx));
+        }
         if self.language_picker.is_some() {
             overlays.push(self.render_language_picker(window, cx));
         }
@@ -14545,6 +18500,15 @@ impl LubanApp {
             CloseIntent::ReloadTab(_) => ("confirm.reload_save", "confirm.reload_discard"),
             CloseIntent::RestoreHistory => ("common.restore", "common.cancel"),
             CloseIntent::TrimTabs => ("confirm.save_close", "confirm.discard"),
+            CloseIntent::DeletePath {
+                permanent: false, ..
+            } => ("explorer.move_to_trash", "explorer.delete_permanently"),
+            CloseIntent::DeletePath {
+                permanent: true, ..
+            } => ("explorer.delete_permanently", "common.cancel"),
+            CloseIntent::ImportSettings => ("settings.import_confirm", "settings.keep"),
+            CloseIntent::ResetSettings => ("settings.reset_confirm", "settings.keep"),
+            CloseIntent::WorkspaceReplace => ("replace.confirm_button", "replace.keep"),
             _ if exit => ("confirm.save_exit", "confirm.discard_exit"),
             _ => ("confirm.save_close", "confirm.discard"),
         };
@@ -14553,6 +18517,20 @@ impl LubanApp {
             CloseIntent::OverwriteExternal(_)
                 | CloseIntent::SaveConflict(_)
                 | CloseIntent::RestoreHistory
+                | CloseIntent::ImportSettings
+                | CloseIntent::ResetSettings
+                | CloseIntent::WorkspaceReplace
+                | CloseIntent::DeletePath {
+                    permanent: false,
+                    ..
+                }
+        );
+        let primary_is_danger = matches!(
+            confirm.intent,
+            CloseIntent::DeletePath {
+                permanent: true,
+                ..
+            }
         );
         let weak_save = cx.weak_entity();
         let weak_discard = cx.weak_entity();
@@ -14599,19 +18577,84 @@ impl LubanApp {
                             button
                         }
                     })
-                    .child(
-                        Button::new("confirm-save")
-                            .label(tr(save_key))
-                            .primary()
-                            .on_click(move |_, window, cx| {
+                    .child({
+                        let button = Button::new("confirm-save").label(tr(save_key)).on_click(
+                            move |_, window, cx| {
                                 let _ =
                                     weak_save.update(cx, |this, cx| this.confirm_save(window, cx));
-                            }),
-                    ),
+                            },
+                        );
+                        if primary_is_danger {
+                            button.danger()
+                        } else {
+                            button.primary()
+                        }
+                    }),
             )
             .into_any_element();
         let _ = window;
         self.overlay_card(460.0, None, cx, content)
+    }
+
+    fn render_name_prompt(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(prompt) = &self.name_prompt else {
+            return div().into_any_element();
+        };
+        let input = prompt.input.clone();
+        let title = tr(prompt.kind.title_key());
+        let action = tr(prompt.kind.action_key());
+        let error = prompt.error.clone();
+        let weak_confirm = cx.weak_entity();
+        let weak_cancel = cx.weak_entity();
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(Input::new(&input).h(px(30.)))
+            .when(error.is_some(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error.clone().unwrap_or_default()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("name-prompt-cancel")
+                            .label(tr("common.cancel"))
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_cancel.update(cx, |this, cx| {
+                                    this.name_prompt = None;
+                                    this.focus_editor = true;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("name-prompt-confirm")
+                            .label(action)
+                            .primary()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_confirm.update(cx, |this, cx| {
+                                    this.confirm_name_prompt(window, cx);
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element();
+        self.overlay_card(480.0, None, cx, content)
     }
 
     fn render_go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -14764,56 +18807,301 @@ impl LubanApp {
         let query = self.find_in_files.query.clone();
         let folder = self.find_in_files.folder.clone();
         let masks = self.find_in_files.masks.clone();
+        let include = self.find_in_files.include.clone();
+        let exclude = self.find_in_files.exclude.clone();
+        let replacement = self.find_in_files.replacement.clone();
+        let show_replace = self.find_in_files.show_replace;
+        let workspace = self.find_in_files.workspace;
+        let has_workspace = !self.workspace_roots.is_empty();
+        let respect_gitignore = self.find_in_files.respect_gitignore;
         let status = self.find_in_files.status.clone();
+        let error = self.find_in_files.error.clone();
         let running = self.find_in_files.running;
-        let results = self.find_in_files.results.clone();
+        let total_groups = self.find_in_files.groups.len();
+        let groups: Vec<crate::find::FileGroup> = self
+            .find_in_files
+            .groups
+            .iter()
+            .take(200)
+            .cloned()
+            .collect();
+        let collapsed = self.find_in_files.collapsed.clone();
+        let count = self.find_in_files.results.len();
         let weak_search = weak.clone();
         let weak_cancel = weak.clone();
         let weak_close = weak.clone();
+        let weak_settings_filter = weak.clone();
+        let weak_toggle_group = weak.clone();
         let weak_result = weak.clone();
-        let count = results.len();
+        let weak_preview = weak.clone();
+        let weak_replace = weak.clone();
+        let weak_undo = weak.clone();
+        let has_undo = self.replace_state.undo.is_some();
+        let replacing = self.replace_state.running;
+        self.invalidate_stale_preview(cx);
+        let replace_preview = self.replace_state.preview.clone();
         let mut result_rows = Vec::new();
-        for (index, matched) in results.iter().take(2000).enumerate() {
-            let matched = matched.clone();
-            let weak_row = weak_result.clone();
+        for (group_index, group) in groups.iter().enumerate() {
+            let is_collapsed = collapsed.contains(&group.path);
+            let weak_group = weak_toggle_group.clone();
+            let group_path = group.path.clone();
+            let group_relative = group.relative.clone();
+            let group_count = group.matches.len();
             result_rows.push(
                 div()
-                    .id(format!("ff-result:{index}"))
+                    .id(format!("ff-group:{group_index}"))
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_center()
+                    .gap_2()
                     .px_3()
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().colors.border)
                     .cursor_pointer()
                     .hover(|this| this.bg(cx.theme().colors.secondary))
+                    .child(if is_collapsed { "▸" } else { "▾" })
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(group_relative),
+                    )
+                    .child(
+                        div()
                             .text_xs()
                             .text_color(cx.theme().colors.muted_foreground)
-                            .child(format!(
-                                "{}:{}:{}",
-                                matched.path.display(),
-                                matched.line,
-                                matched.column
-                            )),
+                            .child(group_count.to_string()),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(textutil::preview(&matched.line_text, 300)),
-                    )
-                    .on_click(move |_, window, cx| {
-                        let _ = weak_row.update(cx, |this, cx| {
-                            this.open_file_match(matched.clone(), window, cx);
+                    .on_click(move |_, _, cx| {
+                        let path = group_path.clone();
+                        let _ = weak_group.update(cx, |this, cx| {
+                            this.find_in_files.toggle_group(&path);
+                            cx.notify();
                         });
                     })
                     .into_any_element(),
             );
+            if is_collapsed {
+                continue;
+            }
+            for (match_index, matched) in group.matches.iter().take(200).enumerate() {
+                let matched = matched.clone();
+                let weak_row = weak_result.clone();
+                result_rows.push(
+                    div()
+                        .id(format!("ff-result:{group_index}:{match_index}"))
+                        .flex()
+                        .flex_col()
+                        .gap_0()
+                        .pl(px(28.))
+                        .pr_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|this| this.bg(cx.theme().colors.secondary))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(format!("{}:{}", matched.line, matched.column)),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(textutil::preview(&matched.line_text, 300)),
+                        )
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_row.update(cx, |this, cx| {
+                                this.open_file_match(matched.clone(), window, cx);
+                            });
+                        })
+                        .into_any_element(),
+                );
+            }
+            if group.matches.len() > 200 {
+                result_rows.push(
+                    div()
+                        .pl(px(28.))
+                        .py_1()
+                        .text_xs()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(tr_args(
+                            "ff.more_matches",
+                            &[("count", (group.matches.len() - 200).to_string())],
+                        ))
+                        .into_any_element(),
+                );
+            }
+        }
+        if total_groups > groups.len() {
+            result_rows.push(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(tr_args(
+                        "ff.more_files",
+                        &[("count", (total_groups - groups.len()).to_string())],
+                    ))
+                    .into_any_element(),
+            );
+        }
+        let mut options = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .flex_wrap()
+            .child(
+                Checkbox::new("ff-workspace")
+                    .label(tr("ff.workspace"))
+                    .checked(workspace && has_workspace)
+                    .disabled(!has_workspace)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        this.find_in_files.workspace = *checked;
+                        if *checked {
+                            this.find_in_files.open_documents = false;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Checkbox::new("ff-gitignore")
+                    .label(tr("ff.respect_gitignore"))
+                    .checked(respect_gitignore)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        this.find_in_files.respect_gitignore = *checked;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("ff-use-settings")
+                    .label(tr("ff.use_workspace_filter"))
+                    .compact()
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_settings_filter.update(cx, |this, cx| {
+                            let include = this.settings.search_include.clone();
+                            let exclude = this.settings.search_exclude.clone();
+                            this.find_in_files
+                                .use_settings_filter(&include, &exclude, window, cx);
+                        });
+                    }),
+            );
+        for (id, label_key, checked, field) in [
+            (
+                "ff-case",
+                "ff.match_case",
+                self.find_in_files.match_case,
+                0u8,
+            ),
+            ("ff-word", "ff.whole_word", self.find_in_files.whole_word, 1),
+            ("ff-regex", "ff.regex", self.find_in_files.regex, 2),
+            (
+                "ff-enhanced-regex",
+                "ff.enhanced_regex",
+                self.find_in_files.enhanced_regex,
+                3,
+            ),
+            (
+                "ff-open-docs",
+                "ff.open_documents",
+                self.find_in_files.open_documents,
+                4,
+            ),
+        ] {
+            options = options.child(
+                Checkbox::new(id)
+                    .label(tr(label_key))
+                    .checked(checked)
+                    .on_click(cx.listener(move |this, checked, _, cx| {
+                        match field {
+                            0 => this.find_in_files.match_case = *checked,
+                            1 => this.find_in_files.whole_word = *checked,
+                            2 => this.find_in_files.regex = *checked,
+                            3 => this.find_in_files.enhanced_regex = *checked,
+                            _ => {
+                                this.find_in_files.open_documents = *checked;
+                                if *checked {
+                                    this.find_in_files.workspace = false;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        options = options
+            .child(
+                Button::new("ff-search")
+                    .label(tr(if running { "ff.searching" } else { "ff.search" }))
+                    .primary()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_search.update(cx, |this, cx| this.start_find_in_files(cx));
+                    }),
+            )
+            .child(
+                Button::new("ff-cancel")
+                    .label(tr("common.cancel"))
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_cancel.update(cx, |this, cx| this.cancel_find_in_files(cx));
+                    }),
+            );
+        let mut replace_row = div().flex().items_center().gap_2();
+        replace_row = replace_row
+            .child(Input::new(&replacement).h(px(30.)))
+            .child(
+                Button::new("ff-toggle-replace")
+                    .label(tr(if show_replace {
+                        "ff.hide_replace"
+                    } else {
+                        "ff.show_replace"
+                    }))
+                    .compact()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.find_in_files.show_replace = !this.find_in_files.show_replace;
+                        cx.notify();
+                    })),
+            );
+        if show_replace {
+            replace_row = replace_row
+                .child(
+                    Button::new("ff-preview")
+                        .label(tr("ff.preview_replace"))
+                        .compact()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_preview.update(cx, |this, cx| {
+                                this.start_workspace_replace_preview(window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("ff-replace-all")
+                        .label(tr("ff.replace_all"))
+                        .compact()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_replace.update(cx, |this, cx| {
+                                this.confirm_workspace_replace(window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("ff-undo-replace")
+                        .label(tr("ff.undo_replace"))
+                        .compact()
+                        .disabled(!has_undo || replacing)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_undo.update(cx, |this, cx| {
+                                this.undo_workspace_replace(window, cx);
+                            });
+                        }),
+                );
         }
         let content = div()
             .flex()
@@ -14850,6 +19138,14 @@ impl LubanApp {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(div().flex_1().child(Input::new(&include).h(px(30.))))
+                    .child(div().flex_1().child(Input::new(&exclude).h(px(30.)))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .child(div().flex_1().child(Input::new(&folder).h(px(30.))))
                     .child(
                         Button::new("ff-browse")
@@ -14861,76 +19157,16 @@ impl LubanApp {
                     ),
             )
             .child(Input::new(&masks).h(px(30.)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        Checkbox::new("ff-case")
-                            .label(tr("ff.match_case"))
-                            .checked(self.find_in_files.match_case)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find_in_files.match_case = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("ff-word")
-                            .label(tr("ff.whole_word"))
-                            .checked(self.find_in_files.whole_word)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find_in_files.whole_word = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("ff-regex")
-                            .label(tr("ff.regex"))
-                            .checked(self.find_in_files.regex)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find_in_files.regex = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("ff-enhanced-regex")
-                            .label(tr("ff.enhanced_regex"))
-                            .checked(self.find_in_files.enhanced_regex)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find_in_files.enhanced_regex = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("ff-open-docs")
-                            .label(tr("ff.open_documents"))
-                            .checked(self.find_in_files.open_documents)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find_in_files.open_documents = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("ff-search")
-                            .label(tr(if running { "ff.searching" } else { "ff.search" }))
-                            .primary()
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ =
-                                    weak_search.update(cx, |this, cx| this.start_find_in_files(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("ff-cancel")
-                            .label(tr("common.cancel"))
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_cancel
-                                    .update(cx, |this, cx| this.cancel_find_in_files(cx));
-                            }),
-                    ),
-            )
+            .child(options)
+            .child(replace_row)
+            .when(error.is_some(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error.clone().unwrap_or_default()),
+                )
+            })
             .child(
                 div()
                     .text_xs()
@@ -14945,6 +19181,61 @@ impl LubanApp {
                         status
                     }),
             )
+            .when_some(replace_preview, |this, preview| {
+                let mut rows = Vec::new();
+                for file in preview.files.iter().take(40) {
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{}  ({} →)", file.relative, file.matches)),
+                            )
+                            .children(file.samples.iter().map(|(before, after)| {
+                                div()
+                                    .pl(px(12.))
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(format!("{before} → {after}"))
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                for skipped in preview.skipped.iter().take(20) {
+                    rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().colors.warning)
+                            .child(format!("{}: {}", skipped.path.display(), skipped.reason))
+                            .into_any_element(),
+                    );
+                }
+                this.child(
+                    div()
+                        .id("replace-preview")
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .border_1()
+                        .border_color(cx.theme().colors.border)
+                        .rounded_sm()
+                        .p_2()
+                        .child(tr_args(
+                            "replace.preview_summary",
+                            &[
+                                ("files", preview.file_count().to_string()),
+                                ("matches", preview.total_matches.to_string()),
+                                ("skipped", preview.skipped.len().to_string()),
+                            ],
+                        ))
+                        .children(rows),
+                )
+            })
             .child(
                 div()
                     .id("ff-results")
@@ -14957,7 +19248,7 @@ impl LubanApp {
             )
             .into_any_element();
         let _ = window;
-        self.overlay_card(820.0, Some(600.0), cx, content)
+        self.overlay_card(860.0, Some(640.0), cx, content)
     }
 
     fn render_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -15108,6 +19399,15 @@ impl LubanApp {
         self.overlay_card(520.0, Some(560.0), cx, content)
     }
 
+    fn close_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preferences.open = false;
+        self.preferences.font_picker = None;
+        let search = self.preferences.search.clone();
+        search.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        self.focus_editor(window, cx);
+        cx.notify();
+    }
+
     fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.open = true;
         let value = self
@@ -15152,6 +19452,10 @@ impl LubanApp {
     fn render_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         let settings = self.settings.clone();
+        let search_input = self.preferences.search.clone();
+        let search_query = search_input.read(cx).value().to_string();
+        let visible = settings_search::visible_group_keys(&search_query);
+        let no_matches = !settings_search::has_matches(&search_query);
         let weak_theme_light = cx.weak_entity();
         let weak_theme_dark = cx.weak_entity();
         let weak_close = cx.weak_entity();
@@ -15243,13 +19547,17 @@ impl LubanApp {
                             .compact()
                             .on_click(move |_, window, cx| {
                                 let _ = weak_close.update(cx, |this, cx| {
-                                    this.preferences.open = false;
-                                    this.preferences.font_picker = None;
-                                    this.focus_editor(window, cx);
-                                    cx.notify();
+                                    this.close_preferences(window, cx);
                                 });
                             }),
                     ),
+            )
+            .child(
+                div().px_5().pb_2().child(
+                    Input::new(&search_input)
+                        .h(px(30.))
+                        .aria_label(tr("prefs.search_placeholder")),
+                ),
             )
             .child(
                 div()
@@ -15262,663 +19570,1080 @@ impl LubanApp {
                     .overflow_y_scrollbar()
                     .px_5()
                     .pb_5()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
+                    .when(no_matches, |this| {
+                        this.child(
+                            div()
+                                .py_4()
+                                .text_sm()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(tr("prefs.no_matches")),
+                        )
+                    })
+                    .when(visible.contains("language"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div().w(px(140.)).text_sm().child(tr("prefs.language")),
+                                        )
+                                        .child(language_system)
+                                        .child(language_en)
+                                        .child(language_zh),
+                                )
+                                .when(settings.ui_language == "system", |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().colors.muted_foreground)
+                                            .child(tr_args(
+                                                "prefs.language_current",
+                                                &[("language", active_language_name().to_string())],
+                                            )),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(visible.contains("appearance"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().w(px(140.)).text_sm().child(tr("prefs.theme")))
+                                .child(
+                                    Button::new("prefs-light")
+                                        .label(tr("prefs.light"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = weak_theme_light.update(cx, |this, cx| {
+                                                this.settings.theme = ThemeChoice::Light;
+                                                this.apply_settings(window, cx);
+                                            });
+                                        }),
+                                )
+                                .child(Button::new("prefs-dark").label(tr("prefs.dark")).on_click(
+                                    move |_, window, cx| {
+                                        let _ = weak_theme_dark.update(cx, |this, cx| {
+                                            this.settings.theme = ThemeChoice::Dark;
+                                            this.apply_settings(window, cx);
+                                        });
+                                    },
+                                ))
+                                .child(
+                                    Button::new("prefs-system")
+                                        .label(tr("prefs.system_theme"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = weak_theme_system.update(cx, |this, cx| {
+                                                this.settings.theme = ThemeChoice::System;
+                                                this.apply_settings(window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                    })
+                    .when(visible.contains("appearance"), |this| {
+                        this.child({
+                            let syntax_label = if settings.syntax_theme == "custom" {
+                                settings
+                                    .syntax_theme_path
+                                    .as_ref()
+                                    .and_then(|path| path.file_stem())
+                                    .map(|stem| stem.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| tr("prefs.syntax_custom"))
+                            } else if settings.syntax_theme == "default"
+                                || settings.syntax_theme.is_empty()
+                            {
+                                tr("prefs.syntax_default")
+                            } else {
+                                THEME_OPTIONS
+                                    .iter()
+                                    .find(|option| option.id == settings.syntax_theme)
+                                    .map(|option| option.label.to_string())
+                                    .unwrap_or_else(|| settings.syntax_theme.clone())
+                            };
+                            let weak_theme = weak.clone();
+                            let weak_import = weak.clone();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().w(px(140.)).text_sm().child(tr("prefs.syntax_theme")))
+                                .child(
+                                    Button::new("prefs-syntax-theme")
+                                        .label(syntax_label)
+                                        .dropdown_menu(move |mut menu, window, _cx| {
+                                            let weak_default = weak_theme.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(tr("prefs.syntax_default"))
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ =
+                                                            weak_default.update(cx, |this, cx| {
+                                                                this.set_syntax_theme(
+                                                                    "default", window, cx,
+                                                                );
+                                                            });
+                                                    }),
+                                            );
+                                            for option in THEME_OPTIONS {
+                                                let weak = weak_theme.clone();
+                                                let id = option.id;
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(option.label).on_click(
+                                                        move |_, window, cx| {
+                                                            let _ = weak.update(cx, |this, cx| {
+                                                                this.set_syntax_theme(
+                                                                    id, window, cx,
+                                                                );
+                                                            });
+                                                        },
+                                                    ),
+                                                );
+                                            }
+                                            Self::fit_menu(menu, window)
+                                        }),
+                                )
+                                .child(
+                                    Button::new("prefs-import-theme")
+                                        .label(tr("prefs.import_theme"))
+                                        .compact()
+                                        .on_click(move |_, window, cx| {
+                                            let _ = weak_import.update(cx, |this, cx| {
+                                                this.open_syntax_theme_dialog(window, cx);
+                                            });
+                                        }),
+                                )
+                        })
+                    })
+                    .when(visible.contains("font"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().w(px(140.)).text_sm().child(tr("prefs.font_size")))
+                                .child(
+                                    Button::new("prefs-font-minus")
+                                        .label("−")
+                                        .compact()
+                                        .on_click(move |_, _, cx| {
+                                            let _ = weak_zoom_out
+                                                .update(cx, |this, cx| this.zoom(-1.0, cx));
+                                        }),
+                                )
+                                .child(div().text_sm().child(tr_args(
+                                    "prefs.pixels",
+                                    &[("size", format!("{:.0}", settings.font_size))],
+                                )))
+                                .child(
+                                    Button::new("prefs-font-plus")
+                                        .label("+")
+                                        .compact()
+                                        .on_click(move |_, _, cx| {
+                                            let _ = weak_zoom_in
+                                                .update(cx, |this, cx| this.zoom(1.0, cx));
+                                        }),
+                                ),
+                        )
+                    })
+                    .when(visible.contains("font"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().w(px(140.)).text_sm().child(tr("prefs.font_family")))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(if settings.font_family.is_empty() {
+                                            tr("prefs.font_default")
+                                        } else {
+                                            settings.font_family.clone()
+                                        }),
+                                )
+                                .child(
+                                    Button::new("prefs-choose-font")
+                                        .label(tr("prefs.choose_font"))
+                                        .compact()
+                                        .on_click(move |_, window, cx| {
+                                            let _ = weak_font_picker.update(cx, |this, cx| {
+                                                this.open_font_picker(window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                    })
+                    .when(visible.contains("editor"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().w(px(140.)).text_sm().child(tr("prefs.tab_size")))
+                                .child(
+                                    Button::new("prefs-tab-minus")
+                                        .label("−")
+                                        .compact()
+                                        .on_click(move |_, window, cx| {
+                                            let _ = weak_tab_out.update(cx, |this, cx| {
+                                                this.settings.tab_size =
+                                                    this.settings.tab_size.saturating_sub(1).max(1);
+                                                this.apply_settings(window, cx);
+                                            });
+                                        }),
+                                )
+                                .child(div().text_sm().child(format!("{}", settings.tab_size)))
+                                .child(Button::new("prefs-tab-plus").label("+").compact().on_click(
+                                    move |_, window, cx| {
+                                        let _ = weak_tab_in.update(cx, |this, cx| {
+                                            this.settings.tab_size =
+                                                (this.settings.tab_size + 1).min(16);
+                                            this.apply_settings(window, cx);
+                                        });
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.insert_spaces"),
+                                    settings.use_spaces,
+                                    "prefs-spaces",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.use_spaces = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                )),
+                        )
+                    })
+                    .when(visible.contains("editor"), |this| {
+                        this.child({
+                            let language = self.preferences.language.clone();
+                            let overrides = self.language_override().cloned().unwrap_or_default();
+                            let weak_language = weak.clone();
+                            let weak_tab_apply = weak.clone();
+                            let weak_spaces_inherit = weak.clone();
+                            let weak_spaces_on = weak.clone();
+                            let weak_spaces_off = weak.clone();
+                            let weak_eol_inherit = weak.clone();
+                            let weak_eol_lf = weak.clone();
+                            let weak_eol_crlf = weak.clone();
+                            let weak_eol_cr = weak.clone();
+                            let tab_size_input = self.preferences.language_tab_size.clone();
+                            let selected_language = language.clone();
+                            let weak_language_menu = weak_language.clone();
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.per_language")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .w(px(140.))
+                                                .text_sm()
+                                                .child(tr("prefs.language_select")),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-select")
+                                                .label(language_display_name(&language))
+                                                .dropdown_menu(move |mut menu, window, _cx| {
+                                                    for name in language::names() {
+                                                        let selected =
+                                                            selected_language.as_str() == name;
+                                                        let name = name.to_string();
+                                                        let weak = weak_language_menu.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(
+                                                                language_display_name(&name),
+                                                            )
+                                                            .checked(selected)
+                                                            .on_click(move |_, window, cx| {
+                                                                let name = name.clone();
+                                                                let _ =
+                                                                    weak.update(cx, |this, cx| {
+                                                                        this.preferences.language =
+                                                                            name.clone();
+                                                                        let value = this
+                                                                            .settings
+                                                                            .tab_size_for(&name)
+                                                                            .to_string();
+                                                                        this.preferences
+                                                                            .language_tab_size
+                                                                            .update(
+                                                                                cx,
+                                                                                |input, cx| {
+                                                                                    input.set_value(
+                                                                                        value,
+                                                                                        window, cx,
+                                                                                    )
+                                                                                },
+                                                                            );
+                                                                        cx.notify();
+                                                                    });
+                                                            }),
+                                                        );
+                                                    }
+                                                    Self::fit_menu(menu, window)
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(140.))
+                                                .text_sm()
+                                                .child(tr("prefs.language_tab_size")),
+                                        )
+                                        .child(Input::new(&tab_size_input).w(px(60.)).h(px(28.)))
+                                        .child(
+                                            Button::new("prefs-language-tab-apply")
+                                                .label(tr("prefs.apply"))
+                                                .compact()
+                                                .on_click(move |_, _, cx| {
+                                                    let _ =
+                                                        weak_tab_apply.update(cx, |this, cx| {
+                                                            this.apply_language_tab_size(cx);
+                                                        });
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(140.))
+                                                .text_sm()
+                                                .child(tr("prefs.language_indent")),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-spaces-inherit")
+                                                .label(tr("prefs.inherit"))
+                                                .compact()
+                                                .when(overrides.use_spaces.is_none(), |button| {
+                                                    button.primary()
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = weak_spaces_inherit.update(
+                                                        cx,
+                                                        |this, cx| {
+                                                            this.set_language_use_spaces(None, cx);
+                                                        },
+                                                    );
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-spaces-on")
+                                                .label(tr("prefs.spaces"))
+                                                .compact()
+                                                .when(
+                                                    overrides.use_spaces == Some(true),
+                                                    |button| button.primary(),
+                                                )
+                                                .on_click(move |_, _, cx| {
+                                                    let _ =
+                                                        weak_spaces_on.update(cx, |this, cx| {
+                                                            this.set_language_use_spaces(
+                                                                Some(true),
+                                                                cx,
+                                                            );
+                                                        });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-spaces-off")
+                                                .label(tr("prefs.tabs"))
+                                                .compact()
+                                                .when(
+                                                    overrides.use_spaces == Some(false),
+                                                    |button| button.primary(),
+                                                )
+                                                .on_click(move |_, _, cx| {
+                                                    let _ =
+                                                        weak_spaces_off.update(cx, |this, cx| {
+                                                            this.set_language_use_spaces(
+                                                                Some(false),
+                                                                cx,
+                                                            );
+                                                        });
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(140.))
+                                                .text_sm()
+                                                .child(tr("prefs.language_eol")),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-eol-inherit")
+                                                .label(tr("prefs.inherit"))
+                                                .compact()
+                                                .when(overrides.eol.is_none(), |button| {
+                                                    button.primary()
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    let _ =
+                                                        weak_eol_inherit.update(cx, |this, cx| {
+                                                            this.set_language_eol(None, cx);
+                                                        });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-eol-lf")
+                                                .label("LF")
+                                                .compact()
+                                                .when(overrides.eol == Some(Eol::Lf), |button| {
+                                                    button.primary()
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = weak_eol_lf.update(cx, |this, cx| {
+                                                        this.set_language_eol(Some(Eol::Lf), cx);
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-eol-crlf")
+                                                .label("CRLF")
+                                                .compact()
+                                                .when(overrides.eol == Some(Eol::CrLf), |button| {
+                                                    button.primary()
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = weak_eol_crlf.update(cx, |this, cx| {
+                                                        this.set_language_eol(Some(Eol::CrLf), cx);
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-language-eol-cr")
+                                                .label("CR")
+                                                .compact()
+                                                .when(overrides.eol == Some(Eol::Cr), |button| {
+                                                    button.primary()
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = weak_eol_cr.update(cx, |this, cx| {
+                                                        this.set_language_eol(Some(Eol::Cr), cx);
+                                                    });
+                                                }),
+                                        ),
+                                )
+                        })
+                    })
+                    .when(visible.contains("editor"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.editor")),
+                                )
+                                .child(toggle_row(
+                                    tr("prefs.line_numbers"),
+                                    settings.show_line_numbers,
+                                    "prefs-linenumbers",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_line_numbers = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.word_wrap"),
+                                    settings.word_wrap,
+                                    "prefs-wrap",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.word_wrap = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.match_brackets"),
+                                    settings.highlight_matching_brackets,
+                                    "prefs-brackets",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.highlight_matching_brackets = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.trim_on_save"),
+                                    settings.trim_trailing_whitespace_on_save,
+                                    "prefs-trim",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.trim_trailing_whitespace_on_save = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                )),
+                        )
+                    })
+                    .when(visible.contains("session"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.session")),
+                                )
+                                .child(toggle_row(
+                                    tr("prefs.restore_session"),
+                                    settings.restore_session,
+                                    "prefs-restore",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.restore_session = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.autosave"),
+                                    settings.autosave_session,
+                                    "prefs-autosave",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.autosave_session = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.hidden_files"),
+                                    settings.show_hidden_files,
+                                    "prefs-hidden",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_hidden_files = checked;
+                                        this.explorer.refresh();
+                                        this.apply_settings(window, cx);
+                                    },
+                                )),
+                        )
+                    })
+                    .when(
+                        visible.contains("history") || visible.contains("keybindings"),
+                        |this| {
+                            this.child(
                                 div()
                                     .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(div().w(px(140.)).text_sm().child(tr("prefs.language")))
-                                    .child(language_system)
-                                    .child(language_en)
-                                    .child(language_zh),
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(tr("prefs.local_history")),
+                                    )
+                                    .child(toggle_row(
+                                        tr("prefs.local_history_enabled"),
+                                        settings.local_history_enabled,
+                                        "prefs-history-enabled",
+                                        weak.clone(),
+                                        |this, checked, window, cx| {
+                                            this.settings.local_history_enabled = checked;
+                                            this.apply_settings(window, cx);
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(140.))
+                                                    .text_sm()
+                                                    .child(tr("prefs.local_history_days")),
+                                            )
+                                            .child(
+                                                Button::new("prefs-history-days-down")
+                                                    .label("−")
+                                                    .compact()
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = weak_days_down.update(
+                                                            cx,
+                                                            |this, cx| {
+                                                                this.settings.local_history_days =
+                                                                    this.settings
+                                                                        .local_history_days
+                                                                        .saturating_sub(1)
+                                                                        .max(1);
+                                                                this.apply_settings(window, cx);
+                                                            },
+                                                        );
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .child(settings.local_history_days.to_string()),
+                                            )
+                                            .child(
+                                                Button::new("prefs-history-days-up")
+                                                    .label("+")
+                                                    .compact()
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ =
+                                                            weak_days_up.update(cx, |this, cx| {
+                                                                this.settings.local_history_days =
+                                                                    (this
+                                                                        .settings
+                                                                        .local_history_days
+                                                                        + 1)
+                                                                    .min(3650);
+                                                                this.apply_settings(window, cx);
+                                                            });
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(140.))
+                                                    .text_sm()
+                                                    .child(tr("prefs.local_history_size")),
+                                            )
+                                            .child(
+                                                Button::new("prefs-history-mb-down")
+                                                    .label("−")
+                                                    .compact()
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ =
+                                                            weak_mb_down.update(cx, |this, cx| {
+                                                                this.settings
+                                                                    .local_history_max_mb = this
+                                                                    .settings
+                                                                    .local_history_max_mb
+                                                                    .saturating_sub(1)
+                                                                    .max(1);
+                                                                this.apply_settings(window, cx);
+                                                            });
+                                                    }),
+                                            )
+                                            .child(
+                                                div().text_sm().child(
+                                                    settings.local_history_max_mb.to_string(),
+                                                ),
+                                            )
+                                            .child(
+                                                Button::new("prefs-history-mb-up")
+                                                    .label("+")
+                                                    .compact()
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ =
+                                                            weak_mb_up.update(cx, |this, cx| {
+                                                                this.settings
+                                                                    .local_history_max_mb = (this
+                                                                    .settings
+                                                                    .local_history_max_mb
+                                                                    + 1)
+                                                                .min(4096);
+                                                                this.apply_settings(window, cx);
+                                                            });
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("prefs-shortcuts")
+                                            .label(tr("shortcuts.customize"))
+                                            .compact()
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak_shortcuts.update(cx, |this, cx| {
+                                                    this.open_shortcut_editor(cx);
+                                                });
+                                            }),
+                                    ),
                             )
-                            .when(settings.ui_language == "system", |this| {
-                                this.child(
+                        },
+                    )
+                    .when(visible.contains("view"), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.view")),
+                                )
+                                .child(toggle_row(
+                                    tr("view.whitespace"),
+                                    settings.show_whitespace,
+                                    "prefs-whitespace",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_whitespace = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("view.indent_guides"),
+                                    settings.show_indent_guides,
+                                    "prefs-indent-guides",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_indent_guides = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("view.ruler"),
+                                    settings.show_ruler,
+                                    "prefs-ruler",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_ruler = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("view.document_map"),
+                                    settings.show_document_map,
+                                    "prefs-document-map",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_document_map = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("view.bracket_colors"),
+                                    settings.bracket_colors,
+                                    "prefs-bracket-colors",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.bracket_colors = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("view.outline"),
+                                    settings.show_outline,
+                                    "prefs-outline",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_outline = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("view.breadcrumbs"),
+                                    settings.show_breadcrumbs,
+                                    "prefs-breadcrumbs",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_breadcrumbs = checked;
+                                        this.apply_settings(window, cx);
+                                    },
+                                )),
+                        )
+                    })
+                    .when(visible.contains("workspace"), |this| {
+                        let weak_open = weak.clone();
+                        let weak_save = weak.clone();
+                        let weak_save_as = weak.clone();
+                        let weak_add = weak.clone();
+                        let weak_close_workspace = weak.clone();
+                        let roots = if self.workspace_roots.is_empty() {
+                            tr("workspace.none")
+                        } else {
+                            self.workspace_roots
+                                .iter()
+                                .map(|root| root.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        let name = if self.workspace_name.is_empty() {
+                            tr("workspace.none")
+                        } else {
+                            self.workspace_name.clone()
+                        };
+                        let file = self
+                            .workspace_file
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| tr("workspace.memory_only"));
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.workspace")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .text_xs()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(tr_args("prefs.workspace_name", &[("name", name)]))
+                                        .child(tr_args("prefs.workspace_file", &[("path", file)])),
+                                )
+                                .child(
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().colors.muted_foreground)
-                                        .child(tr_args(
-                                            "prefs.language_current",
-                                            &[("language", active_language_name().to_string())],
-                                        )),
+                                        .child(roots),
                                 )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(140.)).text_sm().child(tr("prefs.theme")))
-                            .child(
-                                Button::new("prefs-light")
-                                    .label(tr("prefs.light"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = weak_theme_light.update(cx, |this, cx| {
-                                            this.settings.theme = ThemeChoice::Light;
-                                            this.apply_settings(window, cx);
-                                        });
-                                    }),
-                            )
-                            .child(Button::new("prefs-dark").label(tr("prefs.dark")).on_click(
-                                move |_, window, cx| {
-                                    let _ = weak_theme_dark.update(cx, |this, cx| {
-                                        this.settings.theme = ThemeChoice::Dark;
-                                        this.apply_settings(window, cx);
-                                    });
-                                },
-                            ))
-                            .child(
-                                Button::new("prefs-system")
-                                    .label(tr("prefs.system_theme"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = weak_theme_system.update(cx, |this, cx| {
-                                            this.settings.theme = ThemeChoice::System;
-                                            this.apply_settings(window, cx);
-                                        });
-                                    }),
-                            ),
-                    )
-                    .child({
-                        let syntax_label = if settings.syntax_theme == "custom" {
-                            settings
-                                .syntax_theme_path
-                                .as_ref()
-                                .and_then(|path| path.file_stem())
-                                .map(|stem| stem.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| tr("prefs.syntax_custom"))
-                        } else if settings.syntax_theme == "default"
-                            || settings.syntax_theme.is_empty()
-                        {
-                            tr("prefs.syntax_default")
-                        } else {
-                            THEME_OPTIONS
-                                .iter()
-                                .find(|option| option.id == settings.syntax_theme)
-                                .map(|option| option.label.to_string())
-                                .unwrap_or_else(|| settings.syntax_theme.clone())
-                        };
-                        let weak_theme = weak.clone();
-                        let weak_import = weak.clone();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(140.)).text_sm().child(tr("prefs.syntax_theme")))
-                            .child(
-                                Button::new("prefs-syntax-theme")
-                                    .label(syntax_label)
-                                    .dropdown_menu(move |mut menu, window, _cx| {
-                                        let weak_default = weak_theme.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(tr("prefs.syntax_default"))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .flex_wrap()
+                                        .child(
+                                            Button::new("prefs-workspace-open")
+                                                .label(tr("workspace.open"))
+                                                .compact()
                                                 .on_click(move |_, window, cx| {
-                                                    let _ = weak_default.update(cx, |this, cx| {
-                                                        this.set_syntax_theme(
-                                                            "default", window, cx,
+                                                    let _ = weak_open.update(cx, |this, cx| {
+                                                        this.open_workspace_dialog(window, cx);
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-workspace-save")
+                                                .label(tr("workspace.save"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_save.update(cx, |this, cx| {
+                                                        this.save_workspace(window, cx);
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-workspace-save-as")
+                                                .label(tr("workspace.save_as"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_save_as.update(cx, |this, cx| {
+                                                        this.save_workspace_as(window, cx);
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-workspace-add")
+                                                .label(tr("workspace.add_folder"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_add.update(cx, |this, cx| {
+                                                        this.open_add_folder_dialog(window, cx);
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-workspace-close")
+                                                .label(tr("workspace.close"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_close_workspace.update(
+                                                        cx,
+                                                        |this, cx| {
+                                                            this.close_workspace(window, cx);
+                                                        },
+                                                    );
+                                                }),
+                                        ),
+                                )
+                                .child(toggle_row(
+                                    tr("ff.respect_gitignore"),
+                                    settings.respect_gitignore,
+                                    "prefs-respect-gitignore",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.respect_gitignore = checked;
+                                        this.find_in_files.respect_gitignore = checked;
+                                        this.apply_settings(window, cx);
+                                        this.rebuild_index(cx);
+                                        if this.find_in_files.open && this.find_in_files.workspace {
+                                            this.start_find_in_files(cx);
+                                        }
+                                    },
+                                ))
+                                .child(toggle_row(
+                                    tr("prefs.hidden_files"),
+                                    settings.show_hidden_files,
+                                    "prefs-workspace-hidden",
+                                    weak.clone(),
+                                    |this, checked, window, cx| {
+                                        this.settings.show_hidden_files = checked;
+                                        this.apply_settings(window, cx);
+                                        this.rebuild_index(cx);
+                                    },
+                                )),
+                        )
+                    })
+                    .when(visible.contains("files"), |this| {
+                        let weak_limit_down = weak.clone();
+                        let weak_limit_up = weak.clone();
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.files")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .w(px(200.))
+                                                .text_sm()
+                                                .child(tr("prefs.max_file_size")),
+                                        )
+                                        .child(
+                                            Button::new("prefs-max-size-down")
+                                                .label("−")
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ =
+                                                        weak_limit_down.update(cx, |this, cx| {
+                                                            this.settings.max_file_size_mb = this
+                                                                .settings
+                                                                .max_file_size_mb
+                                                                .saturating_sub(64)
+                                                                .max(1);
+                                                            this.apply_settings(window, cx);
+                                                        });
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .child(format!("{} MB", settings.max_file_size_mb)),
+                                        )
+                                        .child(
+                                            Button::new("prefs-max-size-up")
+                                                .label("+")
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_limit_up.update(cx, |this, cx| {
+                                                        this.settings.max_file_size_mb =
+                                                            (this.settings.max_file_size_mb + 64)
+                                                                .min(4096);
+                                                        this.apply_settings(window, cx);
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(visible.contains("backup"), |this| {
+                        let weak_export = weak.clone();
+                        let weak_import = weak.clone();
+                        let weak_reset = weak.clone();
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.import_export")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("prefs-export-settings")
+                                                .label(tr("settings.export"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_export.update(cx, |this, cx| {
+                                                        this.open_export_settings_dialog(
+                                                            window, cx,
                                                         );
                                                     });
                                                 }),
-                                        );
-                                        for option in THEME_OPTIONS {
-                                            let weak = weak_theme.clone();
-                                            let id = option.id;
-                                            menu = menu.item(
-                                                PopupMenuItem::new(option.label).on_click(
-                                                    move |_, window, cx| {
-                                                        let _ = weak.update(cx, |this, cx| {
-                                                            this.set_syntax_theme(id, window, cx);
-                                                        });
-                                                    },
-                                                ),
-                                            );
-                                        }
-                                        Self::fit_menu(menu, window)
-                                    }),
-                            )
-                            .child(
-                                Button::new("prefs-import-theme")
-                                    .label(tr("prefs.import_theme"))
-                                    .compact()
-                                    .on_click(move |_, window, cx| {
-                                        let _ = weak_import.update(cx, |this, cx| {
-                                            this.open_syntax_theme_dialog(window, cx);
-                                        });
-                                    }),
-                            )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(140.)).text_sm().child(tr("prefs.font_size")))
-                            .child(
-                                Button::new("prefs-font-minus")
-                                    .label("−")
-                                    .compact()
-                                    .on_click(move |_, _, cx| {
-                                        let _ = weak_zoom_out
-                                            .update(cx, |this, cx| this.zoom(-1.0, cx));
-                                    }),
-                            )
-                            .child(div().text_sm().child(tr_args(
-                                "prefs.pixels",
-                                &[("size", format!("{:.0}", settings.font_size))],
-                            )))
-                            .child(
-                                Button::new("prefs-font-plus")
-                                    .label("+")
-                                    .compact()
-                                    .on_click(move |_, _, cx| {
-                                        let _ =
-                                            weak_zoom_in.update(cx, |this, cx| this.zoom(1.0, cx));
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(140.)).text_sm().child(tr("prefs.font_family")))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(if settings.font_family.is_empty() {
-                                        tr("prefs.font_default")
-                                    } else {
-                                        settings.font_family.clone()
-                                    }),
-                            )
-                            .child(
-                                Button::new("prefs-choose-font")
-                                    .label(tr("prefs.choose_font"))
-                                    .compact()
-                                    .on_click(move |_, window, cx| {
-                                        let _ = weak_font_picker.update(cx, |this, cx| {
-                                            this.open_font_picker(window, cx);
-                                        });
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().w(px(140.)).text_sm().child(tr("prefs.tab_size")))
-                            .child(
-                                Button::new("prefs-tab-minus")
-                                    .label("−")
-                                    .compact()
-                                    .on_click(move |_, window, cx| {
-                                        let _ = weak_tab_out.update(cx, |this, cx| {
-                                            this.settings.tab_size =
-                                                this.settings.tab_size.saturating_sub(1).max(1);
-                                            this.apply_settings(window, cx);
-                                        });
-                                    }),
-                            )
-                            .child(div().text_sm().child(format!("{}", settings.tab_size)))
-                            .child(Button::new("prefs-tab-plus").label("+").compact().on_click(
-                                move |_, window, cx| {
-                                    let _ = weak_tab_in.update(cx, |this, cx| {
-                                        this.settings.tab_size =
-                                            (this.settings.tab_size + 1).min(16);
-                                        this.apply_settings(window, cx);
-                                    });
-                                },
-                            ))
-                            .child(toggle_row(
-                                tr("prefs.insert_spaces"),
-                                settings.use_spaces,
-                                "prefs-spaces",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.use_spaces = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            )),
-                    )
-                    .child({
-                        let language = self.preferences.language.clone();
-                        let overrides = self.language_override().cloned().unwrap_or_default();
-                        let weak_language = weak.clone();
-                        let weak_tab_apply = weak.clone();
-                        let weak_spaces_inherit = weak.clone();
-                        let weak_spaces_on = weak.clone();
-                        let weak_spaces_off = weak.clone();
-                        let weak_eol_inherit = weak.clone();
-                        let weak_eol_lf = weak.clone();
-                        let weak_eol_crlf = weak.clone();
-                        let weak_eol_cr = weak.clone();
-                        let tab_size_input = self.preferences.language_tab_size.clone();
-                        let selected_language = language.clone();
-                        let weak_language_menu = weak_language.clone();
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(tr("prefs.per_language")),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .w(px(140.))
-                                            .text_sm()
-                                            .child(tr("prefs.language_select")),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-select")
-                                            .label(language_display_name(&language))
-                                            .dropdown_menu(move |mut menu, window, _cx| {
-                                                for name in language::names() {
-                                                    let selected =
-                                                        selected_language.as_str() == name;
-                                                    let name = name.to_string();
-                                                    let weak = weak_language_menu.clone();
-                                                    menu = menu.item(
-                                                        PopupMenuItem::new(language_display_name(
-                                                            &name,
-                                                        ))
-                                                        .checked(selected)
-                                                        .on_click(move |_, window, cx| {
-                                                            let name = name.clone();
-                                                            let _ = weak.update(cx, |this, cx| {
-                                                                this.preferences.language =
-                                                                    name.clone();
-                                                                let value = this
-                                                                    .settings
-                                                                    .tab_size_for(&name)
-                                                                    .to_string();
-                                                                this.preferences
-                                                                    .language_tab_size
-                                                                    .update(cx, |input, cx| {
-                                                                        input.set_value(
-                                                                            value, window, cx,
-                                                                        )
-                                                                    });
-                                                                cx.notify();
-                                                            });
-                                                        }),
-                                                    );
-                                                }
-                                                Self::fit_menu(menu, window)
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(140.))
-                                            .text_sm()
-                                            .child(tr("prefs.language_tab_size")),
-                                    )
-                                    .child(Input::new(&tab_size_input).w(px(60.)).h(px(28.)))
-                                    .child(
-                                        Button::new("prefs-language-tab-apply")
-                                            .label(tr("prefs.apply"))
-                                            .compact()
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_tab_apply.update(cx, |this, cx| {
-                                                    this.apply_language_tab_size(cx);
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(140.))
-                                            .text_sm()
-                                            .child(tr("prefs.language_indent")),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-spaces-inherit")
-                                            .label(tr("prefs.inherit"))
-                                            .compact()
-                                            .when(overrides.use_spaces.is_none(), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ =
-                                                    weak_spaces_inherit.update(cx, |this, cx| {
-                                                        this.set_language_use_spaces(None, cx);
+                                        )
+                                        .child(
+                                            Button::new("prefs-import-settings")
+                                                .label(tr("settings.import"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_import.update(cx, |this, cx| {
+                                                        this.open_import_settings_dialog(
+                                                            window, cx,
+                                                        );
                                                     });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-spaces-on")
-                                            .label(tr("prefs.spaces"))
-                                            .compact()
-                                            .when(overrides.use_spaces == Some(true), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_spaces_on.update(cx, |this, cx| {
-                                                    this.set_language_use_spaces(Some(true), cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-spaces-off")
-                                            .label(tr("prefs.tabs"))
-                                            .compact()
-                                            .when(overrides.use_spaces == Some(false), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_spaces_off.update(cx, |this, cx| {
-                                                    this.set_language_use_spaces(Some(false), cx);
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div().w(px(140.)).text_sm().child(tr("prefs.language_eol")),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-eol-inherit")
-                                            .label(tr("prefs.inherit"))
-                                            .compact()
-                                            .when(overrides.eol.is_none(), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_eol_inherit.update(cx, |this, cx| {
-                                                    this.set_language_eol(None, cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-eol-lf")
-                                            .label("LF")
-                                            .compact()
-                                            .when(overrides.eol == Some(Eol::Lf), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_eol_lf.update(cx, |this, cx| {
-                                                    this.set_language_eol(Some(Eol::Lf), cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-eol-crlf")
-                                            .label("CRLF")
-                                            .compact()
-                                            .when(overrides.eol == Some(Eol::CrLf), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_eol_crlf.update(cx, |this, cx| {
-                                                    this.set_language_eol(Some(Eol::CrLf), cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("prefs-language-eol-cr")
-                                            .label("CR")
-                                            .compact()
-                                            .when(overrides.eol == Some(Eol::Cr), |button| {
-                                                button.primary()
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak_eol_cr.update(cx, |this, cx| {
-                                                    this.set_language_eol(Some(Eol::Cr), cx);
-                                                });
-                                            }),
-                                    ),
-                            )
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-reset-settings")
+                                                .label(tr("settings.reset"))
+                                                .compact()
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = weak_reset.update(cx, |this, cx| {
+                                                        this.confirm = Some(ConfirmState::new(
+                                                            CloseIntent::ResetSettings,
+                                                            tr("settings.reset_title"),
+                                                            tr("settings.reset_detail"),
+                                                        ));
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(tr("prefs.editor")),
-                            )
-                            .child(toggle_row(
-                                tr("prefs.line_numbers"),
-                                settings.show_line_numbers,
-                                "prefs-linenumbers",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.show_line_numbers = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            ))
-                            .child(toggle_row(
-                                tr("prefs.word_wrap"),
-                                settings.word_wrap,
-                                "prefs-wrap",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.word_wrap = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            ))
-                            .child(toggle_row(
-                                tr("prefs.match_brackets"),
-                                settings.highlight_matching_brackets,
-                                "prefs-brackets",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.highlight_matching_brackets = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            ))
-                            .child(toggle_row(
-                                tr("prefs.trim_on_save"),
-                                settings.trim_trailing_whitespace_on_save,
-                                "prefs-trim",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.trim_trailing_whitespace_on_save = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(tr("prefs.session")),
-                            )
-                            .child(toggle_row(
-                                tr("prefs.restore_session"),
-                                settings.restore_session,
-                                "prefs-restore",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.restore_session = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            ))
-                            .child(toggle_row(
-                                tr("prefs.autosave"),
-                                settings.autosave_session,
-                                "prefs-autosave",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.autosave_session = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            ))
-                            .child(toggle_row(
-                                tr("prefs.hidden_files"),
-                                settings.show_hidden_files,
-                                "prefs-hidden",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.show_hidden_files = checked;
-                                    this.explorer.refresh();
-                                    this.apply_settings(window, cx);
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(tr("prefs.local_history")),
-                            )
-                            .child(toggle_row(
-                                tr("prefs.local_history_enabled"),
-                                settings.local_history_enabled,
-                                "prefs-history-enabled",
-                                weak.clone(),
-                                |this, checked, window, cx| {
-                                    this.settings.local_history_enabled = checked;
-                                    this.apply_settings(window, cx);
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .w(px(140.))
-                                            .text_sm()
-                                            .child(tr("prefs.local_history_days")),
-                                    )
-                                    .child(
-                                        Button::new("prefs-history-days-down")
-                                            .label("−")
-                                            .compact()
-                                            .on_click(move |_, window, cx| {
-                                                let _ = weak_days_down.update(cx, |this, cx| {
-                                                    this.settings.local_history_days = this
-                                                        .settings
-                                                        .local_history_days
-                                                        .saturating_sub(1)
-                                                        .max(1);
-                                                    this.apply_settings(window, cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .child(settings.local_history_days.to_string()),
-                                    )
-                                    .child(
-                                        Button::new("prefs-history-days-up")
-                                            .label("+")
-                                            .compact()
-                                            .on_click(move |_, window, cx| {
-                                                let _ = weak_days_up.update(cx, |this, cx| {
-                                                    this.settings.local_history_days =
-                                                        (this.settings.local_history_days + 1)
-                                                            .min(3650);
-                                                    this.apply_settings(window, cx);
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .w(px(140.))
-                                            .text_sm()
-                                            .child(tr("prefs.local_history_size")),
-                                    )
-                                    .child(
-                                        Button::new("prefs-history-mb-down")
-                                            .label("−")
-                                            .compact()
-                                            .on_click(move |_, window, cx| {
-                                                let _ = weak_mb_down.update(cx, |this, cx| {
-                                                    this.settings.local_history_max_mb = this
-                                                        .settings
-                                                        .local_history_max_mb
-                                                        .saturating_sub(1)
-                                                        .max(1);
-                                                    this.apply_settings(window, cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .child(settings.local_history_max_mb.to_string()),
-                                    )
-                                    .child(
-                                        Button::new("prefs-history-mb-up")
-                                            .label("+")
-                                            .compact()
-                                            .on_click(move |_, window, cx| {
-                                                let _ = weak_mb_up.update(cx, |this, cx| {
-                                                    this.settings.local_history_max_mb =
-                                                        (this.settings.local_history_max_mb + 1)
-                                                            .min(4096);
-                                                    this.apply_settings(window, cx);
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                Button::new("prefs-shortcuts")
-                                    .label(tr("shortcuts.customize"))
-                                    .compact()
-                                    .on_click(move |_, _, cx| {
-                                        let _ = weak_shortcuts.update(cx, |this, cx| {
-                                            this.open_shortcut_editor(cx);
-                                        });
-                                    }),
-                            ),
-                    )
                     .child(
                         div()
                             .text_xs()
@@ -16042,14 +20767,28 @@ impl LubanApp {
     }
 }
 
+impl Drop for LubanApp {
+    fn drop(&mut self) {
+        if self.window_registered {
+            window_registry::unregister(self.window_id);
+        }
+    }
+}
+
 impl Render for LubanApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = window.bounds();
+        self.window_width = bounds.size.width.as_f32();
+        self.window_height = bounds.size.height.as_f32();
+        self.window_maximized = window.is_maximized();
+        window_registry::update_bounds(self.window_id, bounds, self.window_maximized);
         self.process_enter_actions(window, cx);
         self.sync_active(window, cx);
         self.sync_file_watch(cx);
         self.sync_large_file_panel(window, cx);
-        self.autosave_session();
+        self.autosave_session(cx);
         self.refresh_find(cx);
+        self.refresh_outline(cx);
         self.refresh_decorations(cx);
 
         let title = self
@@ -16089,9 +20828,8 @@ impl Render for LubanApp {
         } else {
             None
         };
-        let tabs = self.render_tabs(window, cx);
+        let panes = self.render_panes(window, cx);
         let banner = self.render_external_banner(cx);
-        let editor = self.render_editor_area(window, cx);
         let find_bar = if show_find {
             Some(self.render_find_bar(window, cx))
         } else {
@@ -16103,7 +20841,7 @@ impl Render for LubanApp {
             None
         };
         let explorer = if show_explorer {
-            Some(self.render_explorer(window, cx))
+            Some(self.render_side_panel(window, cx))
         } else {
             None
         };
@@ -16153,7 +20891,6 @@ impl Render for LubanApp {
         if let Some(toolbar) = toolbar {
             root = root.child(toolbar);
         }
-        root = root.child(tabs);
         if let Some(banner) = banner {
             root = root.child(banner);
         }
@@ -16164,7 +20901,7 @@ impl Render for LubanApp {
                 .flex()
                 .flex_row()
                 .children(explorer)
-                .child(editor)
+                .child(panes)
                 .children(large_file_panel),
         );
         if let Some(find_bar) = find_bar {
@@ -16348,10 +21085,39 @@ mod restore_tests {
             huge_line: None,
             huge_column: None,
             bookmarks: Vec::new(),
+            group: 0,
         };
         let doc = spec.load(1024);
         assert!(doc.is_non_text());
         assert_eq!(doc.text, "x\r\ny");
+        assert!(doc.is_modified());
+    }
+
+    #[test]
+    fn partial_restore_applies_unsaved_text_and_keeps_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.txt");
+        std::fs::write(&path, b"AAAAA\nBBBBB\nCCCCC\n").unwrap();
+        let spec = RestoreSpec {
+            path: Some(path),
+            text: Some("BBBBB\nCHANGED\n".to_string()),
+            encoding: TextEncoding::Utf8,
+            eol: Eol::Lf,
+            language: "Plain Text".to_string(),
+            cursor: 0,
+            anchor: 0,
+            modified: true,
+            fallback_name: "range.txt".to_string(),
+            range: Some([6, 12]),
+            huge: false,
+            huge_line: None,
+            huge_column: None,
+            bookmarks: Vec::new(),
+            group: 0,
+        };
+        let doc = spec.load(1024);
+        assert!(doc.is_partial());
+        assert_eq!(doc.text, "BBBBB\nCHANGED\n");
         assert!(doc.is_modified());
     }
 
@@ -16375,6 +21141,7 @@ mod restore_tests {
             huge_line: None,
             huge_column: None,
             bookmarks: Vec::new(),
+            group: 0,
         };
         let doc = spec.load(1024);
         assert!(doc.is_partial());

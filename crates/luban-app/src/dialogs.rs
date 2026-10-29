@@ -31,9 +31,25 @@ pub enum FileDialogPurpose {
     OpenFiles,
     OpenFolder,
     FindInFilesFolder,
-    SaveAs { tab_id: u64, then: SaveThen },
-    Export { format: ExportFormat },
+    SaveAs {
+        tab_id: u64,
+        then: SaveThen,
+    },
+    Export {
+        format: ExportFormat,
+    },
     ImportTheme,
+    /// Open a `.luban-workspace` file.
+    OpenWorkspace,
+    /// Write the current workspace definition to a chosen path.
+    SaveWorkspace,
+    SaveWorkspaceAs,
+    /// Add a folder as a workspace root.
+    AddFolder,
+    /// Import a global settings JSON file.
+    ImportSettings,
+    /// Export the global settings JSON file.
+    ExportSettings,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -182,17 +198,26 @@ impl FileDialogState {
 
     pub fn title(&self) -> String {
         tr(match self.mode {
-            FileDialogMode::Open => "dialog.open_file",
+            FileDialogMode::Open => match &self.purpose {
+                FileDialogPurpose::OpenWorkspace => "dialog.open_workspace",
+                FileDialogPurpose::ImportSettings => "dialog.import_settings",
+                _ => "dialog.open_file",
+            },
             FileDialogMode::Save => match &self.purpose {
                 FileDialogPurpose::Export { format } => match format {
                     ExportFormat::Html => "dialog.export_html",
                     ExportFormat::Rtf => "dialog.export_rtf",
                 },
+                FileDialogPurpose::SaveWorkspace | FileDialogPurpose::SaveWorkspaceAs => {
+                    "dialog.save_workspace"
+                }
+                FileDialogPurpose::ExportSettings => "dialog.export_settings",
                 _ => "dialog.save_as",
             },
             FileDialogMode::Folder => match self.purpose {
                 FileDialogPurpose::OpenFolder => "dialog.open_folder",
                 FileDialogPurpose::FindInFilesFolder => "dialog.choose_search_folder",
+                FileDialogPurpose::AddFolder => "dialog.add_folder",
                 _ => "dialog.choose_folder",
             },
         })
@@ -378,7 +403,7 @@ impl FileDialogState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloseIntent {
     Tab(u64),
     AllTabs,
@@ -394,6 +419,18 @@ pub enum CloseIntent {
     RestoreHistory,
     /// Save/discard every tab targeted by close-other/close-right.
     TrimTabs,
+    /// Delete a file or folder from the tree. `permanent` selects the
+    /// irreversible action; the default moves the item to the trash.
+    DeletePath {
+        path: PathBuf,
+        permanent: bool,
+    },
+    /// Replace the global settings with a parsed file.
+    ImportSettings,
+    /// Restore the default global settings.
+    ResetSettings,
+    /// Apply the workspace replace preview.
+    WorkspaceReplace,
 }
 
 pub struct ConfirmState {

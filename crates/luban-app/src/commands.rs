@@ -62,6 +62,8 @@ pub enum CommandWhen {
     CanUndo,
     CanRedo,
     CanEditFullText,
+    CanGoBack,
+    CanGoForward,
 }
 
 /// Registry entry.
@@ -83,6 +85,8 @@ pub struct CommandContext {
     /// The active tab holds complete, editable text (not a disk-engine window,
     /// range view, reduced large-file view or non-text buffer).
     pub can_edit_full_text: bool,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
 }
 
 impl CommandSpec {
@@ -95,6 +99,8 @@ impl CommandSpec {
             CommandWhen::CanUndo => context.can_undo,
             CommandWhen::CanRedo => context.can_redo,
             CommandWhen::CanEditFullText => context.can_edit_full_text,
+            CommandWhen::CanGoBack => context.can_go_back,
+            CommandWhen::CanGoForward => context.can_go_forward,
         }
     }
 }
@@ -114,7 +120,77 @@ macro_rules! command {
 /// All registered commands, in menu and palette order.
 pub const COMMANDS: &[CommandSpec] = &[
     command!("file.new", File, "menu.file.new", Some("ctrl+n"), Always),
+    command!(
+        "file.new-window",
+        File,
+        "menu.file.new_window",
+        Some("ctrl+shift+n"),
+        Always
+    ),
     command!("file.open", File, "menu.file.open", Some("ctrl+o"), Always),
+    command!(
+        "file.open-workspace",
+        File,
+        "menu.file.open_workspace",
+        Some("ctrl+alt+o"),
+        Always
+    ),
+    command!(
+        "file.save-workspace",
+        File,
+        "menu.file.save_workspace",
+        None,
+        Always
+    ),
+    command!(
+        "file.save-workspace-as",
+        File,
+        "menu.file.save_workspace_as",
+        None,
+        Always
+    ),
+    command!(
+        "file.add-folder",
+        File,
+        "menu.file.add_folder",
+        None,
+        Always
+    ),
+    command!(
+        "file.close-workspace",
+        File,
+        "menu.file.close_workspace",
+        None,
+        Always
+    ),
+    command!(
+        "file.open-recent-workspace",
+        File,
+        "menu.file.open_recent_workspace",
+        None,
+        Always
+    ),
+    command!(
+        "file.remove-workspace-root",
+        File,
+        "menu.workspace.remove_root",
+        None,
+        Always
+    ),
+    command!(
+        "file.clear-recent-workspaces",
+        File,
+        "menu.file.clear_recent_workspaces",
+        None,
+        Always
+    ),
+    command!("tree.new-file", File, "explorer.new_file", None, Always),
+    command!("tree.new-folder", File, "explorer.new_folder", None, Always),
+    command!("tree.rename", File, "explorer.rename", None, Always),
+    command!("tree.delete", File, "explorer.delete", None, Always),
+    command!("tree.refresh", File, "explorer.refresh", None, Always),
+    command!("tree.copy-path", File, "explorer.copy_path", None, Always),
+    command!("tree.reveal", File, "explorer.reveal", None, Always),
     command!(
         "file.open-folder",
         File,
@@ -445,6 +521,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         Always
     ),
     command!(
+        "search.workspace-replace",
+        Search,
+        "menu.search.workspace_replace",
+        None,
+        Always
+    ),
+    command!(
+        "search.undo-workspace-replace",
+        Search,
+        "menu.search.undo_workspace_replace",
+        None,
+        Always
+    ),
+    command!(
         "search.clear-highlights",
         Search,
         "menu.search.clear_highlights",
@@ -488,6 +578,35 @@ pub const COMMANDS: &[CommandSpec] = &[
         "menu.view.large_file_controller",
         None,
         HasDocument
+    ),
+    command!(
+        "view.whitespace",
+        View,
+        "menu.view.whitespace",
+        None,
+        Always
+    ),
+    command!(
+        "view.indent-guides",
+        View,
+        "menu.view.indent_guides",
+        None,
+        Always
+    ),
+    command!("view.ruler", View, "menu.view.ruler", None, Always),
+    command!(
+        "view.document-map",
+        View,
+        "menu.view.document_map",
+        None,
+        Always
+    ),
+    command!(
+        "view.bracket-colors",
+        View,
+        "menu.view.bracket_colors",
+        None,
+        Always
     ),
     command!(
         "view.zoom-in",
@@ -661,6 +780,90 @@ pub const COMMANDS: &[CommandSpec] = &[
         Always
     ),
     command!(
+        "navigation.back",
+        Navigation,
+        "menu.navigation.back",
+        Some("alt+left"),
+        CanGoBack
+    ),
+    command!(
+        "navigation.forward",
+        Navigation,
+        "menu.navigation.forward",
+        Some("alt+right"),
+        CanGoForward
+    ),
+    command!(
+        "navigation.goto-symbol",
+        Navigation,
+        "menu.navigation.goto_symbol",
+        None,
+        HasDocument
+    ),
+    command!(
+        "navigation.toggle-outline",
+        Navigation,
+        "menu.view.outline",
+        None,
+        Always
+    ),
+    command!(
+        "navigation.toggle-breadcrumbs",
+        Navigation,
+        "menu.view.breadcrumbs",
+        None,
+        Always
+    ),
+    command!(
+        "window.move-tab-to-new-window",
+        Tabs,
+        "menu.tabs.move_to_new_window",
+        Some("ctrl+alt+n"),
+        HasDocument
+    ),
+    command!(
+        "window.split-right",
+        View,
+        "menu.view.split_right",
+        Some("ctrl+\\"),
+        Always
+    ),
+    command!(
+        "window.split-down",
+        View,
+        "menu.view.split_down",
+        Some("ctrl+shift+\\"),
+        Always
+    ),
+    command!(
+        "window.unsplit",
+        View,
+        "menu.view.unsplit",
+        Some("ctrl+alt+\\"),
+        Always
+    ),
+    command!(
+        "window.switch-group",
+        View,
+        "menu.view.switch_group",
+        Some("ctrl+alt+left"),
+        Always
+    ),
+    command!(
+        "window.switch-group-back",
+        View,
+        "menu.view.switch_group_back",
+        Some("ctrl+alt+right"),
+        Always
+    ),
+    command!(
+        "window.move-tab-to-other-group",
+        Tabs,
+        "menu.tabs.move_to_other_group",
+        None,
+        HasDocument
+    ),
+    command!(
         "palette.commands",
         Navigation,
         "command.palette",
@@ -678,6 +881,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         "settings.preferences",
         Settings,
         "menu.settings.preferences",
+        None,
+        Always
+    ),
+    command!(
+        "settings.import",
+        Settings,
+        "menu.settings.import",
+        None,
+        Always
+    ),
+    command!(
+        "settings.export",
+        Settings,
+        "menu.settings.export",
+        None,
+        Always
+    ),
+    command!(
+        "settings.reset",
+        Settings,
+        "menu.settings.reset",
         None,
         Always
     ),

@@ -6,6 +6,8 @@ use crate::i18n::tr;
 
 pub struct PreferencesState {
     pub open: bool,
+    /// Settings search query; filters the visible groups.
+    pub search: Entity<InputState>,
     /// System font families, loaded the first time the font picker opens.
     pub fonts: Option<Vec<String>>,
     pub font_picker: Option<FontPickerState>,
@@ -17,8 +19,11 @@ pub struct PreferencesState {
 impl PreferencesState {
     pub fn new(window: &mut Window, cx: &mut Context<LubanApp>) -> Self {
         let language_tab_size = cx.new(|cx| InputState::new(window, cx).default_value("4"));
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("prefs.search_placeholder")));
         Self {
             open: false,
+            search,
             fonts: None,
             font_picker: None,
             language: "Python".to_string(),

@@ -9,6 +9,7 @@ mod app;
 mod column_editor;
 mod commands;
 mod dialogs;
+mod document_map;
 mod explorer;
 mod file_watch;
 mod find;
@@ -20,23 +21,36 @@ mod icons;
 mod large_file;
 mod logging;
 mod macro_ui;
+mod navigation;
+mod outline;
 mod palette;
+mod path_prompt;
 mod preferences;
+mod quick_open;
+mod settings_search;
 mod syntax_theme;
+mod tab_groups;
 mod theme;
 mod util;
+mod window_registry;
+mod workspace_replace;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use app::LaunchOptions;
-use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 use luban_core::settings::Settings;
 
 use crate::i18n::tr_args;
 
-fn parse_args() -> LaunchOptions {
+struct ParsedArgs {
+    files: Vec<PathBuf>,
+    new_window: bool,
+    smoke_test: bool,
+}
+
+fn parse_args() -> ParsedArgs {
     let mut files = Vec::new();
     let mut new_window = false;
     let mut smoke_test = false;
@@ -62,12 +76,10 @@ fn parse_args() -> LaunchOptions {
             other => log::warn!("ignoring unknown argument {other}"),
         }
     }
-    LaunchOptions {
+    ParsedArgs {
         files,
         new_window,
         smoke_test,
-        manual_window_chrome: manual_window_chrome(),
-        recoveries: Vec::new(),
     }
 }
 
@@ -135,7 +147,7 @@ fn apply_borderless_hint(window: &Window) -> anyhow::Result<bool> {
 /// Remove the window-manager titlebar and keep it removed while the window
 /// manager finishes managing the freshly mapped window.
 #[cfg(target_os = "linux")]
-fn remove_window_decorations(handle: AnyWindowHandle, cx: &mut App) {
+pub(crate) fn remove_window_decorations(handle: AnyWindowHandle, cx: &mut App) {
     let _ = handle.update(cx, |_, window, _| match apply_borderless_hint(window) {
         Ok(true) => log::info!("removed the window manager titlebar"),
         Ok(false) => {}
@@ -157,7 +169,7 @@ fn remove_window_decorations(handle: AnyWindowHandle, cx: &mut App) {
 
 /// Decode the icon embedded in the binary so the taskbar entry is correct even
 /// when the desktop entry and icon theme are not installed (X11 only).
-fn window_icon() -> Option<Arc<image::RgbaImage>> {
+pub(crate) fn window_icon() -> Option<Arc<image::RgbaImage>> {
     const ICON_PNG: &[u8] =
         include_bytes!("../../../packaging/linux/icons/hicolor/256x256/apps/luban-notepad.png");
     match image::load_from_memory(ICON_PNG) {
@@ -191,67 +203,74 @@ fn main() {
         log::warn!("could not prune local history: {error}");
     }
 
-    let mut options = parse_args();
-    // Collected before the window exists so a crash-recovery offer can be
-    // shown together with the restored session. Expired entries are removed;
-    // entries belonging to a running instance stay within the retention age.
-    options.recoveries = luban_core::disk_engine::scan_recovery(luban_core::disk_engine::RETENTION);
+    let args = parse_args();
+    // Crash recoveries are collected before any window exists so the first
+    // window can show the offer next to its restored tabs. Expired entries are
+    // removed; entries belonging to a running instance stay within retention.
+    let recoveries = luban_core::disk_engine::scan_recovery(luban_core::disk_engine::RETENTION);
+    let manual_chrome = manual_window_chrome();
+
+    // Restore one window per saved window when the session holds any. Command
+    // line files take precedence and skip the session, matching the previous
+    // single-window behaviour.
+    let restore = settings.restore_session && !args.new_window && args.files.is_empty();
+    let mut windows: Vec<Option<luban_core::session::WindowSession>> = if restore {
+        let session = luban_core::session::Session::load();
+        if session.windows.is_empty() {
+            vec![None]
+        } else {
+            session.windows.into_iter().map(Some).collect()
+        }
+    } else {
+        vec![None]
+    };
+    if windows.is_empty() {
+        windows.push(None);
+    }
 
     gpui_kit::application()
         .with_assets(icons::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-            let manual_chrome = options.manual_window_chrome;
-            let window_options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Luban Notepad".into()),
-                    ..TitleBar::title_bar_options()
-                }),
-                // X11 asks for server decorations and removes the titlebar
-                // itself, because client decorations add a transparent shadow
-                // margin that cannot blend without a compositor. Every other
-                // platform requests client decorations and lets the platform
-                // report whether it can honour them; the render path falls back
-                // to a standalone menu row when it cannot.
-                window_decorations: Some(if manual_chrome {
-                    WindowDecorations::Server
-                } else {
-                    WindowDecorations::Client
-                }),
-                // A manually decorated window has no shadow margin and needs no
-                // compositor to blend its surface. Client decorations on Linux
-                // do use a transparent margin, so that path stays transparent.
-                window_background: if cfg!(target_os = "linux") && !manual_chrome {
-                    WindowBackgroundAppearance::Transparent
-                } else {
-                    WindowBackgroundAppearance::Opaque
-                },
-                // Keep the window grouped with its desktop entry so docks and
-                // taskbars pick up the installed icon on Wayland as well.
-                app_id: Some("luban-notepad".into()),
-                icon: window_icon(),
-                ..TitleBar::window_options()
-            };
-            let result = gpui_kit::open_window(window_options, cx, |window, cx| {
-                log::info!("window decorations: {:?}", window.window_decorations());
-                cx.new(|cx| app::LubanApp::new(window, cx, options))
-            });
-            let handle = match result {
-                Ok((handle, _)) => handle,
-                Err(error) => {
+            let mut first = true;
+            for saved in windows.drain(..) {
+                let id = window_registry::next_window_id();
+                let bounds = saved
+                    .as_ref()
+                    .map(|session| window_registry::restored_bounds(session, cx))
+                    .unwrap_or_else(|| {
+                        WindowBounds::Windowed(window_registry::centered_bounds(cx))
+                    });
+                let options = LaunchOptions {
+                    files: if first {
+                        args.files.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    smoke_test: first && args.smoke_test,
+                    manual_window_chrome: manual_chrome,
+                    recoveries: if first {
+                        recoveries.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    init: saved
+                        .map(|session| app::WindowInit::Session(Box::new(session)))
+                        .unwrap_or(app::WindowInit::Blank),
+                    auto_recovery: false,
+                    window_id: id,
+                };
+                if let Err(error) =
+                    window_registry::open_window_with(options, bounds, manual_chrome, cx)
+                {
                     log::error!("failed to open Luban Notepad window: {error:#}");
-                    cx.quit();
-                    return;
+                    if first {
+                        cx.quit();
+                        return;
+                    }
                 }
-            };
-            #[cfg(target_os = "linux")]
-            if manual_chrome {
-                remove_window_decorations(handle, cx);
+                first = false;
             }
-            #[cfg(not(target_os = "linux"))]
-            let _ = handle;
             cx.activate(true);
         });
 }
