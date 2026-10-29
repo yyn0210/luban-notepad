@@ -4,6 +4,8 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-10-29
+
 ### 新增
 
 - 折叠：Python/YAML/Makefile 按缩进生成折叠候选，大括号语言保留现有候选；
