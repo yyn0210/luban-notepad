@@ -135,6 +135,21 @@ pub const SETTINGS_GROUPS: &[SettingsGroup] = &[
         keywords: &["macros", "recording", "宏", "录制"],
     },
     SettingsGroup {
+        key: "plugins",
+        label_key: "prefs.plugins",
+        keywords: &[
+            "plugin",
+            "extension",
+            "lua",
+            "safe mode",
+            "package",
+            "插件",
+            "扩展",
+            "安全模式",
+            "包",
+        ],
+    },
+    SettingsGroup {
         key: "backup",
         label_key: "prefs.import_export",
         keywords: &[

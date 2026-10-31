@@ -473,17 +473,23 @@ impl Document {
             encoding::decode_owned(bytes)
         };
         let detected_eol = eol::detect(&decoded.text);
-        let language_name = language::detect_from_path(path);
-        let mut doc = Self::new_untitled("new 1");
-        doc.path = Some(path.to_path_buf());
         // The editing buffer is always LF; the file's convention lives in
         // `doc.eol` and is restored when saving. Non-text buffers keep the
         // original line endings so that saving does not rewrite bytes.
-        doc.text = if non_text {
+        let text = if non_text {
             decoded.text
         } else {
             eol::to_lf_owned(decoded.text)
         };
+        let path_language = language::detect_from_path(path);
+        let language_name = if path_language == language::PLAIN_TEXT {
+            language::detect_from_content(&text).unwrap_or(path_language)
+        } else {
+            path_language
+        };
+        let mut doc = Self::new_untitled("new 1");
+        doc.path = Some(path.to_path_buf());
+        doc.text = text;
         doc.cached_chars = Some(text::char_count(&doc.text));
         doc.encoding = decoded.encoding;
         doc.eol = detected_eol;
@@ -963,7 +969,13 @@ impl Document {
 
     pub fn auto_detect_language(&mut self) {
         if let Some(path) = &self.path {
-            self.language = language::detect_from_path(path).to_string();
+            let path_language = language::detect_from_path(path);
+            let detected = if path_language == language::PLAIN_TEXT {
+                language::detect_from_content(&self.text).unwrap_or(path_language)
+            } else {
+                path_language
+            };
+            self.language = detected.to_string();
         }
     }
 

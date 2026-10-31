@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/luban-core",
     "crates/luban-app",
+    "crates/luban-plugin",
 ]
 
 [workspace.package]

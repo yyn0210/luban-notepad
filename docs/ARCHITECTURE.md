@@ -31,18 +31,33 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 | `fuzzy` | 子序列模糊评分、Goto Anything 查询解析（`:行`、`@符号`、`文件:行`）、文件排序。 |
 | `symbols` | 正则启发式符号提取（Rust/Python/JS/TS/C/C++/Java/C#/Kotlin/Go/Ruby/PHP/Shell/Markdown）、缩进层级、包含符号、5,000 上限。 |
 | `bracket_colors` | 括号配对与嵌套深度扫描、2 MB 上限、调色板循环。 |
-| `language` | 扩展名/文件名→语言检测、注释语法、语言菜单列表。 |
+| `diff` | 行级统一 diff（`similar`）、相同/缺失/二进制/超大文件分类；按块读取并报告字节进度，支持取消。 |
+| `snippet` | `.sublime-snippet`/`snippets.json` 解析、按语言 scope 过滤、`$1`/`${1:默认}`/`$0` 展开。 |
+| `user_packages` | `packages/{syntaxes,themes,snippets}` 扫描、错误隔离、用户主题元数据。 |
+| `user_syntax` | 在 `two_face` 默认语法集上合并 `.sublime-syntax` 的 `SyntaxSet`、用户语言元数据、活动语法集。 |
+| `language` | 扩展名/文件名→语言检测、注释语法、语言菜单列表；运行时用户语言注册表。 |
 | `settings` | JSON 设置、校验/范围限制、最近文件与最近工作区、全局字段合并（工作区覆盖）、导入/导出/重置。 |
 | `session` | 原子化 v2 会话：多窗口位置/大小/最大化、工作区、分屏与标签组；v1 单窗口迁移、活动标签夹取。 |
 | `i18n` | 界面语言解析（环境变量/设置/操作系统）、引擎文案与语言显示名翻译；catalog 位于 `locales/ui.yml`。 |
+
+### `luban-plugin`
+
+| 模块 | 职责 |
+| --- | --- |
+| `manifest` | `plugin.json` 解析/校验、API 版本、依赖范围、贡献点和设置 schema、权限声明。 |
+| `permissions` | 权限集合规范化、批准哈希（SHA-256）。 |
+| `registry` | 插件发现、重复 ID/非法清单隔离、依赖拓扑/环、启用/批准/安全模式状态。 |
+| `runtime` | 每个插件独立的 Lua 5.4 状态：沙箱标准库、指令/内存上限、`luban` 宿主 API、文档/状态/文件操作收集为 `HostAction`。 |
+| `install` | 本地目录/zip/Git 安装、原子替换、更新、卸载、安装记录 `.installed.json`、路径穿越/符号链接防护。 |
+| `settings` | 插件设置默认值、校验和回退。 |
 
 ### `luban-app`
 
 | 模块 | 职责 |
 | --- | --- |
-| `main` | 命令行参数解析、GPUI 应用/平台启动、窗口选项、日志与 panic hook 初始化、启动时按会话恢复全部窗口、恢复数据/本地历史扫描与过期清理。 |
+| `main` | 命令行参数解析（goto/diff/stdin/command/wait/safe-mode）、单实例转发或启动主实例、GPUI 应用/平台启动、窗口选项、日志与 panic hook 初始化、启动时按会话恢复全部窗口、恢复数据/本地历史扫描与过期清理。 |
 | `logging` | `env_logger` 终端过滤 + 文件 tee、5 MiB 轮转（保留 3 份）、panic 崩溃日志、日志目录定位。 |
-| `commands` | 静态命令注册表、默认快捷键解析/格式化、有效键位映射、覆盖抑制和冲突检测；宏快捷键校验。 |
+| `commands` | 静态命令注册表 + 运行时插件命令、默认快捷键解析/格式化、有效键位映射、覆盖抑制和冲突检测；宏快捷键校验。 |
 | `palette` | 命令面板分组。 |
 | `navigation` | 每窗口前进/后退历史（上限 100、跳过已关闭标签）与面包屑段模型。 |
 | `quick_open` | 快速打开行构建：打开文件优先、工作区文件模糊排序、`:行`/`@符号`/`文件:行` 目标、50 条上限。 |
@@ -60,12 +75,45 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 | `huge_file` | 磁盘引擎标签页的窗口状态：窗口范围、代次、换窗请求、后台保存/查找任务、离屏光标。 |
 | `explorer` | 多根文件夹树：展开集合、选择、索引子项/直接列举回退、重命名/删除路径同步。 |
 | `preferences` | 首选项窗口状态：设置搜索、字体选择、语法主题、每语言缩进/换行、工作区/文件/视图/导入导出分组。 |
-| `syntax_theme` | 内置 TextMate 主题到语义高亮角色的映射、`.tmTheme` 解析与应用。 |
+| `syntax_theme` | 内置/用户包 `.tmTheme` 到语义高亮角色的映射、解析与应用。 |
+| `highlighter` | 基于活动 `SyntaxSet` 的 `InputHighlighterFactory`；用户 `.sublime-syntax` 因而能用于编辑器和导出。 |
+| `plugin_host` | 应用侧插件加载计划、贡献点注册、命令/面板调用、文档快照与 `HostAction` 应用。 |
+| `plugin_manager` | 插件管理器输入/设置控件状态。 |
+| `snippet_ui` | 片段选择行、插入会话和 tab stop 导航。 |
+| `ipc` | 单实例 PID 锁、`interprocess` 本地套接字（Unix domain socket/Windows 命名管道）、请求/响应协议、主实例请求队列。 |
 | `column_editor` | 列编辑器对话框状态和输入校验。 |
 | `macro_ui` | 宏对话框状态（命名、列表、快捷键）。 |
 | `i18n` | 界面文案翻译、locale 应用与运行时语言切换；catalog 位于 `locales/ui.yml`。 |
 | `theme` | 浅色/深色/跟随系统的 GPUI 主题应用；系统外观变化由根视图监听。 |
 | `util` | 路径规范化、语言标识映射、平台打开目录/在文件管理器中显示的启动命令构造。 |
+
+## 插件与用户包
+
+`luban-plugin` 不依赖 GUI：它发现并校验清单、解析依赖和权限，然后为每个启用
+插件建立一个 Lua 状态。Lua 沙箱只开放基础/字符串/表/数学/UTF-8 库；每次回调
+重置指令计数，并设置 64 MiB 内存上限。插件不能获得 `io`、`os`、`package`、
+`debug`、`require` 或动态代码加载。
+
+插件回调不直接持有应用状态。宿主在调用前构造文档快照、设置快照和允许路径，
+`luban.set_document_text`/`insert_text`/`replace_selection`/`status.set`/`notify`
+只追加 `HostAction`；回调返回后应用按顺序通过现有文档替换路径、状态栏和通知
+路径执行。这样 Lua 错误不会留下半执行的宿主写入。
+
+`luban-app/src/highlighter.rs` 实现了和 gpui-component 相同的
+`InputHighlighter` 适配器，但使用 `luban-core::user_syntax::active_set()`。
+`packages.reload` 重新构建活动 `SyntaxSet`、用户语言表和片段集合，并为所有
+已打开编辑器重新安装高亮器；编辑器与 HTML/RTF 导出因此看到同一套语法。
+
+## 单实例与 CLI
+
+主实例在配置目录持有 `instance.lock`（PID）和本地端点（Unix domain socket；
+Windows 通过 `interprocess` 使用由配置目录派生的命名管道）。后续启动把 `LaunchRequest`（文件、goto、
+diff、stdin、command、wait、new-window）序列化为一行 JSON，交给主实例的 IPC
+线程；线程把请求放入队列并等待应用回复。应用在渲染循环中排空队列，按请求
+打开/定位/执行，并在 `--wait` 时把回复延迟到目标标签关闭。
+
+只有取得锁的进程写 `session.json`；`--safe-mode` 或 `--new` 在已有主实例时以
+无会话写入的次要进程运行。陈旧锁通过 PID 存活检查清理。
 
 ## 命令与快捷键
 

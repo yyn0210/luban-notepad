@@ -39,6 +39,19 @@ pub fn next_window_id() -> u64 {
     })
 }
 
+pub fn notify_all(cx: &mut gpui_kit::AsyncApp) {
+    let entries: Vec<WeakEntity<LubanApp>> = ENTRIES.with(|entries| {
+        entries
+            .borrow()
+            .iter()
+            .map(|entry| entry.weak.clone())
+            .collect()
+    });
+    for weak in entries {
+        let _ = weak.update(cx, |_, cx| cx.notify());
+    }
+}
+
 pub fn register(id: u64, weak: WeakEntity<LubanApp>, bounds: Bounds<Pixels>, maximized: bool) {
     let order = NEXT_ORDER.with(|next| {
         let order = next.get();
@@ -202,10 +215,19 @@ fn visible_enough(bounds: &Bounds<Pixels>, cx: &App) -> bool {
 pub fn open_window(
     init: WindowInit,
     manual_chrome: bool,
+    session_writer: bool,
+    safe_mode: bool,
     cx: &mut App,
 ) -> anyhow::Result<AnyWindowHandle> {
     let bounds = centered_bounds(cx);
-    open_window_at(init, WindowBounds::Windowed(bounds), manual_chrome, cx)
+    open_window_at(
+        init,
+        WindowBounds::Windowed(bounds),
+        manual_chrome,
+        session_writer,
+        safe_mode,
+        cx,
+    )
 }
 
 /// Open a window at explicit bounds (used by session restore).
@@ -213,6 +235,8 @@ pub fn open_window_at(
     init: WindowInit,
     bounds: WindowBounds,
     manual_chrome: bool,
+    session_writer: bool,
+    safe_mode: bool,
     cx: &mut App,
 ) -> anyhow::Result<AnyWindowHandle> {
     let id = next_window_id();
@@ -220,6 +244,16 @@ pub fn open_window_at(
         LaunchOptions {
             files: Vec::new(),
             smoke_test: false,
+            safe_mode,
+            session_writer,
+            wait: false,
+            goto: None,
+            diff: None,
+            stdin: None,
+            command: None,
+            exit_on_command_failure: false,
+            command_result: None,
+            ipc_queue: crate::ipc::shared_queue(),
             manual_window_chrome: manual_chrome,
             recoveries: Vec::new(),
             init,
@@ -238,6 +272,8 @@ pub fn open_window_for_tab(
     tab: luban_core::session::SessionTab,
     recovery: Option<luban_core::disk_engine::RecoveryInfo>,
     manual_chrome: bool,
+    session_writer: bool,
+    safe_mode: bool,
     cx: &mut App,
 ) -> anyhow::Result<AnyWindowHandle> {
     let bounds = centered_bounds(cx);
@@ -248,6 +284,16 @@ pub fn open_window_for_tab(
         LaunchOptions {
             files: Vec::new(),
             smoke_test: false,
+            safe_mode,
+            session_writer,
+            wait: false,
+            goto: None,
+            diff: None,
+            stdin: None,
+            command: None,
+            exit_on_command_failure: false,
+            command_result: None,
+            ipc_queue: crate::ipc::shared_queue(),
             manual_window_chrome: manual_chrome,
             recoveries,
             init: WindowInit::Tabs(vec![tab]),

@@ -164,7 +164,21 @@ pub fn highlight_theme(name: &str, theme: &SyntectTheme) -> HighlightTheme {
             }
         }
     }
+    // The highlighter names unstyled source/text spans `primary`; giving that
+    // role the theme foreground makes plain identifiers follow the theme
+    // instead of the application palette.
+    if let Some(style) = theme_style(foreground, FontStyle::empty()) {
+        if let Ok(value) = serde_json::to_value(style) {
+            syntax.insert("primary".to_string(), value);
+        }
+    }
     let background_color = theme.settings.background.unwrap_or(Color::WHITE);
+    // TextMate's `gutter` is the gutter *background*; `gutterForeground` is
+    // the line-number text. The syntect build reads the background through
+    // `editor_gutter_background`; the text colour keys are kept for the
+    // tree-sitter build and for themes consumed elsewhere.
+    let gutter_background = theme.settings.gutter.unwrap_or(background);
+    let gutter_foreground = theme.settings.gutter_foreground.unwrap_or(foreground);
     let luminance = u32::from(background_color.r)
         + u32::from(background_color.g)
         + u32::from(background_color.b);
@@ -173,11 +187,20 @@ pub fn highlight_theme(name: &str, theme: &SyntectTheme) -> HighlightTheme {
         "name": name,
         "appearance": appearance,
         "style": {
+            // The tree-sitter build reads dotted Zed keys; the syntect build
+            // (what this application uses) reads the snake_case aliases.
             "editor.background": color_hex(background),
+            "editor_background": color_hex(background),
             "editor.foreground": color_hex(foreground),
-            "editor.line_number": color_hex(theme.settings.gutter.unwrap_or(foreground)),
-            "editor.active_line_number": color_hex(theme.settings.gutter_foreground.unwrap_or(foreground)),
+            "editor_foreground": color_hex(foreground),
+            "editor.gutter.background": color_hex(gutter_background),
+            "editor_gutter_background": color_hex(gutter_background),
+            "editor.line_number": color_hex(gutter_foreground),
+            "editor_line_number": color_hex(gutter_foreground),
+            "editor.active_line_number": color_hex(gutter_foreground),
+            "editor_active_line_number": color_hex(gutter_foreground),
             "editor.active_line.background": color_hex(theme.settings.line_highlight.unwrap_or(background)),
+            "editor_active_line": color_hex(theme.settings.line_highlight.unwrap_or(background)),
             "syntax": syntax,
         }
     });
@@ -204,6 +227,44 @@ pub fn resolve_theme(settings: &Settings) -> Result<Option<(String, SyntectTheme
             .unwrap_or_else(|| "Custom".to_string());
         return Ok(Some((name, theme)));
     }
+    if let Some(rest) = id.strip_prefix("pkg:") {
+        let root = luban_core::settings::packages_dir().join("themes");
+        let root = root.canonicalize().unwrap_or(root);
+        let candidates: Vec<&str> = match rest.rsplit_once(':') {
+            Some((path, _name)) if path != rest => vec![path, rest],
+            _ => vec![rest],
+        };
+        for candidate in candidates {
+            let relative = Path::new(candidate);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let path = root.join(relative);
+            let Ok(path) = path.canonicalize() else {
+                continue;
+            };
+            if !path.starts_with(&root) || !path.is_file() {
+                continue;
+            }
+            let theme = syntect::highlighting::ThemeSet::get_theme(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let name = theme
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Theme".to_string())
+                });
+            return Ok(Some((name, theme)));
+        }
+        return Err(format!("unknown package theme '{id}'"));
+    }
     let Some(option) = THEME_OPTIONS.iter().find(|option| option.id == id) else {
         return Err(format!("unknown syntax theme '{id}'"));
     };
@@ -212,7 +273,19 @@ pub fn resolve_theme(settings: &Settings) -> Result<Option<(String, SyntectTheme
     Ok(Some((option.label.to_string(), theme)))
 }
 
+/// The theme used when a saved theme cannot be resolved.
+pub fn fallback_highlight_theme() -> HighlightTheme {
+    let themes = extra();
+    highlight_theme(
+        "InspiredGitHub",
+        themes.get(EmbeddedThemeName::InspiredGithub),
+    )
+}
+
 /// Apply the configured syntax theme to the global editor theme.
+///
+/// Returns the load error without touching the active theme, so interactive
+/// callers can keep the previous theme when a new choice fails.
 pub fn apply(settings: &Settings, cx: &mut App) -> Result<(), String> {
     match resolve_theme(settings)? {
         Some((name, theme)) => {
@@ -229,6 +302,19 @@ pub fn apply(settings: &Settings, cx: &mut App) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Apply the saved theme at startup, resetting a broken theme to
+/// InspiredGitHub so the fallback does not depend on the previous theme.
+pub fn apply_with_fallback(settings: &Settings, cx: &mut App) -> Result<(), String> {
+    match apply(settings, cx) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let highlight = Arc::new(fallback_highlight_theme());
+            Theme::update(cx, |theme| theme.highlight_theme = highlight);
+            Err(error)
+        }
+    }
 }
 
 /// Parse an imported `.tmTheme` file before storing its path.
@@ -277,6 +363,64 @@ mod tests {
             ..Settings::default()
         };
         assert!(resolve_theme(&settings).is_err());
+    }
+
+    #[test]
+    fn fallback_theme_is_inspired_github() {
+        let fallback = fallback_highlight_theme();
+        assert_eq!(fallback.name, "InspiredGitHub");
+        assert!(fallback.style.syntax.keyword.is_some());
+        assert!(fallback.style.syntax.primary.is_some());
+        assert!(fallback.style.editor_background.is_some());
+        assert!(fallback.style.editor_foreground.is_some());
+        assert!(fallback.style.editor_line_number.is_some());
+        assert!(fallback.style.editor_gutter_background.is_some());
+    }
+
+    #[test]
+    fn gutter_colors_map_to_background_and_line_numbers() {
+        use syntect::highlighting::ThemeSettings;
+
+        let theme = SyntectTheme {
+            name: Some("Gutter".to_string()),
+            author: None,
+            settings: ThemeSettings {
+                background: Some(Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                }),
+                foreground: Some(Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                }),
+                gutter: Some(Color {
+                    r: 240,
+                    g: 240,
+                    b: 240,
+                    a: 255,
+                }),
+                gutter_foreground: Some(Color {
+                    r: 128,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                }),
+                ..Default::default()
+            },
+            scopes: Vec::new(),
+        };
+        let highlight = highlight_theme("Gutter", &theme);
+        let expected_gutter: gpui_kit::Hsla = serde_json::from_value(json!("#f0f0f0")).unwrap();
+        let expected_number: gpui_kit::Hsla = serde_json::from_value(json!("#800000")).unwrap();
+        assert_eq!(
+            highlight.style.editor_gutter_background,
+            Some(expected_gutter)
+        );
+        assert_eq!(highlight.style.editor_line_number, Some(expected_number));
     }
 
     #[test]

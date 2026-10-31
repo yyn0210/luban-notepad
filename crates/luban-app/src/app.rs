@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
@@ -49,6 +49,7 @@ use luban_core::workspace::{
 };
 use luban_core::workspace_file::{WorkspaceFile, WorkspaceSettings};
 use luban_core::workspace_index::{build_index, IndexOptions, WorkspaceIndex};
+use luban_plugin::manifest::StatusAlignment;
 
 use crate::column_editor::ColumnEditorState;
 use crate::commands::{self, CommandContext, Keymap};
@@ -100,9 +101,32 @@ pub enum WindowInit {
     Tabs(Vec<SessionTab>),
 }
 
+/// Shared result of a command run in a newly created IPC window.
+pub type CommandResult = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
+
 pub struct LaunchOptions {
     pub files: Vec<PathBuf>,
     pub smoke_test: bool,
+    /// Disable plugin loading for this run without changing settings.
+    pub safe_mode: bool,
+    /// Only the primary instance writes `session.json`.
+    pub session_writer: bool,
+    /// Exit after the tabs opened by this launch have been closed.
+    pub wait: bool,
+    /// Initial file/line/column request.
+    pub goto: Option<(PathBuf, usize, usize)>,
+    /// Initial read-only diff request.
+    pub diff: Option<(PathBuf, PathBuf)>,
+    /// Standard input opened as an untitled buffer.
+    pub stdin: Option<String>,
+    /// Command to run after the initial files open.
+    pub command: Option<String>,
+    /// A command failure should terminate this process (CLI launch).
+    pub exit_on_command_failure: bool,
+    /// Result of a command run in a newly created window (IPC `--new-window`).
+    pub command_result: Option<CommandResult>,
+    /// IPC endpoint owned by the first window of the primary process.
+    pub ipc_queue: Option<crate::ipc::IpcQueue>,
     /// The platform has no client-decorated shadow margin to blend against, so
     /// the application removes the window manager titlebar itself and draws the
     /// chrome for every window state.
@@ -154,12 +178,38 @@ struct PaletteOverlay {
     state: Entity<CommandState>,
     /// Flat command IDs for the command palette.
     command_groups: Vec<Vec<&'static str>>,
+    /// Runtime plugin commands, shown as one extra section.
+    plugin_commands: Vec<&'static str>,
+    /// Section index where plugin commands start.
+    plugin_section: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaletteKind {
     Commands,
     QuickOpen,
+    Snippets,
+}
+
+struct PendingWait {
+    id: String,
+    tab_ids: Vec<u64>,
+    reply: std::sync::mpsc::Sender<crate::ipc::IpcResponse>,
+}
+
+struct DiffTask {
+    tab_id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+struct PluginPanelState {
+    plugin_id: String,
+    panel_id: String,
+    title: String,
+    placement: luban_plugin::manifest::PanelPlacement,
+    lines: Vec<luban_plugin::runtime::PanelLine>,
+    error: Option<String>,
+    truncated: bool,
 }
 
 /// Quick-open rows and the current query error.
@@ -639,6 +689,24 @@ pub struct LubanApp {
     window_height: f32,
     window_maximized: bool,
     _subscriptions: Vec<Subscription>,
+    pub plugin_host: crate::plugin_host::PluginHost,
+    pub safe_mode: bool,
+    pub session_writer: bool,
+    pub snippets: luban_core::snippet::SnippetSet,
+    pub packages: luban_core::user_packages::PackageReport,
+    pub package_paths: luban_core::user_packages::PackagePaths,
+    pub snippet_session: Option<crate::snippet_ui::SnippetSession>,
+    snippet_picker_rows: Vec<crate::snippet_ui::SnippetRow>,
+    pub plugin_manager: crate::plugin_manager::PluginManagerState,
+    plugin_panel: Option<PluginPanelState>,
+    ipc_queue: Option<
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<crate::ipc::IpcCommand>>>,
+    >,
+    pending_waits: Vec<PendingWait>,
+    wait: bool,
+    wait_exit_scheduled: bool,
+    wait_for_tabs: Vec<u64>,
+    diff_tasks: Vec<DiffTask>,
 }
 
 /// Maximum width of a recent-file menu label, counted in display columns
@@ -815,11 +883,43 @@ fn session_tab_from(tab: &Tab) -> SessionTab {
 impl LubanApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, mut options: LaunchOptions) -> Self {
         let mut settings = Settings::load();
+        let package_paths = luban_core::user_packages::PackagePaths::system();
+        if let Err(error) = package_paths.ensure() {
+            log::warn!("could not create user package directories: {error}");
+        }
+        let packages = luban_core::user_packages::load(&package_paths);
+        let syntax_build = luban_core::user_syntax::build(&packages.syntax_files);
+        for error in &syntax_build.errors {
+            log::warn!("user syntax: {error}");
+        }
+        luban_core::user_syntax::set_active_set(syntax_build.set);
+        let user_languages = syntax_build
+            .languages
+            .iter()
+            .map(|info| language::UserLanguageSpec {
+                name: info.name.clone(),
+                extensions: info.extensions.clone(),
+                line_comment: None,
+                block_comment: None,
+                first_line_match: info.first_line_match.clone(),
+            })
+            .collect();
+        language::set_user_languages(user_languages);
+        let mut plugin_host = crate::plugin_host::PluginHost::load(&settings, options.safe_mode);
+        for (plugin_id, values) in &plugin_host.settings {
+            settings
+                .plugin_settings
+                .insert(plugin_id.clone(), values.clone());
+        }
+        plugin_host.settings = settings.plugin_settings.clone();
         // Drop entries for commands this build no longer knows about, and
-        // entries that cannot be parsed. Conflicts stay visible in the editor
-        // rather than silently changing which command wins.
+        // entries that cannot be parsed. Disabled/unapproved plugins keep their
+        // overrides so safe mode and permission changes do not erase them.
+        let known_plugin_commands = plugin_host.known_command_ids();
         settings.keybindings.retain(|id, text| {
-            let valid = commands::spec(id).is_some()
+            let valid = (commands::spec(id).is_some()
+                || plugin_host.has_command(id)
+                || known_plugin_commands.contains(id))
                 && commands::parse_binding(text)
                     .is_ok_and(|binding| commands::binding_allowed(&binding));
             if !valid {
@@ -834,8 +934,10 @@ impl LubanApp {
         let options_auto_recovery = options.auto_recovery;
         crate::i18n::apply_language(&settings.ui_language);
         apply_theme(&settings, Some(window), cx);
-        if let Err(error) = syntax_theme::apply(&settings, cx) {
+        let mut startup_notice = None;
+        if let Err(error) = syntax_theme::apply_with_fallback(&settings, cx) {
             log::warn!("could not apply syntax theme: {error}");
+            startup_notice = Some(tr("theme.invalid_fallback").to_string());
         }
 
         let mut app = Self {
@@ -908,9 +1010,9 @@ impl LubanApp {
             pending_history_restore: None,
             closed_tabs: Vec::new(),
             trim_plan: None,
-            keymap: Keymap::build(&keybindings),
+            keymap: Keymap::build_with(&keybindings, &plugin_host.dynamic_specs()),
             history: HistoryStore::system(),
-            status: String::new(),
+            status: startup_notice.clone().unwrap_or_default(),
             workspace_root: None,
             last_session_save: Instant::now(),
             allow_close: false,
@@ -947,6 +1049,22 @@ impl LubanApp {
             window_height: 820.0,
             window_maximized: false,
             _subscriptions: Vec::new(),
+            safe_mode: options.safe_mode,
+            session_writer: options.session_writer,
+            snippets: packages.snippets.clone(),
+            packages,
+            package_paths,
+            snippet_session: None,
+            snippet_picker_rows: Vec::new(),
+            plugin_manager: crate::plugin_manager::PluginManagerState::new(window, cx),
+            plugin_panel: None,
+            ipc_queue: options.ipc_queue,
+            pending_waits: Vec::new(),
+            wait: options.wait,
+            wait_exit_scheduled: false,
+            wait_for_tabs: Vec::new(),
+            diff_tasks: Vec::new(),
+            plugin_host,
         };
 
         app.rebuild_macro_keymap();
@@ -965,6 +1083,7 @@ impl LubanApp {
                                 true
                             } else if app.file_dialog.is_some() {
                                 app.cancel_file_dialog(cx);
+                                app.focus_editor(window, cx);
                                 true
                             } else if app.name_prompt.is_some() {
                                 app.name_prompt = None;
@@ -977,6 +1096,11 @@ impl LubanApp {
                             } else if app.palette.is_some() {
                                 app.close_palette(window, cx);
                                 true
+                            } else if app.plugin_manager.open {
+                                app.plugin_manager.open = false;
+                                app.focus_editor(window, cx);
+                                cx.notify();
+                                true
                             } else if app.history_dialog.is_some() {
                                 app.history_dialog = None;
                                 app.pending_history_restore = None;
@@ -985,6 +1109,12 @@ impl LubanApp {
                                 true
                             } else if app.trim_plan.is_some() {
                                 app.trim_plan = None;
+                                true
+                            } else if app.preferences.open {
+                                app.close_preferences(window, cx);
+                                true
+                            } else if app.snippet_session.is_some() {
+                                app.end_snippet(window, cx);
                                 true
                             } else {
                                 false
@@ -1015,10 +1145,68 @@ impl LubanApp {
                     return;
                 }
                 let modifiers = event.keystroke.modifiers;
-                if !(modifiers.secondary() || modifiers.control) {
+                let key = event.keystroke.key.to_ascii_lowercase();
+                let command = modifiers.secondary() || modifiers.control;
+                // The editor binds Tab, Shift+Tab, Ctrl+F and Ctrl+H to its
+                // own actions, so these keys never reach the normal shortcut
+                // handler. Resolve snippet navigation and the application find
+                // bar here, before those actions run.
+                if key == "tab" && !command && !modifiers.alt {
+                    let handled = weak_shortcuts
+                        .update(cx, |app, cx| {
+                            if app.snippet_session.is_none() {
+                                return false;
+                            }
+                            let editor_focused = app.tabs.get(app.active).is_some_and(|tab| {
+                                tab.editor.read(cx).focus_handle(cx).is_focused(window)
+                            });
+                            if !editor_focused {
+                                return false;
+                            }
+                            app.snippet_next(!modifiers.shift, window, cx);
+                            true
+                        })
+                        .unwrap_or(false);
+                    if handled {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
-                let key = event.keystroke.key.to_ascii_lowercase();
+                if command
+                    && !modifiers.shift
+                    && !modifiers.alt
+                    && matches!(key.as_str(), "f" | "h")
+                {
+                    let handled = weak_shortcuts
+                        .update(cx, |app, cx| {
+                            let editor_focused = app.tabs.get(app.active).is_some_and(|tab| {
+                                tab.editor.read(cx).focus_handle(cx).is_focused(window)
+                            });
+                            if !editor_focused {
+                                return false;
+                            }
+                            app.open_find(key == "h", window, cx);
+                            true
+                        })
+                        .unwrap_or(false);
+                    if handled {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                if command && !modifiers.shift && !modifiers.alt && key == "z" {
+                    let _ = weak_shortcuts.update(cx, |app, cx| {
+                        let editor_focused = app.tabs.get(app.active).is_some_and(|tab| {
+                            tab.editor.read(cx).focus_handle(cx).is_focused(window)
+                        });
+                        if editor_focused {
+                            app.snippet_session = None;
+                        }
+                    });
+                }
+                if !command {
+                    return;
+                }
                 if !matches!(key.as_str(), "z" | "y" | "home" | "end") {
                     return;
                 }
@@ -1118,6 +1306,17 @@ impl LubanApp {
                 }));
         }
 
+        let wait_paths: Vec<PathBuf> = options
+            .files
+            .iter()
+            .cloned()
+            .chain(options.goto.iter().map(|(path, _, _)| path.clone()))
+            .collect();
+        let had_files = !options.files.is_empty();
+        let mut wait_before: HashSet<u64> = HashSet::new();
+        if had_files {
+            wait_before.extend(app.tabs.iter().map(|tab| tab.id));
+        }
         // Open command-line files first; they take precedence over the session.
         if !options.files.is_empty() {
             let mut opened = 0;
@@ -1142,6 +1341,69 @@ impl LubanApp {
                     app.restore_tabs(tabs, window, cx);
                 }
                 WindowInit::Blank => app.new_file(window, cx),
+            }
+        }
+        if !had_files {
+            wait_before.extend(app.tabs.iter().map(|tab| tab.id));
+        }
+        if let Some((path, line, column)) = options.goto {
+            app.open_path_at(&path, line, column, 0, window, cx);
+        }
+        if let Some((left, right)) = options.diff {
+            app.open_diff(&left, &right, window, cx);
+        }
+        if let Some(text) = options.stdin {
+            app.open_stdin(text, window, cx);
+        }
+        if let Some(command) = options.command {
+            let succeeded = app.run_command(&command, window, cx);
+            let message = if succeeded {
+                None
+            } else {
+                Some(tr_args("status.command_failed", &[("command", command)]))
+            };
+            if let Some(message) = &message {
+                if options.exit_on_command_failure {
+                    eprintln!("{message}");
+                    std::process::exit(3);
+                }
+                app.set_status(message.clone(), cx);
+            }
+            if let Some(result) = &options.command_result {
+                if let Ok(mut result) = result.lock() {
+                    *result = Some(match message {
+                        Some(message) => Err(message),
+                        None => Ok(()),
+                    });
+                }
+            }
+        }
+        // Opening the initial document clears the status set during startup, so
+        // surface the theme fallback again once the window is populated.
+        if let Some(notice) = startup_notice {
+            app.status = notice;
+        }
+        if app.wait {
+            app.wait_for_tabs = app
+                .tabs
+                .iter()
+                .filter(|tab| !wait_before.contains(&tab.id))
+                .map(|tab| tab.id)
+                .collect();
+            for path in &wait_paths {
+                if let Some(tab) = app.tabs.iter().find(|tab| {
+                    tab.doc
+                        .path
+                        .as_ref()
+                        .is_some_and(|open| util::same_path(open, path))
+                }) {
+                    if !app.wait_for_tabs.contains(&tab.id) {
+                        app.wait_for_tabs.push(tab.id);
+                    }
+                }
+            }
+            if app.wait_for_tabs.is_empty() {
+                app.schedule_wait_exit();
             }
         }
         app.advance_recovery_prompt();
@@ -1310,6 +1572,7 @@ impl LubanApp {
             })
         };
         editor.update(cx, |state, cx| {
+            state.set_highlighter_factory(crate::highlighter::factory(), cx);
             state.set_tab_size(
                 TabSize {
                     tab_size,
@@ -1353,6 +1616,9 @@ impl LubanApp {
                 let b1 = state.text().char_to_byte_idx(cursor.min(total));
                 let (start, end) = if b0 <= b1 { (b0, b1) } else { (b1, b0) };
                 state.set_selected_range(start..end, cx);
+                if doc.read_only {
+                    state.set_readonly(true, cx);
+                }
             });
         }
         if self.focus_editor {
@@ -2077,7 +2343,9 @@ impl LubanApp {
                             cx.notify();
                             return;
                         }
+                        let closed_id = self.tabs[index].id;
                         self.tabs.remove(index);
+                        self.resolve_wait_for_tab(closed_id, cx);
                         if self.tabs.is_empty() {
                             self.active = 0;
                         } else if self.active >= self.tabs.len() {
@@ -2323,7 +2591,9 @@ impl LubanApp {
                             cx.notify();
                             return;
                         }
+                        let closed_id = self.tabs[index].id;
                         self.tabs.remove(index);
+                        self.resolve_wait_for_tab(closed_id, cx);
                         if self.tabs.is_empty() {
                             self.active = 0;
                         } else if self.active >= self.tabs.len() {
@@ -2723,6 +2993,36 @@ impl LubanApp {
         (start, end)
     }
 
+    fn goto_is_clamped(
+        &self,
+        index: usize,
+        line: usize,
+        column: usize,
+        cx: &gpui_kit::App,
+    ) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        let rope = tab.editor.read(cx).text();
+        let rows = rope.lines_len();
+        if line > rows {
+            return true;
+        }
+        let row = line.saturating_sub(1).min(rows.saturating_sub(1));
+        column > rope.slice_line(row).len_chars() + 1
+    }
+
+    fn note_goto_clamped(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        log::info!("goto {line}:{column} was clamped to the document bounds");
+        self.set_status(
+            tr_args(
+                "status.goto_clamped",
+                &[("line", line.to_string()), ("column", column.to_string())],
+            ),
+            cx,
+        );
+    }
+
     pub fn open_path_at(
         &mut self,
         path: &Path,
@@ -2761,6 +3061,9 @@ impl LubanApp {
             }
             let (start, end) = self.line_selection_in_tab(index, line, column, match_len, cx);
             self.select_char_range(start, end, window, cx);
+            if self.goto_is_clamped(index, line, column, cx) {
+                self.note_goto_clamped(line, column, cx);
+            }
             self.focus_editor = true;
             self.find.dirty = true;
             cx.notify();
@@ -2817,6 +3120,9 @@ impl LubanApp {
         self.active = index;
         let (start, end) = self.line_selection_in_tab(index, line, column, match_len, cx);
         self.select_char_range(start, end, window, cx);
+        if self.goto_is_clamped(index, line, column, cx) {
+            self.note_goto_clamped(line, column, cx);
+        }
         self.focus_editor = true;
         self.find.dirty = true;
         cx.notify();
@@ -3217,9 +3523,13 @@ impl LubanApp {
     }
 
     pub fn new_window(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) =
-            window_registry::open_window(WindowInit::Blank, self.manual_window_chrome, cx)
-        {
+        if let Err(error) = window_registry::open_window(
+            WindowInit::Blank,
+            self.manual_window_chrome,
+            self.session_writer,
+            self.safe_mode,
+            cx,
+        ) {
             self.set_status(
                 tr_args("window.open_failed", &[("error", error.to_string())]),
                 cx,
@@ -3260,6 +3570,8 @@ impl LubanApp {
             snapshot,
             recovery,
             self.manual_window_chrome,
+            self.session_writer,
+            self.safe_mode,
             cx,
         ) {
             Ok(_) => {
@@ -3267,6 +3579,7 @@ impl LubanApp {
                     self.cancel_tab_jobs(index);
                     self.tabs.remove(index);
                     self.nav.remove_tab(id);
+                    self.resolve_wait_for_tab(id, cx);
                     if self.active >= self.tabs.len() {
                         self.active = self.tabs.len().saturating_sub(1);
                     }
@@ -3739,6 +4052,7 @@ impl LubanApp {
 
     fn close_tab_by_id_without_prompt(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(index) = self.tab_index_by_id(id) {
+            self.cancel_diff_for_tab(id);
             self.cancel_tab_jobs(index);
             self.tabs.remove(index);
             self.nav.remove_tab(id);
@@ -3747,8 +4061,257 @@ impl LubanApp {
             }
             self.active_in_group[self.active_group] = None;
             self.find.dirty = true;
+            self.resolve_wait_for_tab(id, cx);
             cx.notify();
         }
+    }
+
+    /// Resolve forwarded `--wait` requests whose target tabs are closing.
+    /// Returns whether any response was sent.
+    fn resolve_pending_waits_for_tabs(&mut self, ids: &[u64]) -> bool {
+        if self.pending_waits.is_empty() || ids.is_empty() {
+            return false;
+        }
+        for wait in &mut self.pending_waits {
+            wait.tab_ids.retain(|tab| !ids.contains(tab));
+        }
+        let ready: Vec<usize> = self
+            .pending_waits
+            .iter()
+            .enumerate()
+            .filter(|(_, wait)| wait.tab_ids.is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        let mut replied = false;
+        for index in ready.into_iter().rev() {
+            let wait = self.pending_waits.remove(index);
+            let _ = wait.reply.send(crate::ipc::IpcResponse::ok(wait.id));
+            replied = true;
+        }
+        replied
+    }
+
+    fn resolve_wait_for_tab(&mut self, id: u64, _cx: &mut Context<Self>) {
+        log::debug!(
+            "tab {id} closed: wait={} targets={:?} pending={}",
+            self.wait,
+            self.wait_for_tabs,
+            self.pending_waits.len()
+        );
+        self.resolve_pending_waits_for_tabs(&[id]);
+        if !self.wait {
+            return;
+        }
+        self.wait_for_tabs.retain(|tab| *tab != id);
+        log::debug!("wait targets after close: {:?}", self.wait_for_tabs);
+        if self.wait_for_tabs.is_empty() {
+            self.schedule_wait_exit();
+        }
+    }
+
+    fn schedule_wait_exit(&mut self) {
+        if self.wait_exit_scheduled {
+            return;
+        }
+        self.wait_exit_scheduled = true;
+        let owns_ipc = self.ipc_queue.is_some();
+        // Give the IPC thread a moment to write the response to the command
+        // that closed the last wait target before the process exits.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            if owns_ipc {
+                crate::ipc::cleanup(&luban_core::settings::config_dir());
+            }
+            std::process::exit(0);
+        });
+    }
+
+    fn process_ipc_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(queue) = self.ipc_queue.clone() else {
+            return;
+        };
+        let commands: Vec<crate::ipc::IpcCommand> = {
+            let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
+            queue.drain(..).collect()
+        };
+        for command in commands {
+            self.handle_ipc_request(command, window, cx);
+        }
+    }
+
+    fn handle_ipc_request(
+        &mut self,
+        command: crate::ipc::IpcCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request = command.request;
+        if request.new_window {
+            if request.wait {
+                let _ = command.reply.send(crate::ipc::IpcResponse::error(
+                    request.id,
+                    "--wait cannot be combined with --new-window",
+                ));
+                return;
+            }
+            let mut errors = Vec::new();
+            for file in &request.files {
+                if !crate::ipc::path_is_readable(file) {
+                    errors.push(format!("cannot open {}", file.display()));
+                }
+            }
+            if let Some(goto) = &request.goto {
+                if !crate::ipc::path_is_readable(&goto.path) {
+                    errors.push(format!("cannot open {}", goto.path.display()));
+                }
+            }
+            if let Some((left, right)) = &request.diff {
+                if !crate::ipc::path_is_readable(left) {
+                    errors.push(format!("cannot open {}", left.display()));
+                }
+                if !crate::ipc::path_is_readable(right) {
+                    errors.push(format!("cannot open {}", right.display()));
+                }
+            }
+            if let Some(command_id) = &request.command {
+                if commands::spec(command_id).is_none() && !self.plugin_host.has_command(command_id)
+                {
+                    errors.push(format!("command '{command_id}' failed"));
+                }
+            }
+            if !errors.is_empty() {
+                let _ = command.reply.send(crate::ipc::IpcResponse::error(
+                    request.id,
+                    errors.join("; "),
+                ));
+                return;
+            }
+            let command_result =
+                std::sync::Arc::new(std::sync::Mutex::new(None::<Result<(), String>>));
+            let command_result_slot = request.command.as_ref().map(|_| command_result.clone());
+            let options = LaunchOptions {
+                files: request.files.clone(),
+                smoke_test: false,
+                safe_mode: self.safe_mode,
+                session_writer: self.session_writer,
+                wait: false,
+                goto: request
+                    .goto
+                    .as_ref()
+                    .map(|goto| (goto.path.clone(), goto.line, goto.column)),
+                diff: request.diff.clone(),
+                stdin: request.stdin.clone(),
+                command: request.command.clone(),
+                exit_on_command_failure: false,
+                command_result: command_result_slot,
+                ipc_queue: self.ipc_queue.clone(),
+                manual_window_chrome: self.manual_window_chrome,
+                recoveries: Vec::new(),
+                init: WindowInit::Blank,
+                auto_recovery: false,
+                window_id: window_registry::next_window_id(),
+            };
+            let bounds = WindowBounds::Windowed(window_registry::centered_bounds(cx));
+            match window_registry::open_window_with(options, bounds, self.manual_window_chrome, cx)
+            {
+                Ok(_) => {
+                    if request.command.is_none() {
+                        let _ = command.reply.send(crate::ipc::IpcResponse::ok(request.id));
+                    } else {
+                        let id = request.id.clone();
+                        let reply = command.reply;
+                        let slot = command_result.clone();
+                        cx.spawn(async move |_, cx| loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(50))
+                                .await;
+                            let done = slot.lock().ok().and_then(|result| result.clone());
+                            if let Some(result) = done {
+                                let response = match result {
+                                    Ok(()) => crate::ipc::IpcResponse::ok(id),
+                                    Err(error) => crate::ipc::IpcResponse::error(id, error),
+                                };
+                                let _ = reply.send(response);
+                                break;
+                            }
+                        })
+                        .detach();
+                    }
+                }
+                Err(error) => {
+                    let _ = command.reply.send(crate::ipc::IpcResponse::error(
+                        request.id,
+                        error.to_string(),
+                    ));
+                }
+            }
+            return;
+        }
+        let before_ids: HashSet<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        let mut errors = Vec::new();
+        for path in &request.files {
+            if !self.open_path(path, window, cx) {
+                errors.push(format!("cannot open {}", path.display()));
+            }
+        }
+        if let Some(goto) = &request.goto {
+            if crate::ipc::path_is_readable(&goto.path) {
+                self.open_path_at(&goto.path, goto.line, goto.column, 0, window, cx);
+            } else {
+                errors.push(format!("cannot open {}", goto.path.display()));
+            }
+        }
+        if let Some((left, right)) = &request.diff {
+            if !self.open_diff(left, right, window, cx) {
+                errors.push("cannot open diff".to_string());
+            }
+        }
+        if let Some(text) = &request.stdin {
+            self.open_stdin(text.clone(), window, cx);
+        }
+        if let Some(command_id) = &request.command {
+            if !self.run_command(command_id, window, cx) {
+                errors.push(format!("command '{command_id}' failed"));
+            }
+        }
+        let mut tab_ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|tab| !before_ids.contains(&tab.id))
+            .map(|tab| tab.id)
+            .collect();
+        for path in request
+            .files
+            .iter()
+            .chain(request.goto.iter().map(|goto| &goto.path))
+        {
+            if let Some(tab) = self.tabs.iter().find(|tab| {
+                tab.doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|open| util::same_path(open, path))
+            }) {
+                if !tab_ids.contains(&tab.id) {
+                    tab_ids.push(tab.id);
+                }
+            }
+        }
+        let ok = errors.is_empty();
+        if ok && request.wait && !tab_ids.is_empty() {
+            self.pending_waits.push(PendingWait {
+                id: request.id,
+                tab_ids,
+                reply: command.reply,
+            });
+        } else {
+            let response = if ok {
+                crate::ipc::IpcResponse::ok(request.id)
+            } else {
+                crate::ipc::IpcResponse::error(request.id, errors.join("; "))
+            };
+            let _ = command.reply.send(response);
+        }
+        cx.notify();
     }
 
     /// Pull the active editor's text/cursor into the document model. The
@@ -3892,6 +4455,10 @@ impl LubanApp {
     }
 
     fn ensure_active_text(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.active_doc().is_some_and(|document| document.read_only) {
+            self.set_status(tr("status.document_read_only"), cx);
+            return false;
+        }
         self.ensure_tab_text(self.active, cx)
     }
 
@@ -3937,6 +4504,10 @@ impl LubanApp {
         let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
             return;
         };
+        if self.tabs[index].doc.read_only {
+            self.set_status(tr("status.document_read_only"), cx);
+            return;
+        }
         let tab = &mut self.tabs[index];
         let char_count = textutil::char_count(&new_text);
         let anchor = select_start.min(char_count);
@@ -6551,6 +7122,10 @@ impl LubanApp {
 
     pub fn save_active_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else { return };
+        if tab.doc.read_only {
+            self.set_status(tr("status.document_read_only"), cx);
+            return;
+        }
         let tab_id = tab.id;
         let dir = util::default_save_directory(tab.doc.path.as_deref());
         let suggested = if tab.doc.is_partial() {
@@ -6819,6 +7394,11 @@ impl LubanApp {
         let Some(index) = self.tab_index_by_id(request.tab_id) else {
             return;
         };
+        if self.tabs[index].doc.read_only {
+            self.set_status(tr("status.document_read_only"), cx);
+            self.abort_pending_saves();
+            return;
+        }
         if self.tabs[index].doc.is_huge() {
             self.start_huge_save(index, Some(request.path), request.then, false, window, cx);
             return;
@@ -7702,6 +8282,12 @@ impl LubanApp {
         let Some(tab) = self.active_tab() else { return };
         let id = tab.id;
         let name = tab.doc.display_name();
+        log::debug!(
+            "close request for tab {id}: modified={} wait={} targets={:?}",
+            tab.doc.is_modified(),
+            self.wait,
+            self.wait_for_tabs
+        );
         if tab.doc.is_modified() {
             self.confirm = Some(ConfirmState::new(
                 CloseIntent::Tab(id),
@@ -7742,6 +8328,7 @@ impl LubanApp {
             return;
         }
         let closed = self.tabs[index].id;
+        self.cancel_diff_for_tab(closed);
         let closed_group = self.tabs[index].group;
         let closed_position = self.tabs[..index]
             .iter()
@@ -7751,6 +8338,7 @@ impl LubanApp {
         self.record_closed_tab(index, cx);
         self.cancel_tab_jobs(index);
         self.tabs.remove(index);
+        self.resolve_wait_for_tab(closed, cx);
         self.nav.remove_tab(closed);
         if self.active_in_group[closed_group] == Some(closed) {
             self.active_in_group[closed_group] = None;
@@ -7823,12 +8411,19 @@ impl LubanApp {
         for index in 0..self.tabs.len() {
             self.cancel_tab_jobs(index);
         }
+        let closed_ids: Vec<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        for id in &closed_ids {
+            self.cancel_diff_for_tab(*id);
+        }
         self.tabs.clear();
         self.active = 0;
         self.active_group = 0;
         self.active_in_group = [None, None];
         self.nav.clear();
         self.find.clear();
+        for id in closed_ids {
+            self.resolve_wait_for_tab(id, cx);
+        }
         self.new_file(window, cx);
     }
 
@@ -7847,12 +8442,18 @@ impl LubanApp {
     }
 
     fn on_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        log::debug!("on_should_close allow_close={}", self.allow_close);
         if self.allow_close {
             return true;
         }
         self.sync_active(window, cx);
         if self.modified_tabs().is_empty() {
             let last = cx.windows().len() <= 1;
+            let closing: Vec<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+            for id in &closing {
+                self.cancel_diff_for_tab(*id);
+            }
+            let replied = self.resolve_pending_waits_for_tabs(&closing);
             self.persist_state(window, cx);
             self.allow_close = true;
             if self.window_registered {
@@ -7860,7 +8461,13 @@ impl LubanApp {
                 self.window_registered = false;
             }
             if last {
-                cx.quit();
+                if replied {
+                    // Let the IPC thread flush the successful wait responses
+                    // before the process exits.
+                    self.schedule_wait_exit();
+                } else {
+                    cx.quit();
+                }
             }
             return true;
         }
@@ -8162,6 +8769,11 @@ impl LubanApp {
         for index in 0..self.tabs.len() {
             self.cancel_tab_jobs(index);
         }
+        let closing: Vec<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        for id in &closing {
+            self.cancel_diff_for_tab(*id);
+        }
+        let replied = self.resolve_pending_waits_for_tabs(&closing);
         self.persist_state(window, cx);
         self.allow_close = true;
         if self.window_registered {
@@ -8172,6 +8784,10 @@ impl LubanApp {
             // File > Exit closes the current window; the application keeps
             // running while another window remains.
             window.remove_window();
+        } else if replied {
+            // Let the IPC thread flush the successful wait responses before
+            // the process exits.
+            self.schedule_wait_exit();
         } else {
             cx.quit();
         }
@@ -8224,6 +8840,9 @@ impl LubanApp {
     }
 
     fn save_session_now(&mut self, cx: &mut Context<Self>) {
+        if !self.session_writer {
+            return;
+        }
         let current = self.build_window_session();
         let windows = window_registry::collect(cx, current);
         let session = Session {
@@ -8342,6 +8961,10 @@ impl LubanApp {
         }
         if tab.large_file || tab.doc.partial_range().is_some() || tab.doc.is_non_text() {
             self.set_status(tr("status.op_needs_full_text"), cx);
+            return false;
+        }
+        if tab.doc.read_only {
+            self.set_status(tr("status.document_read_only"), cx);
             return false;
         }
         true
@@ -9012,6 +9635,10 @@ impl LubanApp {
     }
 
     pub fn convert_eol(&mut self, new_eol: Eol, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(|document| document.read_only) {
+            self.set_status(tr("status.document_read_only"), cx);
+            return;
+        }
         if self.active_doc().is_some_and(Document::is_non_text) {
             self.set_status(tr("status.eol_non_text"), cx);
             return;
@@ -9028,6 +9655,10 @@ impl LubanApp {
     }
 
     pub fn set_encoding(&mut self, encoding: TextEncoding, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(|document| document.read_only) {
+            self.set_status(tr("status.document_read_only"), cx);
+            return;
+        }
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
@@ -9108,8 +9739,7 @@ impl LubanApp {
         if let Err(error) = syntax_theme::apply(&self.settings, cx) {
             log::warn!("could not apply syntax theme: {error}");
         }
-        self.keymap = Keymap::build(&self.settings.keybindings);
-        self.rebuild_macro_keymap();
+        self.rebuild_keymap();
         let line_numbers = self.settings.show_line_numbers;
         let wrap = self.settings.word_wrap;
         let whitespace = self.settings.show_whitespace;
@@ -10834,9 +11464,11 @@ impl LubanApp {
                     && !tab.large_file
                     && tab.doc.partial_range().is_none()
                     && !tab.doc.is_non_text()
+                    && !tab.doc.read_only
             }),
             can_go_back: self.nav.can_back(),
             can_go_forward: self.nav.can_forward(),
+            diff_running: !self.diff_tasks.is_empty(),
         }
     }
 
@@ -10858,19 +11490,50 @@ impl LubanApp {
     /// Execute a registered command. Menu items, the toolbar, shortcuts and
     /// the command palette all end up here.
     pub fn run_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(spec) = commands::spec(id) else {
+        let static_spec = commands::spec(id);
+        let plugin_command = self.plugin_host.command(id).map(|command| {
+            (
+                command.plugin_id.clone(),
+                command.entry.clone(),
+                command.when,
+            )
+        });
+        if static_spec.is_none() && plugin_command.is_none() {
             log::warn!("unknown command {id}");
             return false;
-        };
-        if !spec.enabled(&self.command_context()) {
-            return false;
+        }
+        let context = self.command_context();
+        if let Some(spec) = static_spec {
+            if !spec.enabled(&context) {
+                return false;
+            }
         }
         if id != "edit.select-next-occurrence" {
             self.occurrence_anchor = None;
         }
+        if id == "edit.undo" {
+            self.snippet_session = None;
+        }
         let recording_before =
             (self.macro_recording && !self.macro_playback && luban_core::macros::recordable(id))
                 .then(|| self.macro_state_signature());
+        if let Some((plugin_id, entry, when)) = plugin_command {
+            if !when.enabled(&context) {
+                return false;
+            }
+            let ok = self.run_plugin_command(&plugin_id, &entry, id, window, cx);
+            if ok {
+                if let Some(before) = recording_before {
+                    // Plugin commands are recorded even when they only update
+                    // plugin-owned state rather than the document.
+                    if before != self.macro_state_signature() || static_spec.is_none() {
+                        self.macro_recorded.push(id.to_string());
+                        cx.notify();
+                    }
+                }
+            }
+            return ok;
+        }
         match id {
             "file.new" => self.new_file(window, cx),
             "file.new-window" => self.new_window(cx),
@@ -11055,6 +11718,7 @@ impl LubanApp {
                 self.settings.show_document_map = !self.settings.show_document_map;
                 self.apply_settings(window, cx);
             }
+            "diff.cancel" => self.cancel_diff(cx),
             "view.bracket-colors" => {
                 self.settings.bracket_colors = !self.settings.bracket_colors;
                 if self.settings.bracket_colors
@@ -11134,6 +11798,20 @@ impl LubanApp {
                     ),
                 }
             }
+            "plugins.manage" => {
+                self.plugin_manager.open(window, cx);
+                cx.notify();
+            }
+            "plugins.reload" => self.reload_plugins(window, cx),
+            "packages.reload" => self.reload_packages(window, cx),
+            "plugins.open-panel" => {
+                if let Some(panel) = self.plugin_host.panels.first().cloned() {
+                    self.open_plugin_panel(&panel.plugin_id, &panel.id, window, cx);
+                } else {
+                    self.set_status(tr("plugins.no_panels"), cx);
+                }
+            }
+            "edit.insert-snippet" => self.open_snippet_picker(window, cx),
             other => {
                 log::warn!("command {other} has no implementation");
                 return false;
@@ -11146,6 +11824,789 @@ impl LubanApp {
             }
         }
         true
+    }
+
+    fn rebuild_keymap(&mut self) {
+        self.keymap = Keymap::build_with(
+            &self.settings.keybindings,
+            &self.plugin_host.dynamic_specs(),
+        );
+        self.rebuild_macro_keymap();
+    }
+
+    fn plugin_allowed_roots(&self) -> Vec<PathBuf> {
+        let document_dir = self
+            .active_doc()
+            .and_then(|doc| doc.path.as_deref())
+            .and_then(Path::parent);
+        Self::plugin_allowed_roots_for(
+            self.workspace_root.as_ref(),
+            &self.workspace_roots,
+            document_dir,
+        )
+    }
+
+    /// File-system roots available to plugins.
+    ///
+    /// A workspace is the security boundary: when one is open, the directory
+    /// of a document outside it is not exposed. Without a workspace the active
+    /// document's directory is the only useful root.
+    fn plugin_allowed_roots_for(
+        workspace_root: Option<&PathBuf>,
+        workspace_roots: &[PathBuf],
+        document_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = workspace_root.into_iter().cloned().collect();
+        roots.extend(workspace_roots.iter().cloned());
+        if roots.is_empty() {
+            if let Some(dir) = document_dir {
+                roots.push(dir.to_path_buf());
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        roots
+            .into_iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect()
+    }
+
+    fn plugin_document_snapshot(
+        &self,
+        cx: &gpui_kit::App,
+    ) -> Option<luban_plugin::runtime::DocumentSnapshot> {
+        let tab = self.active_tab()?;
+        if tab.large_file
+            || tab.doc.is_huge()
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text()
+            || tab.doc.read_only
+        {
+            return None;
+        }
+        let (selection_start, selection_end) = tab.doc.selection();
+        let state = tab.editor.read(cx);
+        let rope = state.text();
+        let char_count = rope.len_chars();
+        let cursor = tab.doc.cursor.min(char_count);
+        let byte = rope.char_to_byte_idx(cursor);
+        let position = rope.offset_to_position(byte);
+        Some(luban_plugin::runtime::DocumentSnapshot {
+            path: tab.doc.path.clone(),
+            text: tab.doc.text.clone(),
+            language: tab.doc.language.clone(),
+            line: position.line as usize + 1,
+            column: position.character as usize + 1,
+            selection_start,
+            selection_end,
+            modified: tab.doc.is_modified(),
+        })
+    }
+
+    fn run_plugin_command(
+        &mut self,
+        plugin_id: &str,
+        entry: &str,
+        command_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let settings = self.plugin_host.settings_for(plugin_id);
+        let input = luban_plugin::runtime::CallInput {
+            plugin: luban_plugin::runtime::PluginIdentity {
+                id: plugin_id.to_string(),
+                version: self
+                    .plugin_host
+                    .manifest(plugin_id)
+                    .map(|manifest| manifest.version.clone())
+                    .unwrap_or_default(),
+                data_dir: self.plugin_host.root.join(plugin_id).join("data"),
+            },
+            document: self.plugin_document_snapshot(cx),
+            settings,
+            allowed_roots: self.plugin_allowed_roots(),
+        };
+        let Some(call) = self
+            .plugin_host
+            .run_command(plugin_id, entry, command_id, input)
+        else {
+            self.set_status(
+                tr_args(
+                    "plugins.not_available",
+                    &[("plugin", plugin_id.to_string())],
+                ),
+                cx,
+            );
+            return false;
+        };
+        let mut ok = call.error.is_none();
+        for action in call.output.actions {
+            match action {
+                luban_plugin::runtime::HostAction::SetDocumentText { text, selection } => {
+                    let (start, end) = selection.unwrap_or((0, 0));
+                    self.replace_document_text(text, start, end, window, cx);
+                }
+                luban_plugin::runtime::HostAction::Notify(message) => {
+                    self.set_status(message, cx);
+                }
+                luban_plugin::runtime::HostAction::SetStatus { id, text } => {
+                    self.plugin_host.set_status(plugin_id, &id, text);
+                    cx.notify();
+                }
+            }
+        }
+        if let Some(error) = call.error {
+            ok = false;
+            self.set_status(error, cx);
+        }
+        ok
+    }
+
+    pub fn reload_packages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let packages = luban_core::user_packages::load(&self.package_paths);
+        let syntax_build = luban_core::user_syntax::build(&packages.syntax_files);
+        for error in &syntax_build.errors {
+            log::warn!("user syntax: {error}");
+        }
+        luban_core::user_syntax::set_active_set(syntax_build.set);
+        let user_languages = syntax_build
+            .languages
+            .iter()
+            .map(|info| language::UserLanguageSpec {
+                name: info.name.clone(),
+                extensions: info.extensions.clone(),
+                line_comment: None,
+                block_comment: None,
+                first_line_match: info.first_line_match.clone(),
+            })
+            .collect();
+        language::set_user_languages(user_languages);
+        self.snippets = packages.snippets.clone();
+        self.packages = packages;
+        for index in 0..self.tabs.len() {
+            let language = language_key(&self.tabs[index].doc.language).to_string();
+            let editor = self.tabs[index].editor.clone();
+            editor.update(cx, |state, cx| {
+                state.set_highlighter_factory(crate::highlighter::factory(), cx);
+                state.set_highlighter(&language, cx);
+            });
+        }
+        if let Err(error) = syntax_theme::apply(&self.settings, cx) {
+            log::warn!("could not apply syntax theme: {error}");
+        }
+        let message = tr_args(
+            "packages.reloaded",
+            &[
+                ("syntax", self.packages.syntax_files.len().to_string()),
+                ("themes", self.packages.themes.len().to_string()),
+                ("snippets", self.snippets.snippets.len().to_string()),
+            ],
+        );
+        self.set_status(message, cx);
+        let _ = window;
+        cx.notify();
+    }
+
+    pub fn reload_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        self.plugin_host = crate::plugin_host::PluginHost::load(&self.settings, self.safe_mode);
+        for (plugin_id, values) in &self.plugin_host.settings {
+            self.settings
+                .plugin_settings
+                .insert(plugin_id.clone(), values.clone());
+        }
+        self.global_settings.plugin_settings = self.settings.plugin_settings.clone();
+        self.rebuild_keymap();
+        self.snippet_session = None;
+        self.plugin_panel = None;
+        self.plugin_manager.text_inputs.clear();
+        cx.notify();
+    }
+
+    pub fn open_diff(
+        &mut self,
+        left: &Path,
+        right: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Missing or unreadable inputs must fail the launch/forward request
+        // before a placeholder tab is created.
+        if !crate::ipc::path_is_readable(left) {
+            self.set_status(
+                tr_args("diff.unreadable", &[("path", left.display().to_string())]),
+                cx,
+            );
+            return false;
+        }
+        if !crate::ipc::path_is_readable(right) {
+            self.set_status(
+                tr_args("diff.unreadable", &[("path", right.display().to_string())]),
+                cx,
+            );
+            return false;
+        }
+
+        let mut doc = Document::new_untitled(tr_args(
+            "diff.title",
+            &[
+                ("left", left.display().to_string()),
+                ("right", right.display().to_string()),
+            ],
+        ));
+        doc.attach_text(tr("diff.computing"));
+        doc.language = "Diff".to_string();
+        doc.read_only = true;
+        self.add_document(doc, window, cx);
+        let Some(tab_id) = self.active_tab().map(|tab| tab.id) else {
+            return false;
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new((0u64, 0u64)));
+        self.diff_tasks.push(DiffTask {
+            tab_id,
+            cancel: cancel.clone(),
+        });
+        self.set_status(tr("diff.computing"), cx);
+
+        let target_left = left.to_path_buf();
+        let target_right = right.to_path_buf();
+        let task_cancel = cancel.clone();
+        let task_progress = progress.clone();
+        let task = cx.background_executor().spawn(async move {
+            luban_core::diff::diff_files_with_progress(
+                &target_left,
+                &target_right,
+                &task_cancel,
+                &mut |done, total| {
+                    if let Ok(mut slot) = task_progress.lock() {
+                        *slot = (done, total);
+                    }
+                },
+            )
+        });
+
+        let pump_progress = progress.clone();
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let keep = this
+                .update(cx, |app, cx| {
+                    if !app.diff_tasks.iter().any(|task| task.tab_id == tab_id) {
+                        return false;
+                    }
+                    let (done, total) = pump_progress.lock().map(|slot| *slot).unwrap_or((0, 0));
+                    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
+                    app.set_status(
+                        tr_args(
+                            "diff.computing_progress",
+                            &[("percent", percent.to_string())],
+                        ),
+                        cx,
+                    );
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_diff(tab_id, result, window, cx);
+            });
+        })
+        .detach();
+        true
+    }
+
+    fn finish_diff(
+        &mut self,
+        tab_id: u64,
+        result: Result<luban_core::diff::DiffOutput, luban_core::diff::DiffError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff_tasks.retain(|task| task.tab_id != tab_id);
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            // The tab was closed while the calculation was running.
+            return;
+        };
+        match result {
+            Ok(output) => {
+                let text = if output.identical {
+                    tr("diff.identical")
+                } else if output.binary {
+                    tr("diff.binary")
+                } else if output.too_large {
+                    tr("diff.too_large")
+                } else {
+                    output.text
+                };
+                let status = if output.identical {
+                    tr("diff.ready.identical")
+                } else if output.binary {
+                    tr("diff.ready.binary")
+                } else if output.too_large {
+                    tr("diff.ready.too_large")
+                } else {
+                    tr_args(
+                        "diff.ready",
+                        &[
+                            ("added", output.added.to_string()),
+                            ("removed", output.removed.to_string()),
+                        ],
+                    )
+                };
+                let tab = &mut self.tabs[index];
+                tab.doc.replace_all_text(&text, EditKind::Other);
+                tab.doc.mark_saved();
+                tab.doc.set_selection(0, 0);
+                let editor = tab.editor.clone();
+                editor.update(cx, |state, cx| {
+                    state.replace_all(text, window, cx);
+                    state.set_selected_range(0..0, cx);
+                    state.set_readonly(true, cx);
+                });
+                self.active = index;
+                self.active_group = self.tabs[index].group;
+                self.active_in_group[self.active_group] = Some(tab_id);
+                self.set_status(status, cx);
+            }
+            Err(luban_core::diff::DiffError::Cancelled) => {
+                self.close_tab_at(index, window, cx);
+                self.set_status(tr("diff.cancelled"), cx);
+            }
+            Err(error) => {
+                self.close_tab_at(index, window, cx);
+                self.set_status(error.to_string(), cx);
+            }
+        }
+    }
+
+    fn cancel_diff(&mut self, cx: &mut Context<Self>) {
+        if self.diff_tasks.is_empty() {
+            return;
+        }
+        for task in &self.diff_tasks {
+            task.cancel.store(true, Ordering::Relaxed);
+        }
+        self.set_status(tr("diff.cancelling"), cx);
+    }
+
+    /// Stop and forget the diff calculation owned by a closing tab.
+    fn cancel_diff_for_tab(&mut self, tab_id: u64) {
+        for task in &self.diff_tasks {
+            if task.tab_id == tab_id {
+                task.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.diff_tasks.retain(|task| task.tab_id != tab_id);
+    }
+
+    pub fn open_stdin(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let mut doc = Document::new_untitled("stdin");
+        doc.attach_text(eol::to_lf_owned(text));
+        doc.language = language::PLAIN_TEXT.to_string();
+        doc.touch();
+        self.add_document(doc, window, cx);
+    }
+
+    fn open_snippet_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            self.set_status(tr("snippet.no_document"), cx);
+            return;
+        };
+        if tab.large_file
+            || tab.doc.is_huge()
+            || tab.doc.partial_range().is_some()
+            || tab.doc.is_non_text()
+        {
+            self.set_status(tr("snippet.needs_full_text"), cx);
+            return;
+        }
+        let language = tab.doc.language.clone();
+        let token = language_key(&language).to_string();
+        let mut unsupported = std::collections::BTreeSet::new();
+        let mut skipped_scopes = std::collections::BTreeSet::new();
+        for snippet in &self.snippets.snippets {
+            let Some(scope) = snippet.scope.as_deref() else {
+                continue;
+            };
+            if luban_core::snippet::scope_is_fully_supported(scope) {
+                if !snippet.matches_language(&language, &token) {
+                    skipped_scopes.insert(scope);
+                }
+            } else {
+                unsupported.insert(scope);
+            }
+        }
+        if !unsupported.is_empty() {
+            log::warn!(
+                "{} snippet scope(s) use unsupported Sublime selectors; only simple source.<language> forms can match: {}",
+                unsupported.len(),
+                unsupported.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        let rows = crate::snippet_ui::rows(&self.snippets.snippets, &language, &token);
+        if rows.is_empty() {
+            log::warn!(
+                "no snippets match language '{language}' (token '{token}'); {} snippet(s) loaded; scopes that did not match: {}",
+                self.snippets.snippets.len(),
+                if skipped_scopes.is_empty() {
+                    "-".to_string()
+                } else {
+                    skipped_scopes.into_iter().collect::<Vec<_>>().join(", ")
+                }
+            );
+            self.set_status(tr("snippet.none"), cx);
+            return;
+        }
+        let state = cx.new(|cx| CommandState::new(window, cx));
+        state.update(cx, |state, cx| state.focus(window, cx));
+        self.snippet_picker_rows = rows;
+        self.palette = Some(PaletteOverlay {
+            kind: PaletteKind::Snippets,
+            state,
+            command_groups: Vec::new(),
+            plugin_commands: Vec::new(),
+            plugin_section: 0,
+        });
+        cx.notify();
+    }
+
+    fn insert_snippet(
+        &mut self,
+        snippet: &luban_core::snippet::Snippet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.full_text_editing_available(window, cx) {
+            return;
+        }
+        self.sync_active(window, cx);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let (start, end) = tab.doc.selection();
+        let chars = tab.doc.char_count();
+        let start = start.min(chars);
+        let end = end.min(chars);
+        let expansion = luban_core::snippet::expand(&snippet.body);
+        let mut text = String::with_capacity(tab.doc.text.len() + expansion.text.len());
+        text.extend(tab.doc.text.chars().take(start));
+        text.push_str(&expansion.text);
+        text.extend(tab.doc.text.chars().skip(end));
+        let (select_start, select_end) = expansion
+            .stops
+            .first()
+            .map(|stop| (start + stop.start, start + stop.end))
+            .unwrap_or_else(|| {
+                let cursor = start + expansion.text.chars().count();
+                (cursor, cursor)
+            });
+        self.replace_document_text(text, select_start, select_end, window, cx);
+        if expansion.stops.is_empty() {
+            self.snippet_session = None;
+        } else {
+            self.snippet_session = Some(crate::snippet_ui::SnippetSession::new(
+                tab_id, start, &expansion,
+            ));
+        }
+        if !expansion.warnings.is_empty() {
+            log::warn!(
+                "snippet '{}': {}",
+                snippet.name,
+                expansion.warnings.join("; ")
+            );
+        }
+    }
+
+    fn snippet_next(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .snippet_session
+            .as_ref()
+            .is_some_and(|session| Some(session.tab_id) != self.active_tab().map(|tab| tab.id))
+        {
+            self.snippet_session = None;
+            return;
+        }
+        let selection_end = self
+            .active_tab()
+            .map(|tab| tab.doc.selection().1)
+            .unwrap_or(0);
+        let Some(session) = self.snippet_session.as_mut() else {
+            return;
+        };
+        // Shift+Tab on the first field keeps the session and the current
+        // selection; only Tab past the last field ends it.
+        if !forward && session.current == 0 {
+            return;
+        }
+        // Typing at a stop can change its length. Track the edited stop and
+        // shift the remaining stops and the final cursor accordingly.
+        session.adjust_for_edit(selection_end);
+        match session.advance(forward) {
+            Some((start, end)) => self.select_char_range(start, end, window, cx),
+            None => self.end_snippet(window, cx),
+        }
+    }
+
+    fn end_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.snippet_session.take() else {
+            return;
+        };
+        let cursor = session.final_cursor;
+        self.select_char_range(cursor, cursor, window, cx);
+    }
+
+    fn open_plugin_panel(
+        &mut self,
+        plugin_id: &str,
+        panel_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.plugin_host.settings_for(plugin_id);
+        let input = luban_plugin::runtime::CallInput {
+            plugin: luban_plugin::runtime::PluginIdentity {
+                id: plugin_id.to_string(),
+                version: self
+                    .plugin_host
+                    .manifest(plugin_id)
+                    .map(|manifest| manifest.version.clone())
+                    .unwrap_or_default(),
+                data_dir: self.plugin_host.root.join(plugin_id).join("data"),
+            },
+            document: self.plugin_document_snapshot(cx),
+            settings,
+            allowed_roots: self.plugin_allowed_roots(),
+        };
+        let Some(call) = self.plugin_host.panel_content(plugin_id, panel_id, input) else {
+            self.set_status(
+                tr_args(
+                    "plugins.panel_not_available",
+                    &[("panel", panel_id.to_string())],
+                ),
+                cx,
+            );
+            return;
+        };
+        let mut error = call.error.clone();
+        for action in call.output.actions {
+            match action {
+                luban_plugin::runtime::HostAction::SetDocumentText { .. } => {
+                    log::warn!(
+                        "plugin panel '{panel_id}' attempted to modify the document; action ignored"
+                    );
+                }
+                luban_plugin::runtime::HostAction::Notify(message) => self.set_status(message, cx),
+                luban_plugin::runtime::HostAction::SetStatus { id, text } => {
+                    self.plugin_host.set_status(plugin_id, &id, text);
+                }
+            }
+        }
+        if let Some(message) = &error {
+            self.set_status(message.clone(), cx);
+        }
+        let panel_spec = self
+            .plugin_host
+            .panels
+            .iter()
+            .find(|panel| panel.plugin_id == plugin_id && panel.id == panel_id)
+            .cloned();
+        let manifest_title = panel_spec
+            .as_ref()
+            .map(|panel| panel.title.clone())
+            .unwrap_or_else(|| panel_id.to_string());
+        let placement = panel_spec
+            .map(|panel| panel.placement)
+            .unwrap_or(luban_plugin::manifest::PanelPlacement::Right);
+        let content_title = call
+            .value
+            .as_ref()
+            .and_then(|panel| panel.title.clone())
+            .filter(|title| !title.trim().is_empty());
+        let truncated = call.value.as_ref().is_some_and(|panel| panel.truncated);
+        let lines = call.value.map(|panel| panel.lines).unwrap_or_default();
+        self.plugin_panel = Some(PluginPanelState {
+            plugin_id: plugin_id.to_string(),
+            panel_id: panel_id.to_string(),
+            title: content_title.unwrap_or(manifest_title),
+            placement,
+            truncated,
+            lines,
+            error: error.take(),
+        });
+        cx.notify();
+    }
+
+    fn render_plugin_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = &self.plugin_panel else {
+            return div().into_any_element();
+        };
+        let title = panel.title.clone();
+        let lines = panel.lines.clone();
+        let empty = lines.is_empty();
+        let error = panel.error.clone();
+        let has_error = error.is_some();
+        let truncated = panel.truncated;
+        let placement = panel.placement;
+        let plugin_id = panel.plugin_id.clone();
+        let panel_id = panel.panel_id.clone();
+        let weak_close = cx.weak_entity();
+        let weak_refresh = cx.weak_entity();
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("plugin-panel-refresh")
+                                    .label(tr("plugins.refresh"))
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        let plugin_id = plugin_id.clone();
+                                        let panel_id = panel_id.clone();
+                                        let _ = weak_refresh.update(cx, |this, cx| {
+                                            this.open_plugin_panel(
+                                                &plugin_id, &panel_id, window, cx,
+                                            );
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("plugin-panel-close")
+                                    .label(tr("common.close"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_close.update(cx, |this, cx| {
+                                            this.plugin_panel = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .id("plugin-panel-lines")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(lines.into_iter().map(|line| {
+                        let weak = cx.weak_entity();
+                        let element = div()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_sm()
+                            .child(line.text.clone());
+                        match line.command {
+                            Some(command) => element
+                                .cursor_pointer()
+                                .hover(|this| this.bg(cx.theme().colors.secondary))
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.plugin_panel = None;
+                                        if !this.run_command(&command, window, cx) {
+                                            this.set_status(
+                                                tr_args(
+                                                    "status.command_failed",
+                                                    &[("command", command.clone())],
+                                                ),
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                }),
+                            None => element,
+                        }
+                        .into_any_element()
+                    })),
+            )
+            .when(empty && !has_error, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(tr("plugins.panel_empty")),
+                )
+            })
+            .when(truncated, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(tr("plugins.panel_truncated")),
+                )
+            });
+        let _ = window;
+        let card = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .bg(cx.theme().colors.background)
+            .child(content);
+        match placement {
+            luban_plugin::manifest::PanelPlacement::Right => div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .w(px(380.))
+                .border_l_1()
+                .border_color(cx.theme().colors.border)
+                .child(card)
+                .into_any_element(),
+            luban_plugin::manifest::PanelPlacement::Bottom => div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(24.))
+                .h(px(260.))
+                .border_t_1()
+                .border_color(cx.theme().colors.border)
+                .child(card)
+                .into_any_element(),
+        }
     }
 
     /// Take a local-history snapshot of the file a save is about to replace.
@@ -11321,12 +12782,21 @@ impl LubanApp {
             .iter()
             .map(|(_, commands)| commands.iter().map(|command| command.id).collect())
             .collect();
+        let plugin_section = command_groups.len();
+        let plugin_commands: Vec<&'static str> = self
+            .plugin_host
+            .commands
+            .iter()
+            .map(|command| command.id)
+            .collect();
         let state = cx.new(|cx| CommandState::new(window, cx));
         state.update(cx, |state, cx| state.focus(window, cx));
         self.palette = Some(PaletteOverlay {
             kind: PaletteKind::Commands,
             state,
             command_groups,
+            plugin_commands,
+            plugin_section,
         });
         cx.notify();
     }
@@ -11347,6 +12817,8 @@ impl LubanApp {
             kind: PaletteKind::QuickOpen,
             state,
             command_groups: Vec::new(),
+            plugin_commands: Vec::new(),
+            plugin_section: 0,
         });
         cx.notify();
     }
@@ -11482,15 +12954,32 @@ impl LubanApp {
         let Some(overlay) = self.palette.take() else {
             return;
         };
+        // The palette is gone. Hand focus back to the editor before running the
+        // selection so commands that do not open a focused surface keep typing
+        // in the document; surfaces opened below set their own focus.
+        self.focus_editor(window, cx);
         match kind {
             PaletteKind::Commands => {
-                let id = overlay
-                    .command_groups
-                    .get(index.section)
-                    .and_then(|group| group.get(index.row))
-                    .copied();
+                let id = if index.section < overlay.plugin_section {
+                    overlay
+                        .command_groups
+                        .get(index.section)
+                        .and_then(|group| group.get(index.row))
+                        .copied()
+                } else if index.section == overlay.plugin_section {
+                    overlay.plugin_commands.get(index.row).copied()
+                } else {
+                    None
+                };
                 if let Some(id) = id {
                     self.run_command(id, window, cx);
+                }
+            }
+            PaletteKind::Snippets => {
+                let row = self.snippet_picker_rows.get(index.row).cloned();
+                self.snippet_picker_rows.clear();
+                if let Some(row) = row {
+                    self.insert_snippet(&row.snippet, window, cx);
                 }
             }
             PaletteKind::QuickOpen => {
@@ -11516,7 +13005,6 @@ impl LubanApp {
                 }
             }
         }
-        self.focus_editor(window, cx);
         cx.notify();
     }
 
@@ -11524,6 +13012,7 @@ impl LubanApp {
         self.palette = None;
         self.quick.rows.clear();
         self.quick_query.clear();
+        self.snippet_picker_rows.clear();
         self.focus_editor(window, cx);
         cx.notify();
     }
@@ -11679,7 +13168,8 @@ impl LubanApp {
         };
         parts.push(key);
         let text = parts.join("+");
-        match commands::validate_override(&id, &text, &self.settings.keybindings) {
+        let dynamic = self.plugin_host.dynamic_specs();
+        match commands::validate_override_with(&id, &text, &self.settings.keybindings, &dynamic) {
             Ok(binding) => {
                 self.settings.keybindings.insert(id, binding);
                 editor.waiting_for = None;
@@ -12046,6 +13536,16 @@ impl LubanApp {
         {
             return self.capture_shortcut(&event.keystroke, window, cx);
         }
+        if self
+            .snippet_session
+            .as_ref()
+            .is_some_and(|session| Some(session.tab_id) != self.active_tab().map(|tab| tab.id))
+        {
+            self.snippet_session = None;
+        }
+        if self.snippet_session.is_some() && command && key == "z" && !shift {
+            self.snippet_session = None;
+        }
         if key == "escape" {
             if self.replace_preview.is_some() {
                 self.replace_preview = None;
@@ -12055,22 +13555,26 @@ impl LubanApp {
             if self.column_editor.open {
                 self.column_editor.open = false;
                 self.column_editor.error = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
             if self.sort_dialog.is_some() {
                 self.sort_dialog = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
             if self.filter_dialog.is_some() {
                 self.filter_dialog = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
             if self.macro_ui.open {
                 self.macro_ui.open = false;
                 self.macro_ui.error = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
@@ -12087,6 +13591,7 @@ impl LubanApp {
             }
             if self.shortcut_editor.is_some() {
                 self.shortcut_editor = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
@@ -12096,6 +13601,7 @@ impl LubanApp {
             }
             if self.file_dialog.is_some() {
                 self.cancel_file_dialog(cx);
+                self.focus_editor(window, cx);
                 return true;
             }
             if self.name_prompt.is_some() {
@@ -12116,11 +13622,13 @@ impl LubanApp {
             }
             if self.language_picker.is_some() {
                 self.language_picker = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
             if self.go_to_line.is_some() {
                 self.go_to_line = None;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
@@ -12137,6 +13645,7 @@ impl LubanApp {
             if self.find_in_files.open {
                 self.cancel_find_in_files(cx);
                 self.find_in_files.open = false;
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
@@ -12144,6 +13653,7 @@ impl LubanApp {
                 self.find.open = false;
                 self.cancel_huge_search();
                 self.find.clear();
+                self.focus_editor(window, cx);
                 cx.notify();
                 return true;
             }
@@ -12531,6 +14041,7 @@ impl LubanApp {
         let closed_tab_count = self.closed_tabs.len();
         let can_go_back = self.nav.can_back();
         let can_go_forward = self.nav.can_forward();
+        let diff_running = !self.diff_tasks.is_empty();
 
         let weak_file = weak.clone();
         let weak_edit = weak.clone();
@@ -12538,6 +14049,32 @@ impl LubanApp {
         let weak_view = weak.clone();
         let weak_settings = weak.clone();
         let weak_help = weak.clone();
+        let weak_plugins = weak.clone();
+        let command_context = self.command_context();
+        let plugin_commands: Vec<(&'static str, String, bool)> = self
+            .plugin_host
+            .commands
+            .iter()
+            .map(|command| {
+                (
+                    command.id,
+                    command.label.clone(),
+                    command.when.enabled(&command_context),
+                )
+            })
+            .collect();
+        let plugin_panels: Vec<(String, String, String)> = self
+            .plugin_host
+            .panels
+            .iter()
+            .map(|panel| {
+                (
+                    panel.plugin_id.clone(),
+                    panel.id.clone(),
+                    panel.title.clone(),
+                )
+            })
+            .collect();
         let recent_items = recent.clone();
 
         let file_menu = Button::new("menu-file")
@@ -13144,6 +14681,16 @@ impl LubanApp {
                     .separator()
                     .item(Self::menu_item(
                         &weak_edit,
+                        Self::command_label("edit.insert-snippet"),
+                        !can_edit_full_text,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("edit.insert-snippet", window, cx);
+                        },
+                    ))
+                    .separator()
+                    .item(Self::menu_item(
+                        &weak_edit,
                         Self::command_label("edit.unfold-current"),
                         !has_doc,
                         None,
@@ -13473,6 +15020,15 @@ impl LubanApp {
                     ))
                     .item(Self::menu_item(
                         &weak_view,
+                        Self::command_label("diff.cancel"),
+                        !diff_running,
+                        None,
+                        |this, window, cx| {
+                            this.run_command("diff.cancel", window, cx);
+                        },
+                    ))
+                    .item(Self::menu_item(
+                        &weak_view,
                         Self::command_label("view.bracket-colors"),
                         false,
                         Some(settings.bracket_colors),
@@ -13760,6 +15316,70 @@ impl LubanApp {
                 ))
             });
 
+        let plugin_menu = Button::new("menu-plugins")
+            .label(tr("menu.plugins"))
+            .ghost()
+            .compact()
+            .dropdown_menu(move |mut menu, _window, _cx| {
+                menu = menu.item(Self::menu_item(
+                    &weak_plugins,
+                    Self::command_label("plugins.manage"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("plugins.manage", window, cx);
+                    },
+                ));
+                if plugin_commands.is_empty() {
+                    menu = menu.item(PopupMenuItem::new(tr("menu.plugins.none")).disabled(true));
+                } else {
+                    for (id, label, enabled) in &plugin_commands {
+                        let id = *id;
+                        let enabled = *enabled;
+                        menu = menu.item(Self::menu_item(
+                            &weak_plugins,
+                            label.clone(),
+                            !enabled,
+                            None,
+                            move |this, window, cx| {
+                                this.run_command(id, window, cx);
+                            },
+                        ));
+                    }
+                }
+                for (plugin_id, panel_id, title) in &plugin_panels {
+                    let plugin_id = plugin_id.clone();
+                    let panel_id = panel_id.clone();
+                    menu = menu.item(Self::menu_item(
+                        &weak_plugins,
+                        title.clone(),
+                        false,
+                        None,
+                        move |this, window, cx| {
+                            this.open_plugin_panel(&plugin_id, &panel_id, window, cx);
+                        },
+                    ));
+                }
+                menu.item(Self::menu_item(
+                    &weak_plugins,
+                    Self::command_label("plugins.reload"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("plugins.reload", window, cx);
+                    },
+                ))
+                .item(Self::menu_item(
+                    &weak_plugins,
+                    Self::command_label("packages.reload"),
+                    false,
+                    None,
+                    |this, window, cx| {
+                        this.run_command("packages.reload", window, cx);
+                    },
+                ))
+            });
+
         div()
             .flex()
             .items_center()
@@ -13769,6 +15389,7 @@ impl LubanApp {
             .child(search_menu)
             .child(view_menu)
             .child(settings_menu)
+            .child(plugin_menu)
             .child(help_menu)
             .into_any_element()
     }
@@ -14455,7 +16076,58 @@ impl LubanApp {
         cx.notify();
     }
 
-    fn render_status_bar(&mut self, cx: &gpui_kit::App) -> AnyElement {
+    fn render_status_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.weak_entity();
+        let left_plugin: Vec<(String, Option<&'static str>)> = self
+            .plugin_host
+            .status_items(StatusAlignment::Left)
+            .into_iter()
+            .map(|item| {
+                let text = self
+                    .plugin_host
+                    .status_text(&item.plugin_id, &item.id)
+                    .unwrap_or(&item.text)
+                    .to_string();
+                (text, item.command)
+            })
+            .collect();
+        let right_plugin: Vec<(String, Option<&'static str>)> = self
+            .plugin_host
+            .status_items(StatusAlignment::Right)
+            .into_iter()
+            .map(|item| {
+                let text = self
+                    .plugin_host
+                    .status_text(&item.plugin_id, &item.id)
+                    .unwrap_or(&item.text)
+                    .to_string();
+                (text, item.command)
+            })
+            .collect();
+        let plugin_item = |weak: WeakEntity<Self>, text: String, command: Option<&'static str>| {
+            let item = div().child(text);
+            if let Some(command) = command {
+                let weak_right = weak.clone();
+                item.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.run_command(command, window, cx);
+                    });
+                })
+                .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                    let _ = weak_right.update(cx, |this, cx| {
+                        this.run_command(command, window, cx);
+                    });
+                })
+            } else {
+                item
+            }
+        };
+        let left_items = left_plugin
+            .into_iter()
+            .map(|(text, command)| plugin_item(weak.clone(), text, command));
+        let right_items = right_plugin
+            .into_iter()
+            .map(|(text, command)| plugin_item(weak.clone(), text, command));
         let (mut line, mut column) = (1, 1);
         let (mut sel_len, mut chars, mut lines) = (0, 0, 0);
         let mut large_file = false;
@@ -14701,12 +16373,20 @@ impl LubanApp {
                     self.status.clone()
                 }),
             ]))
-            .child(div().flex().items_center().gap_4().children([
-                div().child(eol_label),
-                div().child(encoding),
-                div().child(language),
-                div().child(zoom_label),
-            ]))
+            .children(left_items)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .children([
+                        div().child(eol_label),
+                        div().child(encoding),
+                        div().child(language),
+                        div().child(zoom_label),
+                    ])
+                    .children(right_items),
+            )
             .into_any_element()
     }
 
@@ -14801,6 +16481,12 @@ impl LubanApp {
         let font_size = self.settings.font_size;
         let font_family = self.settings.font_family.clone();
         let show_line_numbers = self.settings.show_line_numbers;
+        let editor_background = cx
+            .theme()
+            .highlight_theme
+            .style
+            .editor_background
+            .unwrap_or(cx.theme().colors.background);
         let _ = weak;
 
         // Disk-engine tabs mount only a bounded window, so the editor's own
@@ -14931,17 +16617,31 @@ impl LubanApp {
                                     .min_h(px(0.))
                                     .children(global_gutter)
                                     .child(
-                                        div().flex_1().min_w(px(0.)).h_full().child(
-                                            Editor::new(&editor)
-                                                .with_size(EDITOR_SIZE)
-                                                .appearance(false)
-                                                .bordered(false)
-                                                .size_full()
-                                                .text_size(px(font_size))
-                                                .when(!font_family.is_empty(), |this| {
-                                                    this.font_family(font_family.clone())
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .h_full()
+                                            .bg(editor_background)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    if this.snippet_session.is_some() {
+                                                        this.snippet_session = None;
+                                                        cx.notify();
+                                                    }
                                                 }),
-                                        ),
+                                            )
+                                            .child(
+                                                Editor::new(&editor)
+                                                    .with_size(EDITOR_SIZE)
+                                                    .appearance(false)
+                                                    .bordered(false)
+                                                    .size_full()
+                                                    .text_size(px(font_size))
+                                                    .when(!font_family.is_empty(), |this| {
+                                                        this.font_family(font_family.clone())
+                                                    }),
+                                            ),
                                     ),
                             )
                             .children(ruler)
@@ -16804,8 +18504,9 @@ impl LubanApp {
                     .child(
                         Button::new("sort-cancel")
                             .label(tr("common.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.sort_dialog = None;
+                                this.focus_editor(window, cx);
                                 cx.notify();
                             })),
                     )
@@ -16898,8 +18599,9 @@ impl LubanApp {
                     .child(
                         Button::new("filter-cancel")
                             .label(tr("common.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.filter_dialog = None;
+                                this.focus_editor(window, cx);
                                 cx.notify();
                             })),
                     )
@@ -16995,9 +18697,10 @@ impl LubanApp {
                     .child(
                         Button::new("column-cancel")
                             .label(tr("common.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.column_editor.open = false;
                                 this.column_editor.error = None;
+                                this.focus_editor(window, cx);
                                 cx.notify();
                             })),
                     )
@@ -17176,8 +18879,9 @@ impl LubanApp {
                 div().flex().justify_end().child(
                     Button::new("macro-close")
                         .label(tr("common.close"))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.macro_ui.open = false;
+                            this.focus_editor(window, cx);
                             cx.notify();
                         })),
                 ),
@@ -17511,9 +19215,11 @@ impl LubanApp {
                         Button::new("file-dialog-close")
                             .label(tr("common.close"))
                             .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ =
-                                    weak_close.update(cx, |this, cx| this.cancel_file_dialog(cx));
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_close.update(cx, |this, cx| {
+                                    this.cancel_file_dialog(cx);
+                                    this.focus_editor(window, cx);
+                                });
                             }),
                     ),
             )
@@ -17597,8 +19303,11 @@ impl LubanApp {
                 .child(
                     Button::new("file-dialog-cancel")
                         .label(tr("common.cancel"))
-                        .on_click(move |_, _, cx| {
-                            let _ = weak_cancel.update(cx, |this, cx| this.cancel_file_dialog(cx));
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_cancel.update(cx, |this, cx| {
+                                this.cancel_file_dialog(cx);
+                                this.focus_editor(window, cx);
+                            });
                         }),
                 )
                 .child(
@@ -17992,6 +19701,13 @@ impl LubanApp {
             .as_ref()
             .is_some_and(|index| !index.truncated_roots.is_empty());
         let context = self.command_context();
+        let plugin_items: Vec<(String, bool)> = overlay
+            .plugin_commands
+            .iter()
+            .filter_map(|id| self.plugin_host.command(id))
+            .map(|command| (command.label.clone(), command.when.enabled(&context)))
+            .collect();
+        let snippet_rows = self.snippet_picker_rows.clone();
         let weak_confirm = cx.weak_entity();
         let weak_cancel = cx.weak_entity();
         let weak_query = cx.weak_entity();
@@ -18000,6 +19716,7 @@ impl LubanApp {
             .placeholder(match kind {
                 PaletteKind::Commands => tr("command.palette.placeholder"),
                 PaletteKind::QuickOpen => tr("command.quick_open.placeholder"),
+                PaletteKind::Snippets => tr("snippet.picker_placeholder"),
             })
             .on_confirm(move |index, window, cx| {
                 let _ = weak_confirm.update(cx, |this, cx| {
@@ -18028,6 +19745,48 @@ impl LubanApp {
                             .items(items),
                     );
                 }
+                if !plugin_items.is_empty() {
+                    let items = plugin_items.iter().map(|(label, enabled)| {
+                        let item = CommandItem::new().label(label.clone());
+                        if !enabled {
+                            item.disabled(true)
+                        } else {
+                            item
+                        }
+                    });
+                    command = command.group(
+                        CommandGroup::new()
+                            .label(tr("command.category.plugins"))
+                            .items(items),
+                    );
+                }
+            }
+            PaletteKind::Snippets => {
+                let items = snippet_rows.iter().map(|row| {
+                    let label = row.label.clone();
+                    let detail = row.detail.clone();
+                    CommandItem::new()
+                        .label(label.clone())
+                        .keywords([detail.clone()])
+                        .child(move |_, cx| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .w_full()
+                                .child(div().truncate().text_sm().child(label.clone()))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(detail.clone()),
+                                )
+                                .into_any_element()
+                        })
+                });
+                command = command.group(CommandGroup::new().items(items));
             }
             PaletteKind::QuickOpen => {
                 command = command
@@ -18240,10 +19999,11 @@ impl LubanApp {
         };
         let waiting = editor.waiting_for.clone();
         let error = editor.error.clone();
-        let conflicts = commands::conflicts(&self.settings.keybindings);
+        let dynamic = self.plugin_host.dynamic_specs();
+        let conflicts = commands::conflicts_with(&self.settings.keybindings, &dynamic);
         let overrides = self.settings.keybindings.clone();
         let keymap = &self.keymap;
-        let rows: Vec<_> = commands::COMMANDS
+        let mut rows: Vec<_> = commands::COMMANDS
             .iter()
             .map(|spec| {
                 (
@@ -18254,6 +20014,14 @@ impl LubanApp {
                 )
             })
             .collect();
+        rows.extend(self.plugin_host.commands.iter().map(|command| {
+            (
+                command.id,
+                command.label.clone(),
+                keymap.binding_text(command.id).unwrap_or("—").to_string(),
+                overrides.get(command.id).cloned(),
+            )
+        }));
         let weak_all = cx.weak_entity();
         let weak_close = cx.weak_entity();
         let mut list = Vec::new();
@@ -18347,9 +20115,10 @@ impl LubanApp {
                                 Button::new("shortcuts-editor-close")
                                     .label(tr("common.close"))
                                     .compact()
-                                    .on_click(move |_, _, cx| {
+                                    .on_click(move |_, window, cx| {
                                         let _ = weak_close.update(cx, |this, cx| {
                                             this.shortcut_editor = None;
+                                            this.focus_editor(window, cx);
                                             cx.notify();
                                         });
                                     }),
@@ -18423,6 +20192,12 @@ impl LubanApp {
         }
         if self.language_picker.is_some() {
             overlays.push(self.render_language_picker(window, cx));
+        }
+        if self.plugin_manager.open {
+            overlays.push(self.render_plugin_manager(window, cx));
+        }
+        if self.plugin_panel.is_some() {
+            overlays.push(self.render_plugin_panel(window, cx));
         }
         if self.about_open {
             overlays.push(self.render_about(window, cx));
@@ -18684,9 +20459,10 @@ impl LubanApp {
                     .child(
                         Button::new("goto-cancel")
                             .label(tr("common.cancel"))
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 let _ = weak_cancel.update(cx, |this, cx| {
                                     this.go_to_line = None;
+                                    this.focus_editor(window, cx);
                                     cx.notify();
                                 });
                             }),
@@ -18751,6 +20527,7 @@ impl LubanApp {
                         let _ = weak_item.update(cx, |this, cx| {
                             this.set_language(name_owned.clone(), window, cx);
                             this.language_picker = None;
+                            this.focus_editor(window, cx);
                             cx.notify();
                         });
                     })
@@ -18778,9 +20555,10 @@ impl LubanApp {
                         Button::new("lang-close")
                             .label(tr("common.close"))
                             .compact()
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 let _ = weak_close.update(cx, |this, cx| {
                                     this.language_picker = None;
+                                    this.focus_editor(window, cx);
                                     cx.notify();
                                 });
                             }),
@@ -19301,16 +21079,32 @@ impl LubanApp {
         let weak = cx.weak_entity();
         let weak_edit = cx.weak_entity();
         let groups = palette::command_groups();
-        let sections = groups.into_iter().map(|(category, specs)| {
-            let rows: Vec<_> = specs
-                .iter()
-                .filter_map(|spec| {
-                    let binding = self.keymap.binding_text(spec.id)?;
-                    Some((tr(spec.label_key), binding.to_string()))
-                })
-                .collect();
-            (tr(category.label_key()), rows)
-        });
+        let plugin_rows: Vec<(String, String)> = self
+            .plugin_host
+            .commands
+            .iter()
+            .filter_map(|command| {
+                self.keymap
+                    .binding_text(command.id)
+                    .map(|binding| (command.label.clone(), binding.to_string()))
+            })
+            .collect();
+        let sections = groups
+            .into_iter()
+            .map(|(category, specs)| {
+                let rows: Vec<_> = specs
+                    .iter()
+                    .filter_map(|spec| {
+                        let binding = self.keymap.binding_text(spec.id)?;
+                        Some((tr(spec.label_key), binding.to_string()))
+                    })
+                    .collect();
+                (tr(category.label_key()), rows)
+            })
+            .chain(std::iter::once((
+                tr("command.category.plugins"),
+                plugin_rows,
+            )));
         let content = div()
             .flex()
             .flex_col()
@@ -19410,6 +21204,9 @@ impl LubanApp {
 
     fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.open = true;
+        self.preferences
+            .search
+            .update(cx, |input, cx| input.focus(window, cx));
         let value = self
             .settings
             .tab_size_for(&self.preferences.language)
@@ -19447,6 +21244,813 @@ impl LubanApp {
         // Escape and the global shortcuts keep reaching the app.
         self.focus_editor(window, cx);
         self.apply_settings(window, cx);
+    }
+
+    fn apply_plugin_setting(
+        &mut self,
+        plugin_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .plugin_host
+            .update_setting(plugin_id, key, value.clone())
+        {
+            self.plugin_manager.error = Some(tr_args(
+                "plugins.invalid_setting",
+                &[("plugin", plugin_id.to_string()), ("key", key.to_string())],
+            ));
+            cx.notify();
+            return;
+        }
+        self.settings
+            .plugin_settings
+            .entry(plugin_id.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
+        self.global_settings.plugin_settings = self.settings.plugin_settings.clone();
+        self.commit_settings();
+        self.plugin_manager.error = None;
+        cx.notify();
+    }
+
+    fn plugin_action_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.plugin_manager.pending_uninstall = None;
+        self.reload_plugins(window, cx);
+        self.commit_settings();
+        self.plugin_manager.message = Some(tr("plugins.reloaded"));
+        cx.notify();
+    }
+
+    fn uninstall_plugin(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let result = luban_plugin::install::uninstall(
+            &self.plugin_host.root,
+            id,
+            self.plugin_manager.remove_data,
+        );
+        match result {
+            Ok(()) => {
+                if self.plugin_manager.remove_data {
+                    self.settings.plugin_settings.remove(id);
+                    self.global_settings.plugin_settings = self.settings.plugin_settings.clone();
+                }
+                self.reload_plugins(window, cx);
+                self.commit_settings();
+                self.plugin_manager.pending_uninstall = None;
+                self.plugin_manager.error = None;
+                self.plugin_manager.message = Some(tr_args(
+                    "plugins.uninstalled",
+                    &[("plugin", id.to_string())],
+                ));
+                cx.notify();
+            }
+            Err(error) => {
+                self.plugin_manager.pending_uninstall = None;
+                self.plugin_manager.error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn plugin_state_label(state: &luban_plugin::registry::PluginState) -> String {
+        use luban_plugin::registry::PluginState;
+        match state {
+            PluginState::Enabled => tr("plugins.state.enabled"),
+            PluginState::DisabledByUser => tr("plugins.state.disabled"),
+            PluginState::NeedsApproval => tr("plugins.state.needs_approval"),
+            PluginState::PluginsDisabled => tr("plugins.state.plugins_disabled"),
+            PluginState::MissingDependency(dependency) => tr_args(
+                "plugins.state.missing_dependency",
+                &[("dependency", dependency.clone())],
+            ),
+            PluginState::IncompatibleDependency(dependency) => tr_args(
+                "plugins.state.incompatible_dependency",
+                &[("dependency", dependency.clone())],
+            ),
+            PluginState::DependencyCycle(ids) => {
+                tr_args("plugins.state.dependency_cycle", &[("ids", ids.clone())])
+            }
+            PluginState::LoadError(error) => error.clone(),
+        }
+    }
+
+    fn render_plugin_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        struct Row {
+            id: String,
+            name: String,
+            version: String,
+            author: String,
+            description: String,
+            state: String,
+            permissions: String,
+            manual: bool,
+            approved: bool,
+            enabled: bool,
+        }
+        let rows: Vec<Row> = self
+            .plugin_host
+            .registry
+            .entries
+            .values()
+            .map(|entry| {
+                let state = self
+                    .plugin_host
+                    .state(&entry.id)
+                    .map(Self::plugin_state_label)
+                    .unwrap_or_else(|| tr("plugins.state.unknown"));
+                let manual = match self.plugin_host.records.plugins.get(&entry.id) {
+                    Some(record) => matches!(
+                        &record.source,
+                        luban_plugin::install::InstallSource::Local { path }
+                            if path == &self.plugin_host.root.join(&entry.id)
+                    ),
+                    None => true,
+                };
+                Row {
+                    id: entry.id.clone(),
+                    name: entry.name().to_string(),
+                    version: entry.version().to_string(),
+                    author: entry
+                        .manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.author.clone())
+                        .unwrap_or_default(),
+                    description: entry
+                        .manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.description.clone())
+                        .unwrap_or_default(),
+                    state,
+                    permissions: {
+                        let mut parts = Vec::new();
+                        for name in entry.permissions.declared() {
+                            let implemented = luban_plugin::permissions::Permission::ALL
+                                .iter()
+                                .any(|permission| {
+                                    permission.name() == name && permission.implemented()
+                                });
+                            if implemented {
+                                parts.push(name.clone());
+                            } else {
+                                parts.push(format!("{name} ({})", tr("plugins.unavailable")));
+                            }
+                        }
+                        if parts.is_empty() {
+                            tr("plugins.no_permissions")
+                        } else {
+                            parts.join(", ")
+                        }
+                    },
+                    manual,
+                    approved: self.plugin_host.approved(&entry.id),
+                    enabled: self
+                        .plugin_host
+                        .state(&entry.id)
+                        .is_some_and(|state| state.is_enabled()),
+                }
+            })
+            .collect();
+        let schemas: Vec<(String, Vec<luban_plugin::manifest::SettingContribution>)> = self
+            .plugin_host
+            .schemas
+            .iter()
+            .map(|(id, schema)| (id.clone(), schema.clone()))
+            .collect();
+        let weak_close = cx.weak_entity();
+        let weak_toggle = cx.weak_entity();
+        let weak_reload = cx.weak_entity();
+        let weak_install = cx.weak_entity();
+        let weak_uninstall_confirm = cx.weak_entity();
+        let weak_uninstall_cancel = cx.weak_entity();
+        let install_input = self.plugin_manager.install_source.clone();
+        let safe_mode = self.safe_mode;
+        let plugins_enabled = self.settings.plugins_enabled;
+        let remove_data = self.plugin_manager.remove_data;
+        let message = self.plugin_manager.message.clone();
+        let error = self.plugin_manager.error.clone();
+        let host_errors = self.plugin_host.errors.clone();
+        let pending_uninstall = self.plugin_manager.pending_uninstall.clone();
+        let uninstall_dependents = pending_uninstall
+            .as_ref()
+            .map(|id| self.plugin_host.dependents_of(id))
+            .unwrap_or_default();
+
+        let mut has_rows = false;
+        let mut list = div()
+            .id("plugin-manager-list")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll();
+        for row in rows {
+            has_rows = true;
+            let weak_enable = cx.weak_entity();
+            let weak_approve = cx.weak_entity();
+            let weak_uninstall = cx.weak_entity();
+            let weak_update = cx.weak_entity();
+            let id = row.id.clone();
+            let id_enable = row.id.clone();
+            let id_approve = row.id.clone();
+            let id_uninstall = row.id.clone();
+            let id_update = row.id.clone();
+            let approved = row.approved;
+            let enabled = row.enabled;
+            let mut actions = div().flex().items_center().gap_2();
+            if !enabled {
+                actions = actions.child(
+                    Button::new(format!("plugin-enable-{id}"))
+                        .label(tr("plugins.enable"))
+                        .compact()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_enable.update(cx, |this, cx| {
+                                this.settings
+                                    .disabled_plugins
+                                    .retain(|item| item != &id_enable);
+                                this.global_settings.disabled_plugins =
+                                    this.settings.disabled_plugins.clone();
+                                this.plugin_action_reload(window, cx);
+                            });
+                        }),
+                );
+            } else {
+                actions = actions.child(
+                    Button::new(format!("plugin-disable-{id}"))
+                        .label(tr("plugins.disable"))
+                        .compact()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_enable.update(cx, |this, cx| {
+                                if !this.settings.disabled_plugins.contains(&id_enable) {
+                                    this.settings.disabled_plugins.push(id_enable.clone());
+                                }
+                                this.global_settings.disabled_plugins =
+                                    this.settings.disabled_plugins.clone();
+                                this.plugin_action_reload(window, cx);
+                            });
+                        }),
+                );
+            }
+            if !approved {
+                actions = actions.child(
+                    Button::new(format!("plugin-approve-{id}"))
+                        .label(tr("plugins.approve"))
+                        .compact()
+                        .primary()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_approve.update(cx, |this, cx| {
+                                let Some(manifest) = this.plugin_host.manifest(&id_approve) else {
+                                    return;
+                                };
+                                match luban_plugin::install::approve(
+                                    &this.plugin_host.root,
+                                    manifest,
+                                ) {
+                                    Ok(_) => this.plugin_action_reload(window, cx),
+                                    Err(error) => {
+                                        this.plugin_manager.error = Some(error);
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }),
+                );
+            }
+            if !row.manual {
+                actions = actions.child(
+                    Button::new(format!("plugin-update-{id}"))
+                        .label(tr("plugins.update"))
+                        .compact()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak_update.update(cx, |this, cx| {
+                                match luban_plugin::install::update(
+                                    &this.plugin_host.root,
+                                    &id_update,
+                                ) {
+                                    Ok(_) => this.plugin_action_reload(window, cx),
+                                    Err(error) => {
+                                        this.plugin_manager.error = Some(error);
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }),
+                );
+            }
+            actions = actions.child(
+                Button::new(format!("plugin-uninstall-{id}"))
+                    .label(tr("plugins.uninstall"))
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_uninstall.update(cx, |this, cx| {
+                            this.plugin_manager.pending_uninstall = Some(id_uninstall.clone());
+                            this.plugin_manager.error = None;
+                            this.plugin_manager.message = None;
+                            cx.notify();
+                        });
+                    }),
+            );
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors.border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{} {}", row.name, row.version)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(row.state),
+                            ),
+                    )
+                    .when(!row.description.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(row.description),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(format!(
+                                "{} · {}{}",
+                                row.id,
+                                if row.permissions.is_empty() {
+                                    tr("plugins.no_permissions")
+                                } else {
+                                    row.permissions
+                                },
+                                if row.author.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", row.author)
+                                }
+                            )),
+                    )
+                    .child(actions),
+            );
+        }
+        if !has_rows {
+            list = list.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(tr("plugins.none_installed")),
+            );
+        }
+
+        let mut settings_rows = div().flex().flex_col().gap_2();
+        for (plugin_id, schema) in schemas {
+            if schema.is_empty() {
+                continue;
+            }
+            let current = self.plugin_host.settings_for(&plugin_id);
+            settings_rows = settings_rows.child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(plugin_id.clone()),
+            );
+            for setting in schema {
+                let value = current
+                    .get(&setting.key)
+                    .cloned()
+                    .unwrap_or_else(|| luban_plugin::manifest::default_setting_value(&setting));
+                let row_id = format!("plugin-setting-{plugin_id}-{}", setting.key);
+                let plugin_id2 = plugin_id.clone();
+                let key = setting.key.clone();
+                let field = match setting.setting_type {
+                    luban_plugin::manifest::SettingType::Boolean => {
+                        let checked = value.as_bool().unwrap_or(false);
+                        let plugin_id3 = plugin_id2.clone();
+                        let key3 = key.clone();
+                        Checkbox::new(row_id)
+                            .label(setting.label.clone())
+                            .checked(checked)
+                            .on_click(cx.listener(move |this, checked, _, cx| {
+                                this.apply_plugin_setting(
+                                    &plugin_id3,
+                                    &key3,
+                                    serde_json::Value::Bool(*checked),
+                                    cx,
+                                );
+                            }))
+                            .into_any_element()
+                    }
+                    luban_plugin::manifest::SettingType::Number => {
+                        let current_value = value.as_f64().unwrap_or(0.0);
+                        let step = setting.step.unwrap_or(1.0);
+                        let min = setting.min.unwrap_or(f64::NEG_INFINITY);
+                        let max = setting.max.unwrap_or(f64::INFINITY);
+                        let down = (current_value - step).max(min);
+                        let up = (current_value + step).min(max);
+                        let plugin_down = plugin_id2.clone();
+                        let plugin_up = plugin_id2.clone();
+                        let key_down = key.clone();
+                        let key_up = key.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().child(setting.label.clone()))
+                            .child(
+                                Button::new(format!("{row_id}-down"))
+                                    .label("−")
+                                    .compact()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.apply_plugin_setting(
+                                            &plugin_down,
+                                            &key_down,
+                                            serde_json::json!(down),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(div().text_sm().child(format!("{current_value}")))
+                            .child(
+                                Button::new(format!("{row_id}-up"))
+                                    .label("+")
+                                    .compact()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.apply_plugin_setting(
+                                            &plugin_up,
+                                            &key_up,
+                                            serde_json::json!(up),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .into_any_element()
+                    }
+                    luban_plugin::manifest::SettingType::Enum => {
+                        let current_value = value.as_str().unwrap_or_default().to_string();
+                        let values = setting.values.clone();
+                        let weak_enum = cx.weak_entity();
+                        let plugin_enum = plugin_id2.clone();
+                        let key_enum = key.clone();
+                        Button::new(row_id)
+                            .label(format!("{}: {current_value}", setting.label))
+                            .compact()
+                            .dropdown_menu(move |menu, _window, _cx| {
+                                let mut menu = menu;
+                                for candidate in values.clone() {
+                                    let weak = weak_enum.clone();
+                                    let plugin = plugin_enum.clone();
+                                    let key = key_enum.clone();
+                                    let value = candidate.clone();
+                                    menu = menu.item(PopupMenuItem::new(candidate).on_click(
+                                        move |_, _, cx| {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.apply_plugin_setting(
+                                                    &plugin,
+                                                    &key,
+                                                    serde_json::Value::String(value.clone()),
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu
+                            })
+                            .into_any_element()
+                    }
+                    luban_plugin::manifest::SettingType::String => {
+                        let current_value = value.as_str().unwrap_or_default().to_string();
+                        let key_string = format!("{plugin_id2}:{key}");
+                        let input =
+                            self.plugin_manager
+                                .text_input(&key_string, &current_value, window, cx);
+                        let weak_apply = cx.weak_entity();
+                        let plugin_string = plugin_id2.clone();
+                        let key_apply = key.clone();
+                        let input_apply = input.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().child(setting.label.clone()))
+                            .child(Input::new(&input).h(px(28.)).flex_1())
+                            .child(
+                                Button::new(format!("{row_id}-apply"))
+                                    .label(tr("common.apply"))
+                                    .compact()
+                                    .on_click(move |_, _, cx| {
+                                        let value = input_apply.read(cx).value().to_string();
+                                        let _ = weak_apply.update(cx, |this, cx| {
+                                            this.apply_plugin_setting(
+                                                &plugin_string,
+                                                &key_apply,
+                                                serde_json::Value::String(value),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            )
+                            .into_any_element()
+                    }
+                };
+                settings_rows = settings_rows.child(field);
+            }
+        }
+
+        let content = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr("plugins.title")),
+                    )
+                    .child(
+                        Button::new("plugin-manager-close")
+                            .label(tr("common.close"))
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_close.update(cx, |this, cx| {
+                                    this.plugin_manager.open = false;
+                                    this.focus_editor(window, cx);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        Checkbox::new("plugins-enabled")
+                            .label(tr("plugins.enabled"))
+                            .checked(plugins_enabled)
+                            .on_click(move |this_checked, window, cx| {
+                                let _ = weak_toggle.update(cx, |this, cx| {
+                                    this.settings.plugins_enabled = *this_checked;
+                                    this.global_settings.plugins_enabled = *this_checked;
+                                    this.commit_settings();
+                                    this.plugin_action_reload(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Checkbox::new("plugins-remove-data")
+                            .label(tr("plugins.remove_data"))
+                            .checked(remove_data)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.plugin_manager.remove_data = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .when(safe_mode, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(tr("plugins.safe_mode")),
+                        )
+                    }),
+            )
+            .when_some(message, |this, message| {
+                this.child(div().text_xs().child(message))
+            })
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors.danger)
+                        .child(error),
+                )
+            })
+            .when(!host_errors.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .children(host_errors.iter().cloned().map(|error| div().child(error))),
+                )
+            })
+            .when_some(pending_uninstall, |this, id| {
+                let detail_key = if remove_data {
+                    "plugins.uninstall_confirm_data"
+                } else {
+                    "plugins.uninstall_confirm"
+                };
+                let id_confirm = id.clone();
+                let mut banner = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors.danger)
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(tr_args(detail_key, &[("plugin", id.clone())])),
+                    );
+                if !uninstall_dependents.is_empty() {
+                    banner =
+                        banner.child(div().text_xs().text_color(cx.theme().colors.danger).child(
+                            tr_args(
+                                "plugins.uninstall_dependents",
+                                &[("plugins", uninstall_dependents.join(", "))],
+                            ),
+                        ));
+                }
+                this.child(
+                    banner
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("plugin-uninstall-cancel")
+                                        .label(tr("common.cancel"))
+                                        .compact()
+                                        .on_click(move |_, _, cx| {
+                                            let _ = weak_uninstall_cancel.update(cx, |this, cx| {
+                                                this.plugin_manager.pending_uninstall = None;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("plugin-uninstall-confirm")
+                                        .label(tr("plugins.uninstall_confirm_button"))
+                                        .compact()
+                                        .danger()
+                                        .on_click(move |_, window, cx| {
+                                            let _ =
+                                                weak_uninstall_confirm.update(cx, |this, cx| {
+                                                    this.uninstall_plugin(&id_confirm, window, cx);
+                                                });
+                                        }),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Input::new(&install_input).h(px(30.)).flex_1())
+                    .child(
+                        Button::new("plugin-install")
+                            .label(tr("plugins.install"))
+                            .primary()
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_install.update(cx, |this, cx| {
+                                    let source = this
+                                        .plugin_manager
+                                        .install_source
+                                        .read(cx)
+                                        .value()
+                                        .to_string();
+                                    let source = source.trim().to_string();
+                                    if source.is_empty() {
+                                        this.plugin_manager.error =
+                                            Some(tr("plugins.install_source_required"));
+                                        cx.notify();
+                                        return;
+                                    }
+                                    let replace = this.plugin_manager.pending_replace.as_deref()
+                                        == Some(source.as_str());
+                                    let result = if source.ends_with(".zip") {
+                                        luban_plugin::install::install_zip_with(
+                                            &this.plugin_host.root,
+                                            std::path::Path::new(&source),
+                                            replace,
+                                        )
+                                    } else if source.starts_with("http://")
+                                        || source.starts_with("https://")
+                                        || source.starts_with("git@")
+                                        || source.ends_with(".git")
+                                    {
+                                        luban_plugin::install::install_git_with(
+                                            &this.plugin_host.root,
+                                            &source,
+                                            None,
+                                            replace,
+                                        )
+                                    } else {
+                                        luban_plugin::install::install_local_with(
+                                            &this.plugin_host.root,
+                                            std::path::Path::new(&source),
+                                            replace,
+                                        )
+                                    };
+                                    match result {
+                                        Ok(record) => {
+                                            this.plugin_manager.pending_replace = None;
+                                            this.plugin_manager.error = None;
+                                            this.plugin_manager.message = Some(format!(
+                                                "{} {}",
+                                                tr("plugins.installed"),
+                                                record.id
+                                            ));
+                                            this.plugin_action_reload(window, cx);
+                                        }
+                                        Err(error) => {
+                                            if let Some(id) = error.strip_prefix(
+                                                luban_plugin::install::REPLACE_CONFIRMATION,
+                                            ) {
+                                                this.plugin_manager.pending_replace = Some(source);
+                                                this.plugin_manager.message = Some(tr_args(
+                                                    "plugins.replace_confirm",
+                                                    &[("plugin", id.to_string())],
+                                                ));
+                                                this.plugin_manager.error = None;
+                                                cx.notify();
+                                            } else {
+                                                this.plugin_manager.pending_replace = None;
+                                                this.plugin_manager.error = Some(error);
+                                                cx.notify();
+                                            }
+                                        }
+                                    }
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("plugin-reload")
+                            .label(tr("plugins.reload"))
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                let _ = weak_reload.update(cx, |this, cx| {
+                                    this.plugin_action_reload(window, cx);
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(tr("plugins.installed_title")),
+                    )
+                    .child(list),
+            )
+            .child(
+                div()
+                    .id("plugin-settings-scroll")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .max_h(px(180.))
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(tr("plugins.settings_title")),
+                    )
+                    .child(settings_rows),
+            );
+        self.overlay_card(760.0, Some(620.0), cx, content.into_any_element())
     }
 
     fn render_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -19649,7 +22253,13 @@ impl LubanApp {
                     })
                     .when(visible.contains("appearance"), |this| {
                         this.child({
-                            let syntax_label = if settings.syntax_theme == "custom" {
+                            let package_themes = self.packages.themes.clone();
+                            let syntax_label = if let Some(package) = package_themes
+                                .iter()
+                                .find(|theme| theme.id == settings.syntax_theme)
+                            {
+                                package.name.clone()
+                            } else if settings.syntax_theme == "custom" {
                                 settings
                                     .syntax_theme_path
                                     .as_ref()
@@ -19669,6 +22279,13 @@ impl LubanApp {
                             };
                             let weak_theme = weak.clone();
                             let weak_import = weak.clone();
+                            let custom_theme = settings.syntax_theme_path.as_ref().map(|path| {
+                                let name = path
+                                    .file_stem()
+                                    .map(|stem| stem.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| tr("prefs.syntax_custom"));
+                                format!("{}: {name}", tr("prefs.syntax_custom"))
+                            });
                             div()
                                 .flex()
                                 .items_center()
@@ -19703,6 +22320,35 @@ impl LubanApp {
                                                             });
                                                         },
                                                     ),
+                                                );
+                                            }
+                                            if let Some(label) = custom_theme.clone() {
+                                                let weak = weak_theme.clone();
+                                                menu =
+                                                    menu.item(PopupMenuItem::new(label).on_click(
+                                                        move |_, window, cx| {
+                                                            let _ = weak.update(cx, |this, cx| {
+                                                                this.set_syntax_theme(
+                                                                    syntax_theme::CUSTOM_ID,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        },
+                                                    ));
+                                            }
+                                            for theme in &package_themes {
+                                                let weak = weak_theme.clone();
+                                                let id = theme.id.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(theme.name.clone())
+                                                        .on_click(move |_, window, cx| {
+                                                            let _ = weak.update(cx, |this, cx| {
+                                                                this.set_syntax_theme(
+                                                                    &id, window, cx,
+                                                                );
+                                                            });
+                                                        }),
                                                 );
                                             }
                                             Self::fit_menu(menu, window)
@@ -20644,6 +23290,72 @@ impl LubanApp {
                                 ),
                         )
                     })
+                    .when(visible.contains("plugins"), |this| {
+                        let weak_manage = weak.clone();
+                        let weak_plugins = weak.clone();
+                        let weak_packages = weak.clone();
+                        let plugins_enabled = self.settings.plugins_enabled;
+                        let safe_mode = self.safe_mode;
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(tr("prefs.plugins")),
+                                )
+                                .child(
+                                    Checkbox::new("prefs-plugins-enabled")
+                                        .label(tr("plugins.enabled"))
+                                        .checked(plugins_enabled)
+                                        .on_click(move |checked, window, cx| {
+                                            let _ = weak_plugins.update(cx, |this, cx| {
+                                                this.settings.plugins_enabled = *checked;
+                                                this.global_settings.plugins_enabled = *checked;
+                                                this.commit_settings();
+                                                this.plugin_action_reload(window, cx);
+                                            });
+                                        }),
+                                )
+                                .when(safe_mode, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().colors.muted_foreground)
+                                            .child(tr("plugins.safe_mode")),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("prefs-plugins-manage")
+                                                .label(tr("plugins.manage"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_manage.update(cx, |this, cx| {
+                                                        this.plugin_manager.open(window, cx);
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("prefs-packages-reload")
+                                                .label(tr("packages.reload"))
+                                                .compact()
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = weak_packages.update(cx, |this, cx| {
+                                                        this.reload_packages(window, cx);
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -20782,8 +23494,16 @@ impl Render for LubanApp {
         self.window_height = bounds.size.height.as_f32();
         self.window_maximized = window.is_maximized();
         window_registry::update_bounds(self.window_id, bounds, self.window_maximized);
+        if self
+            .snippet_session
+            .as_ref()
+            .is_some_and(|session| Some(session.tab_id) != self.active_tab().map(|tab| tab.id))
+        {
+            self.snippet_session = None;
+        }
         self.process_enter_actions(window, cx);
         self.sync_active(window, cx);
+        self.process_ipc_requests(window, cx);
         self.sync_file_watch(cx);
         self.sync_large_file_panel(window, cx);
         self.autosave_session(cx);
@@ -20946,6 +23666,114 @@ fn client_decorated_frame(root: AnyElement, border: Hsla, maximized: bool) -> An
         .border_color(border)
         .child(root)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::{LaunchOptions, LubanApp, PaletteKind, PaletteOverlay, WindowInit};
+    use gpui::TestAppContext;
+    use gpui_kit::component::command::CommandState;
+    use gpui_kit::component::IndexPath;
+    use gpui_kit::{AppContext, Focusable};
+
+    fn options() -> LaunchOptions {
+        LaunchOptions {
+            files: Vec::new(),
+            smoke_test: false,
+            safe_mode: true,
+            session_writer: false,
+            wait: false,
+            goto: None,
+            diff: None,
+            stdin: None,
+            command: None,
+            exit_on_command_failure: false,
+            command_result: None,
+            ipc_queue: None,
+            manual_window_chrome: false,
+            recoveries: Vec::new(),
+            init: WindowInit::Blank,
+            auto_recovery: false,
+            window_id: 1,
+        }
+    }
+
+    #[gpui::test]
+    fn palette_commands_and_escape_restore_editor_focus(cx: &mut TestAppContext) {
+        let config = tempfile::tempdir().unwrap();
+        // SAFETY: no other test in this binary reads the config directory.
+        unsafe { std::env::set_var("LUBAN_NOTEPAD_CONFIG_DIR", config.path()) };
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        for (command, opened, closed) in [
+            (
+                "settings.preferences",
+                (|app: &LubanApp| app.preferences.open) as fn(&LubanApp) -> bool,
+                (|app: &LubanApp| !app.preferences.open) as fn(&LubanApp) -> bool,
+            ),
+            (
+                "plugins.manage",
+                (|app: &LubanApp| app.plugin_manager.open) as fn(&LubanApp) -> bool,
+                (|app: &LubanApp| !app.plugin_manager.open) as fn(&LubanApp) -> bool,
+            ),
+        ] {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.focus_editor(window, cx);
+                    let state = cx.new(|cx| CommandState::new(window, cx));
+                    app.palette = Some(PaletteOverlay {
+                        kind: PaletteKind::Commands,
+                        state,
+                        command_groups: vec![vec![command]],
+                        plugin_commands: Vec::new(),
+                        plugin_section: 1,
+                    });
+                    app.confirm_palette(PaletteKind::Commands, IndexPath::new(0), window, cx);
+                });
+            });
+            cx.update(|_, cx| {
+                let app = app.read(cx);
+                assert!(opened(app), "{command} did not open");
+                assert!(app.palette.is_none());
+            });
+
+            cx.simulate_keystrokes("escape");
+
+            cx.update(|window, cx| {
+                let app = app.read(cx);
+                assert!(closed(app), "{command} did not close");
+                let editor = app.tabs.get(app.active).expect("active tab").editor.clone();
+                assert!(
+                    editor.read(cx).focus_handle(cx).is_focused(window),
+                    "{command} did not restore editor focus"
+                );
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_roots_tests {
+    use super::LubanApp;
+
+    #[test]
+    fn workspace_roots_exclude_documents_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let roots = LubanApp::plugin_allowed_roots_for(
+            None,
+            &[workspace.path().to_path_buf()],
+            Some(outside.path()),
+        );
+        assert_eq!(roots, vec![workspace.path().canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn an_open_document_supplies_a_root_without_a_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        let roots = LubanApp::plugin_allowed_roots_for(None, &[], Some(outside.path()));
+        assert_eq!(roots, vec![outside.path().canonicalize().unwrap()]);
+    }
 }
 
 #[cfg(test)]

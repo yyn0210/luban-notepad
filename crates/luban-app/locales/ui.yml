@@ -1,8 +1,8 @@
 _version: 2
 
 cli.help:
-  en: "Luban Notepad %{version}\n\nUsage: luban-notepad [--new] [--smoke-test] [FILE ...]\n\nA cross-platform Rust reimplementation of the Notepad++ editing experience."
-  zh-CN: "鲁班编辑器 %{version}\n\n用法：luban-notepad [--new] [--smoke-test] [文件 ...]\n\n使用 Rust 与 GPUI 跨平台重新实现 Notepad++ 的编辑体验。"
+  en: "Luban Notepad %{version}\n\nUsage: luban-notepad [OPTIONS] [FILE ...]\n\nOptions:\n  --goto <path>:<line>[:<col>]  Open a file at a line and column\n  --new-window                  Open a new window\n  --wait                        Wait until the opened tabs close\n  --diff <left> <right>         Open a read-only diff\n  --stdin                       Read standard input as a new document\n  --command <id>                Run a command after opening files\n  --safe-mode                   Start without plugins\n  --new, -n                     Start without restoring the session\n  --smoke-test                  Start and exit (CI)\n  --help, -h                    Show this help\n  --version, -V                 Show the version\n\nA cross-platform Rust reimplementation of the Notepad++ editing experience."
+  zh-CN: "鲁班编辑器 %{version}\n\n用法：luban-notepad [选项] [文件 ...]\n\n选项：\n  --goto <路径>:<行>[:<列>]     打开文件并定位到行列\n  --new-window                  打开新窗口\n  --wait                        等到打开的标签页关闭后退出\n  --diff <左> <右>              打开只读差异视图\n  --stdin                       把标准输入读入新文档\n  --command <id>                打开文件后执行命令\n  --safe-mode                   以安全模式启动（禁用插件）\n  --new, -n                     启动时不恢复会话\n  --smoke-test                  启动后退出（CI）\n  --help, -h                    显示帮助\n  --version, -V                 显示版本\n\n使用 Rust 与 GPUI 跨平台重新实现 Notepad++ 的编辑体验。"
 
 common.close:
   en: "Close"
@@ -1470,6 +1470,9 @@ status.export_unavailable:
 status.theme_imported:
   en: "Imported syntax theme from %{path}"
   zh-CN: "已从 %{path} 导入语法主题"
+theme.invalid_fallback:
+  en: "The saved syntax theme could not be loaded; using InspiredGitHub."
+  zh-CN: "无法加载已保存的语法主题，已使用 InspiredGitHub。"
 status.theme_import_failed:
   en: "Theme import failed: %{error}"
   zh-CN: "主题导入失败：%{error}"
@@ -2258,3 +2261,245 @@ view.outline:
 view.breadcrumbs:
   en: "Breadcrumbs"
   zh-CN: "面包屑"
+
+common.apply:
+  en: "Apply"
+  zh-CN: "应用"
+
+menu.plugins:
+  en: "Plugins"
+  zh-CN: "插件"
+menu.plugins.manage:
+  en: "Manage plugins…"
+  zh-CN: "管理插件…"
+menu.plugins.reload:
+  en: "Reload plugins"
+  zh-CN: "重新加载插件"
+menu.plugins.none:
+  en: "No plugin commands"
+  zh-CN: "没有插件命令"
+menu.packages.reload:
+  en: "Reload user packages"
+  zh-CN: "重新加载用户包"
+menu.edit.insert_snippet:
+  en: "Insert snippet…"
+  zh-CN: "插入片段…"
+
+prefs.plugins:
+  en: "Plugins"
+  zh-CN: "插件"
+
+status.command_failed:
+  en: "Command failed: %{command}"
+  zh-CN: "命令失败：%{command}"
+
+command.category.plugins:
+  en: "Plugins"
+  zh-CN: "插件"
+
+snippet.picker_placeholder:
+  en: "Insert a snippet…"
+  zh-CN: "插入片段…"
+snippet.no_document:
+  en: "Open a document to insert a snippet."
+  zh-CN: "请先打开文档再插入片段。"
+snippet.needs_full_text:
+  en: "Snippets are unavailable for this document type."
+  zh-CN: "此文档类型不支持片段。"
+snippet.none:
+  en: "No snippets match this language."
+  zh-CN: "没有匹配当前语言的片段。"
+
+packages.reload:
+  en: "Reload user packages"
+  zh-CN: "重新加载用户包"
+
+plugins.title:
+  en: "Plugins"
+  zh-CN: "插件"
+plugins.enabled:
+  en: "Enable plugins"
+  zh-CN: "启用插件"
+plugins.safe_mode:
+  en: "Safe mode: plugins are disabled for this run."
+  zh-CN: "安全模式：本次运行已禁用插件。"
+plugins.reloaded:
+  en: "Plugins reloaded."
+  zh-CN: "插件已重新加载。"
+plugins.enable:
+  en: "Enable"
+  zh-CN: "启用"
+plugins.disable:
+  en: "Disable"
+  zh-CN: "禁用"
+plugins.approve:
+  en: "Approve permissions"
+  zh-CN: "批准权限"
+plugins.update:
+  en: "Update"
+  zh-CN: "更新"
+plugins.uninstall:
+  en: "Uninstall"
+  zh-CN: "卸载"
+plugins.manual:
+  en: "manually installed"
+  zh-CN: "手动安装"
+plugins.no_permissions:
+  en: "no permissions"
+  zh-CN: "无权限"
+plugins.none_installed:
+  en: "No plugins installed."
+  zh-CN: "尚未安装插件。"
+plugins.installed:
+  en: "Installed"
+  zh-CN: "已安装"
+plugins.install:
+  en: "Install"
+  zh-CN: "安装"
+plugins.install_source_required:
+  en: "Enter a directory, .zip file, or Git URL."
+  zh-CN: "请输入目录、.zip 文件或 Git 地址。"
+plugins.installed_title:
+  en: "Installed plugins"
+  zh-CN: "已安装插件"
+plugins.settings_title:
+  en: "Plugin settings"
+  zh-CN: "插件设置"
+plugins.refresh:
+  en: "Refresh"
+  zh-CN: "刷新"
+plugins.panel_truncated:
+  en: "Panel output was truncated."
+  zh-CN: "面板输出已截断。"
+plugins.manage:
+  en: "Manage plugins…"
+  zh-CN: "管理插件…"
+plugins.reload:
+  en: "Reload plugins"
+  zh-CN: "重新加载插件"
+
+plugins.remove_data:
+  en: "Also remove data and settings when uninstalling"
+  zh-CN: "卸载时同时删除数据和设置"
+plugins.uninstall_confirm:
+  en: "Uninstall %{plugin}? Its data is kept unless 'Also remove data' is checked."
+  zh-CN: "卸载 %{plugin}？除非勾选“同时删除数据和设置”，否则会保留其数据。"
+plugins.uninstall_confirm_data:
+  en: "Uninstall %{plugin} and permanently delete its data and settings?"
+  zh-CN: "卸载 %{plugin} 并永久删除其数据和设置？"
+plugins.uninstall_dependents:
+  en: "These plugins depend on it and will stop loading: %{plugins}."
+  zh-CN: "以下插件依赖它，将停止加载：%{plugins}。"
+plugins.uninstall_confirm_button:
+  en: "Uninstall"
+  zh-CN: "确认卸载"
+plugins.uninstalled:
+  en: "Uninstalled %{plugin}."
+  zh-CN: "已卸载 %{plugin}。"
+
+menu.plugins.open_panel:
+  en: "Open plugin panel"
+  zh-CN: "打开插件面板"
+
+plugins.install_placeholder:
+  en: "Directory, .zip file, or Git URL"
+  zh-CN: "目录、.zip 文件或 Git 地址"
+plugins.value_placeholder:
+  en: "Value"
+  zh-CN: "值"
+plugins.unavailable:
+  en: "unavailable in this version"
+  zh-CN: "本版本不可用"
+plugins.no_panels:
+  en: "No plugin panels are available."
+  zh-CN: "没有可用的插件面板。"
+plugins.panel_empty:
+  en: "The plugin returned no content."
+  zh-CN: "插件没有返回内容。"
+plugins.state.enabled:
+  en: "enabled"
+  zh-CN: "已启用"
+plugins.state.disabled:
+  en: "disabled"
+  zh-CN: "已禁用"
+plugins.state.needs_approval:
+  en: "needs approval"
+  zh-CN: "需要批准权限"
+plugins.state.plugins_disabled:
+  en: "plugins disabled"
+  zh-CN: "插件已禁用"
+plugins.state.missing_dependency:
+  en: "missing dependency: %{dependency}"
+  zh-CN: "缺少依赖：%{dependency}"
+plugins.state.incompatible_dependency:
+  en: "incompatible dependency: %{dependency}"
+  zh-CN: "依赖版本不兼容：%{dependency}"
+plugins.state.dependency_cycle:
+  en: "dependency cycle: %{ids}"
+  zh-CN: "依赖环：%{ids}"
+plugins.state.unknown:
+  en: "unknown"
+  zh-CN: "未知"
+
+diff.identical:
+  en: "No differences\n"
+  zh-CN: "没有差异\n"
+diff.binary:
+  en: "Binary files differ\n"
+  zh-CN: "二进制文件不同\n"
+diff.too_large:
+  en: "Files are too large for an inline diff\n"
+  zh-CN: "文件过大，无法以内联差异显示\n"
+diff.computing:
+  en: "Computing diff…"
+  zh-CN: "正在计算差异…"
+diff.computing_progress:
+  en: "Computing diff… %{percent}%"
+  zh-CN: "正在计算差异… %{percent}%"
+diff.cancelling:
+  en: "Cancelling diff…"
+  zh-CN: "正在取消差异计算…"
+diff.cancelled:
+  en: "Diff calculation cancelled"
+  zh-CN: "已取消差异计算"
+diff.unreadable:
+  en: "Cannot read %{path}"
+  zh-CN: "无法读取 %{path}"
+diff.ready:
+  en: "Diff ready: +%{added} -%{removed}"
+  zh-CN: "差异已生成：+%{added} -%{removed}"
+diff.ready.identical:
+  en: "No differences"
+  zh-CN: "没有差异"
+diff.ready.binary:
+  en: "Binary files differ"
+  zh-CN: "二进制文件不同"
+diff.ready.too_large:
+  en: "Files are too large for an inline diff"
+  zh-CN: "文件过大，无法以内联差异显示"
+menu.view.cancel_diff:
+  en: "Cancel Diff Calculation"
+  zh-CN: "取消差异计算"
+
+status.goto_clamped:
+  en: "Line/column %{line}:%{column} is outside the document; moved to the nearest position."
+  zh-CN: "行/列 %{line}:%{column} 超出文档范围，已定位到最近位置。"
+
+packages.reloaded:
+  en: "User packages reloaded: %{syntax} syntax, %{themes} themes, %{snippets} snippets."
+  zh-CN: "用户包已重新加载：%{syntax} 个语法、%{themes} 个主题、%{snippets} 个片段。"
+plugins.replace_confirm:
+  en: "%{plugin} is already installed. Click Install again to replace it."
+  zh-CN: "%{plugin} 已安装。再次点击“安装”以替换。"
+plugins.invalid_setting:
+  en: "Invalid value for %{plugin}.%{key}"
+  zh-CN: "%{plugin}.%{key} 的值无效"
+plugins.not_available:
+  en: "Plugin '%{plugin}' is not available."
+  zh-CN: "插件“%{plugin}”不可用。"
+plugins.panel_not_available:
+  en: "Plugin panel '%{panel}' is not available."
+  zh-CN: "插件面板“%{panel}”不可用。"
+diff.title:
+  en: "Diff: %{left} ↔ %{right}"
+  zh-CN: "差异：%{left} ↔ %{right}"

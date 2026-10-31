@@ -1,0 +1,23 @@
+[package]
+name = "luban-plugin"
+description = "Plugin manifest, permissions and sandboxed Lua runtime for Luban Notepad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+luban-core = { path = "../luban-core" }
+anyhow.workspace = true
+log.workspace = true
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
+semver = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+walkdir.workspace = true
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

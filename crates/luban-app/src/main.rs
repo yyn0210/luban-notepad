@@ -6,6 +6,7 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 mod app;
+mod cli;
 mod column_editor;
 mod commands;
 mod dialogs;
@@ -13,11 +14,13 @@ mod document_map;
 mod explorer;
 mod file_watch;
 mod find;
+mod highlighter;
 mod huge_file;
 mod huge_gutter;
 mod huge_scrollbar;
 mod i18n;
 mod icons;
+mod ipc;
 mod large_file;
 mod logging;
 mod macro_ui;
@@ -25,9 +28,12 @@ mod navigation;
 mod outline;
 mod palette;
 mod path_prompt;
+mod plugin_host;
+mod plugin_manager;
 mod preferences;
 mod quick_open;
 mod settings_search;
+mod snippet_ui;
 mod syntax_theme;
 mod tab_groups;
 mod theme;
@@ -44,17 +50,36 @@ use luban_core::settings::Settings;
 
 use crate::i18n::tr_args;
 
+use crate::cli::{parse_goto, GotoTarget};
+
 struct ParsedArgs {
     files: Vec<PathBuf>,
     new_window: bool,
     smoke_test: bool,
+    safe_mode: bool,
+    wait: bool,
+    goto: Option<GotoTarget>,
+    diff: Option<(PathBuf, PathBuf)>,
+    stdin: bool,
+    command: Option<String>,
+    skip_session: bool,
 }
 
 fn parse_args() -> ParsedArgs {
     let mut files = Vec::new();
     let mut new_window = false;
     let mut smoke_test = false;
-    for arg in std::env::args().skip(1) {
+    let mut safe_mode = false;
+    let mut wait = false;
+    let mut goto = None;
+    let mut diff = None;
+    let mut stdin = false;
+    let mut command = None;
+    let mut skip_session = false;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
@@ -70,16 +95,66 @@ fn parse_args() -> ParsedArgs {
                 println!("luban-notepad {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-            "--new" | "-n" => new_window = true,
+            "--new" | "-n" => skip_session = true,
+            "--new-window" => new_window = true,
+            "--wait" => wait = true,
+            "--safe-mode" => safe_mode = true,
+            "--stdin" => stdin = true,
             "--smoke-test" => smoke_test = true,
-            other if !other.starts_with('-') => files.push(PathBuf::from(other)),
-            other => log::warn!("ignoring unknown argument {other}"),
+            "--goto" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--goto requires path:line[:column]");
+                    std::process::exit(2);
+                };
+                match parse_goto(value) {
+                    Ok(target) => goto = Some(target),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--diff" => {
+                let (Some(left), Some(right)) = (args.get(index + 1), args.get(index + 2)) else {
+                    eprintln!("--diff requires two file paths");
+                    std::process::exit(2);
+                };
+                diff = Some((PathBuf::from(left), PathBuf::from(right)));
+                index += 2;
+            }
+            "--command" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--command requires a command id");
+                    std::process::exit(2);
+                };
+                command = Some(value.clone());
+            }
+            "--" => {
+                files.extend(args[index + 1..].iter().map(PathBuf::from));
+                break;
+            }
+            "-" => stdin = true,
+            other if other.starts_with('-') => {
+                eprintln!("unknown option {other}; use --help for usage");
+                std::process::exit(2);
+            }
+            other => files.push(PathBuf::from(other)),
         }
+        index += 1;
     }
     ParsedArgs {
         files,
         new_window,
         smoke_test,
+        safe_mode,
+        wait,
+        goto,
+        diff,
+        stdin,
+        command,
+        skip_session,
     }
 }
 
@@ -181,6 +256,26 @@ pub(crate) fn window_icon() -> Option<Arc<image::RgbaImage>> {
     }
 }
 
+fn readable_file(path: &std::path::Path) -> bool {
+    path.is_file() && std::fs::File::open(path).is_ok()
+}
+
+fn read_stdin() -> String {
+    use std::io::Read as _;
+    const LIMIT: u64 = 64 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    let mut stdin = std::io::stdin().take(LIMIT + 1);
+    if let Err(error) = stdin.read_to_end(&mut bytes) {
+        eprintln!("cannot read stdin: {error}");
+        std::process::exit(3);
+    }
+    if bytes.len() as u64 > LIMIT {
+        eprintln!("stdin is larger than {LIMIT} bytes");
+        std::process::exit(3);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn main() {
     // Remove journals left behind by terminated instances. Only directories
     // older than a day are touched so another running instance is unaffected.
@@ -204,6 +299,104 @@ fn main() {
     }
 
     let args = parse_args();
+    let stdin = if args.stdin { Some(read_stdin()) } else { None };
+    let config_dir = luban_core::settings::config_dir();
+    let request = ipc::LaunchRequest::new(
+        args.files.clone(),
+        args.goto.as_ref().map(|target| ipc::GotoRequest {
+            path: target.path.clone(),
+            line: target.line,
+            column: target.column,
+        }),
+        args.diff.clone(),
+        stdin.clone(),
+        args.command.clone(),
+        args.new_window,
+        args.wait,
+    );
+    let mut server = None;
+    let mut bridge = None;
+    let mut session_writer = !args.wait;
+    if args.safe_mode || args.skip_session {
+        // These flags request a distinct process; the primary keeps its own
+        // session file. If nobody owns the lock, this process becomes primary.
+        match ipc::start(&config_dir) {
+            Ok((new_server, new_bridge)) => {
+                server = Some(new_server);
+                bridge = Some(new_bridge);
+            }
+            Err(_) => session_writer = false,
+        }
+    } else {
+        match ipc::forward(&config_dir, &request) {
+            Ok(response) => {
+                if !response.ok {
+                    if let Some(error) = response.error {
+                        eprintln!("{error}");
+                    }
+                    std::process::exit(3);
+                }
+                std::process::exit(0);
+            }
+            Err(ipc::ForwardError::NoPrimary) => match ipc::start(&config_dir) {
+                Ok((new_server, new_bridge)) => {
+                    server = Some(new_server);
+                    bridge = Some(new_bridge);
+                }
+                Err(error) => {
+                    // Another process may have won the race; retry forwarding.
+                    match ipc::forward(&config_dir, &request) {
+                        Ok(response) => {
+                            if !response.ok {
+                                if let Some(error) = response.error {
+                                    eprintln!("{error}");
+                                }
+                                std::process::exit(3);
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(_) => {
+                            eprintln!("{error}");
+                            std::process::exit(3);
+                        }
+                    }
+                }
+            },
+            Err(ipc::ForwardError::Failed(error)) => {
+                eprintln!("{error}");
+                std::process::exit(3);
+            }
+        }
+    }
+    let _server = server;
+    if let Some(bridge) = &bridge {
+        ipc::set_shared_queue(bridge.queue.clone());
+    }
+    let mut bridge = bridge;
+    // A launch that becomes the primary has no IPC response channel, so report
+    // invalid file targets before opening a window.
+    if let Some(target) = &args.goto {
+        if !readable_file(&target.path) {
+            eprintln!("cannot open {}", target.path.display());
+            std::process::exit(3);
+        }
+    }
+    if let Some((left, right)) = &args.diff {
+        if !readable_file(left) {
+            eprintln!("cannot open {}", left.display());
+            std::process::exit(3);
+        }
+        if !readable_file(right) {
+            eprintln!("cannot open {}", right.display());
+            std::process::exit(3);
+        }
+    }
+    for file in &args.files {
+        if !readable_file(file) {
+            eprintln!("cannot open {}", file.display());
+            std::process::exit(3);
+        }
+    }
     // Crash recoveries are collected before any window exists so the first
     // window can show the offer next to its restored tabs. Expired entries are
     // removed; entries belonging to a running instance stay within retention.
@@ -213,7 +406,11 @@ fn main() {
     // Restore one window per saved window when the session holds any. Command
     // line files take precedence and skip the session, matching the previous
     // single-window behaviour.
-    let restore = settings.restore_session && !args.new_window && args.files.is_empty();
+    let restore = settings.restore_session
+        && !args.skip_session
+        && !args.new_window
+        && !args.wait
+        && args.files.is_empty();
     let mut windows: Vec<Option<luban_core::session::WindowSession>> = if restore {
         let session = luban_core::session::Session::load();
         if session.windows.is_empty() {
@@ -232,6 +429,27 @@ fn main() {
         .with_assets(icons::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            if let Some(bridge) = bridge.take() {
+                let wake_rx = std::sync::Arc::new(std::sync::Mutex::new(bridge.wake_rx));
+                cx.spawn(async move |cx| loop {
+                    let rx = wake_rx.clone();
+                    let received = cx
+                        .background_executor()
+                        .spawn(async move {
+                            rx.lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .recv()
+                                .is_ok()
+                        })
+                        .await;
+                    if !received {
+                        break;
+                    }
+                    window_registry::notify_all(cx);
+                })
+                .detach();
+            }
+            let ipc_queue = ipc::shared_queue();
             let mut first = true;
             for saved in windows.drain(..) {
                 let id = window_registry::next_window_id();
@@ -248,6 +466,22 @@ fn main() {
                         Vec::new()
                     },
                     smoke_test: first && args.smoke_test,
+                    safe_mode: args.safe_mode,
+                    session_writer,
+                    wait: args.wait,
+                    goto: if first {
+                        args.goto
+                            .as_ref()
+                            .map(|target| (target.path.clone(), target.line, target.column))
+                    } else {
+                        None
+                    },
+                    diff: if first { args.diff.clone() } else { None },
+                    stdin: if first { stdin.clone() } else { None },
+                    command: if first { args.command.clone() } else { None },
+                    exit_on_command_failure: first && args.command.is_some(),
+                    command_result: None,
+                    ipc_queue: ipc_queue.clone(),
                     manual_window_chrome: manual_chrome,
                     recoveries: if first {
                         recoveries.clone()

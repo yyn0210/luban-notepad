@@ -247,21 +247,27 @@ Luban Notepad 0.13 不是“功能少”，而是**能力结构偏科**：超大
 
 #### 交付物
 
-- [ ] **插件模型**：先定义贡献点（命令、菜单、快捷键、主题、语言/语法、
-      片段、面板、状态栏项、设置），再选运行时。
-- [ ] **运行时建议**：Lua（mlua）做脚本/宏，WASM（wasmtime）做沙箱插件；
-      不暴露不稳定的 Rust ABI。
-- [ ] **插件清单、权限、版本兼容、安全模式**（禁用所有插件启动）。
-- [ ] **插件管理器**：zip/Git/本地目录安装、启用/禁用、更新、依赖检查。
+- [x] **插件模型**：贡献点（命令、菜单、快捷键、状态栏、设置、面板）、
+      用户语法/主题/片段包；运行时选择 Lua。
+- [x] **Lua 运行时**：mlua + Lua 5.4，沙箱标准库、指令/内存上限、受控文件
+      访问；不暴露不稳定的 Rust ABI。WASM（wasmtime）沙箱插件留待后续。
+- [x] **插件清单、权限、版本兼容、安全模式**（禁用所有插件启动）。
+- [x] **插件管理器**：zip/Git/本地目录安装、启用/禁用、更新、卸载、权限批准、
+      依赖检查。
 - [ ] **首批官方插件**：文件比较/差异、JSON/XML 格式化、Markdown 预览、
-      CSV 模式。
-- [ ] **UDL/主题/片段包**：`.sublime-syntax`、`.tmTheme`、snippet 包格式；
-      用户包目录。
-- [ ] **CLI 自动化**：`--goto file:line:col`、`--wait`、`--new-window`、
-      `--diff`、stdin 过滤、`--command`。
+      CSV 模式（后续 change，使用本轮的插件 API）。
+- [x] **UDL/主题/片段包**：`.sublime-syntax`、`.tmTheme`、
+      `.sublime-snippet`/`snippets.json`；用户包目录。
+- [x] **CLI 自动化**：`--goto file:line:col`、`--wait`、`--new-window`、
+      `--diff`、stdin 过滤、`--command`、单实例转发。
 - [ ] **分发**：Windows Authenticode、macOS Developer ID + 公证、自动更新
       （签名清单）；winget/scoop/choco、Flatpak/Snap/AppImage、
-      Homebrew cask、AUR；Linux/Windows arm64；可选崩溃报告。
+      Homebrew cask、AUR；Linux/Windows arm64；可选崩溃报告（后续 change，
+      需要外部凭据）。
+
+2026-10-30：插件平台、Lua 运行时、插件管理器、用户包、片段和 CLI/单实例/
+差异视图已实现。官方插件、WASM 运行时和签名/分发仍需独立 change；它们复用
+本轮定义的清单、贡献点、宿主 API、包格式和 CLI 协议。
 
 #### 验收
 

@@ -19,11 +19,12 @@ pub enum CommandCategory {
     Bookmarks,
     Macros,
     Settings,
+    Plugins,
     Help,
 }
 
 impl CommandCategory {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::File,
         Self::Edit,
         Self::Search,
@@ -33,6 +34,7 @@ impl CommandCategory {
         Self::Bookmarks,
         Self::Macros,
         Self::Settings,
+        Self::Plugins,
         Self::Help,
     ];
 
@@ -47,6 +49,7 @@ impl CommandCategory {
             Self::Bookmarks => "command.category.bookmarks",
             Self::Macros => "command.category.macros",
             Self::Settings => "command.category.settings",
+            Self::Plugins => "command.category.plugins",
             Self::Help => "command.category.help",
         }
     }
@@ -64,6 +67,7 @@ pub enum CommandWhen {
     CanEditFullText,
     CanGoBack,
     CanGoForward,
+    DiffRunning,
 }
 
 /// Registry entry.
@@ -87,11 +91,12 @@ pub struct CommandContext {
     pub can_edit_full_text: bool,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    pub diff_running: bool,
 }
 
-impl CommandSpec {
-    pub fn enabled(&self, context: &CommandContext) -> bool {
-        match self.when {
+impl CommandWhen {
+    pub fn enabled(self, context: &CommandContext) -> bool {
+        match self {
             CommandWhen::Always => true,
             CommandWhen::HasDocument => context.has_document,
             CommandWhen::HasPath => context.has_path,
@@ -101,7 +106,14 @@ impl CommandSpec {
             CommandWhen::CanEditFullText => context.can_edit_full_text,
             CommandWhen::CanGoBack => context.can_go_back,
             CommandWhen::CanGoForward => context.can_go_forward,
+            CommandWhen::DiffRunning => context.diff_running,
         }
+    }
+}
+
+impl CommandSpec {
+    pub fn enabled(&self, context: &CommandContext) -> bool {
+        self.when.enabled(context)
     }
 }
 
@@ -609,6 +621,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         Always
     ),
     command!(
+        "diff.cancel",
+        View,
+        "menu.view.cancel_diff",
+        Some("ctrl+alt+d"),
+        DiffRunning
+    ),
+    command!(
         "view.zoom-in",
         View,
         "menu.view.zoom_in",
@@ -906,13 +925,48 @@ pub const COMMANDS: &[CommandSpec] = &[
         Always
     ),
     command!("help.shortcuts", Help, "menu.help.shortcuts", None, Always),
-    command!("help.about", Help, "menu.help.about", None, Always),
     command!(
         "help.open-log-dir",
         Help,
         "menu.help.open_logs",
         None,
         Always
+    ),
+    command!("help.about", Help, "menu.help.about", None, Always),
+    command!(
+        "plugins.manage",
+        Settings,
+        "menu.plugins.manage",
+        Some("ctrl+alt+p"),
+        Always
+    ),
+    command!(
+        "plugins.reload",
+        Settings,
+        "menu.plugins.reload",
+        Some("ctrl+alt+r"),
+        Always
+    ),
+    command!(
+        "packages.reload",
+        Settings,
+        "menu.packages.reload",
+        Some("ctrl+alt+shift+r"),
+        Always
+    ),
+    command!(
+        "plugins.open-panel",
+        Settings,
+        "menu.plugins.open_panel",
+        Some("ctrl+alt+shift+o"),
+        Always
+    ),
+    command!(
+        "edit.insert-snippet",
+        Edit,
+        "menu.edit.insert_snippet",
+        Some("ctrl+alt+s"),
+        CanEditFullText
     ),
 ];
 
@@ -1119,6 +1173,16 @@ fn is_function_key(key: &str) -> bool {
         .is_some_and(|index| (1..=24).contains(&index))
 }
 
+/// A command contributed by a plugin at runtime.
+///
+/// The ID is leaked by the plugin host so the existing `&'static str` keymap,
+/// palette and macro structures can hold it without an owned-ID rewrite.
+#[derive(Clone, Debug)]
+pub struct DynamicCommandSpec {
+    pub id: &'static str,
+    pub default_binding: Option<String>,
+}
+
 /// The effective keymap for a set of user overrides.
 pub struct Keymap {
     /// Binding text per command ID.
@@ -1132,29 +1196,35 @@ pub struct Keymap {
 
 impl Keymap {
     pub fn build(overrides: &BTreeMap<String, String>) -> Self {
+        Self::build_with(overrides, &[])
+    }
+
+    pub fn build_with(
+        overrides: &BTreeMap<String, String>,
+        dynamic: &[DynamicCommandSpec],
+    ) -> Self {
         let mut bindings = BTreeMap::new();
         let mut entries = Vec::new();
         let mut suppressed = Vec::new();
         for command in COMMANDS {
-            let default = command
-                .default_binding
-                .and_then(|text| parse_binding(text).ok());
-            let binding = match overrides.get(command.id) {
-                Some(text) => parse_binding(text).ok(),
-                None => default.clone(),
-            };
-            if let Some(binding) = &binding {
-                bindings.insert(command.id, format_binding(binding));
-                entries.push((binding.clone(), command.id));
-            }
-            if let Some(default) = default {
-                let overridden = overrides
-                    .get(command.id)
-                    .is_some_and(|text| parse_binding(text).ok().as_ref() != Some(&default));
-                if overridden {
-                    suppressed.push((default, command.id));
-                }
-            }
+            add_binding(
+                command.id,
+                command.default_binding.map(str::to_string),
+                overrides,
+                &mut bindings,
+                &mut entries,
+                &mut suppressed,
+            );
+        }
+        for command in dynamic {
+            add_binding(
+                command.id,
+                command.default_binding.clone(),
+                overrides,
+                &mut bindings,
+                &mut entries,
+                &mut suppressed,
+            );
         }
         Self {
             bindings,
@@ -1198,34 +1268,83 @@ pub struct BindingConflict {
 }
 
 /// Find duplicate effective bindings.
+#[cfg(test)]
 pub fn conflicts(overrides: &BTreeMap<String, String>) -> Vec<BindingConflict> {
-    let keymap = Keymap::build(overrides);
+    conflicts_with(overrides, &[])
+}
+
+pub fn conflicts_with(
+    overrides: &BTreeMap<String, String>,
+    dynamic: &[DynamicCommandSpec],
+) -> Vec<BindingConflict> {
+    let keymap = Keymap::build_with(overrides, dynamic);
     let mut seen: Vec<(String, &'static str)> = Vec::new();
     let mut conflicts = Vec::new();
-    for command in COMMANDS {
-        let Some(text) = keymap.binding_text(command.id) else {
+    let ids = COMMANDS
+        .iter()
+        .map(|command| command.id)
+        .chain(dynamic.iter().map(|command| command.id));
+    for id in ids {
+        let Some(text) = keymap.binding_text(id) else {
             continue;
         };
         if let Some((_, first)) = seen.iter().find(|(existing, _)| existing == text) {
             conflicts.push(BindingConflict {
                 binding: text.to_string(),
                 first,
-                second: command.id,
+                second: id,
             });
         } else {
-            seen.push((text.to_string(), command.id));
+            seen.push((text.to_string(), id));
         }
     }
     conflicts
 }
 
+fn add_binding(
+    id: &'static str,
+    default: Option<String>,
+    overrides: &BTreeMap<String, String>,
+    bindings: &mut BTreeMap<&'static str, String>,
+    entries: &mut Vec<(Binding, &'static str)>,
+    suppressed: &mut Vec<(Binding, &'static str)>,
+) {
+    let default = default.and_then(|text| parse_binding(&text).ok());
+    let binding = match overrides.get(id) {
+        Some(text) => parse_binding(text).ok(),
+        None => default.clone(),
+    };
+    if let Some(binding) = &binding {
+        bindings.insert(id, format_binding(binding));
+        entries.push((binding.clone(), id));
+    }
+    if let Some(default) = default {
+        let overridden = overrides
+            .get(id)
+            .is_some_and(|text| parse_binding(text).ok().as_ref() != Some(&default));
+        if overridden {
+            suppressed.push((default, id));
+        }
+    }
+}
+
 /// Validate a proposed override before it is stored.
+#[cfg(test)]
 pub fn validate_override(
     id: &str,
     text: &str,
     overrides: &BTreeMap<String, String>,
 ) -> Result<String, BindingError> {
-    if spec(id).is_none() {
+    validate_override_with(id, text, overrides, &[])
+}
+
+pub fn validate_override_with(
+    id: &str,
+    text: &str,
+    overrides: &BTreeMap<String, String>,
+    dynamic: &[DynamicCommandSpec],
+) -> Result<String, BindingError> {
+    if spec(id).is_none() && !dynamic.iter().any(|command| command.id == id) {
         return Err(BindingError::UnknownCommand(id.to_string()));
     }
     let binding = parse_binding(text)?;
@@ -1235,7 +1354,7 @@ pub fn validate_override(
     let formatted = format_binding(&binding);
     let mut proposed = overrides.clone();
     proposed.insert(id.to_string(), text.to_string());
-    if let Some(conflict) = conflicts(&proposed)
+    if let Some(conflict) = conflicts_with(&proposed, dynamic)
         .into_iter()
         .find(|conflict| conflict.first == id || conflict.second == id)
     {

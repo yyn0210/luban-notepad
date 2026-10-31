@@ -5,7 +5,6 @@
 //! undo stack or the session.
 
 use std::fmt::Write as _;
-use std::sync::LazyLock;
 
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, FontStyle, Style, Theme};
@@ -27,10 +26,10 @@ impl ExportFormat {
     }
 }
 
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
-
-fn syntax_for(token: &str) -> Option<&'static syntect::parsing::SyntaxReference> {
-    let syntaxes = &*SYNTAXES;
+fn syntax_for<'a>(
+    syntaxes: &'a SyntaxSet,
+    token: &str,
+) -> Option<&'a syntect::parsing::SyntaxReference> {
     let token = match token {
         "text" | "Plain Text" => return None,
         "csharp" => "cs",
@@ -38,11 +37,14 @@ fn syntax_for(token: &str) -> Option<&'static syntect::parsing::SyntaxReference>
         "markdown" => "md",
         other => other,
     };
-    syntaxes.find_syntax_by_token(token)
+    syntaxes
+        .find_syntax_by_token(token)
+        .or_else(|| syntaxes.find_syntax_by_name(token))
 }
 
 fn runs(text: &str, token: &str, theme: &Theme) -> Vec<(Style, String)> {
-    let Some(syntax) = syntax_for(token) else {
+    let syntaxes = crate::user_syntax::active_set();
+    let Some(syntax) = syntax_for(&syntaxes, token) else {
         return vec![(
             Style {
                 foreground: theme.settings.foreground.unwrap_or(Color::BLACK),
@@ -55,7 +57,7 @@ fn runs(text: &str, token: &str, theme: &Theme) -> Vec<(Style, String)> {
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut out = Vec::new();
     for line in LinesWithEndings::from(text) {
-        match highlighter.highlight_line(line, &SYNTAXES) {
+        match highlighter.highlight_line(line, &syntaxes) {
             Ok(parts) => {
                 for (style, piece) in parts {
                     if !piece.is_empty() {
@@ -103,7 +105,7 @@ pub fn to_html(text: &str, token: &str, theme: &Theme, title: &str) -> String {
     let mut body = String::new();
     for (style, piece) in runs(text, token, theme) {
         let color = html_color(Some(style.foreground), Color::BLACK);
-        let mut span = format!(r#"<span style="color:{color}"#);
+        let mut span = format!(r#"<span style="color:{color}""#);
         if style.font_style.contains(FontStyle::ITALIC) {
             span.push_str(";font-style:italic");
         }
@@ -219,6 +221,13 @@ mod tests {
         assert!(html.contains("<title>a &lt; b</title>"));
         assert!(html.contains("&lt;&amp;&gt;"));
         assert!(html.contains("<span style=\"color:#"));
+        // The style attribute must be closed before the tag ends; browsers
+        // recover from a missing quote, but the exported document is text a
+        // user may post-process, so it has to be well-formed.
+        assert!(!html.contains("#000000>"));
+        for line in html.lines().filter(|line| line.contains("<span style=")) {
+            assert!(line.contains("\">"), "unclosed style attribute: {line}");
+        }
         assert!(html.contains("white-space:pre"));
     }
 

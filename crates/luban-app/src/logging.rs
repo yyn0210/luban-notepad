@@ -40,7 +40,8 @@ pub fn init() {
     };
     install_panic_hook(&directory);
     let console = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("luban_notepad=info,gpui=warn"),
+        env_logger::Env::default()
+            .default_filter_or("luban_notepad=info,luban_plugin=info,gpui=warn"),
     )
     .build();
     let level = console.filter();

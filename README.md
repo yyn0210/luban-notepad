@@ -42,6 +42,12 @@ Notepad++ 中人们日常最常用的部分——快速的标签页编辑、语�
   在工作区文件中按子序列模糊匹配，支持 `:行号`、`@符号` 和 `文件:行号`。
   面包屑显示工作区→目录→文件→当前符号；符号大纲按缩进分层并可点击跳转；
   `Alt+←/→` 提供每窗口独立的前进/后退历史。
+- **扩展性**：`plugin.json` 清单 + 沙箱化 Lua 5.4 插件（命令、菜单、快捷键、
+  状态栏、设置和文本/列表面板），权限批准与安全模式，以及本地目录/zip/Git
+  安装、更新、卸载的插件管理器；用户包支持 `.sublime-syntax`、`.tmTheme`、
+  `.sublime-snippet` 和 `snippets.json`。
+- **CLI 自动化**：`--goto`、`--new-window`、`--wait`、`--diff`、`--stdin`、
+  `--command`、`--safe-mode` 和单实例转发；`--diff` 打开只读统一差异标签。
 - **工作区与文件树**：`.luban-workspace` 多根工作区、最近工作区、工作区设置
   覆盖；后台 `.gitignore` 感知索引；文件树支持新建、重命名、删除（回收站）、
   刷新、复制路径和在文件管理器中显示。
@@ -189,12 +195,34 @@ scripts/package-windows.ps1
 ## 运行
 
 ```bash
-cargo run -p luban-app -- [--new] [--smoke-test] [FILE ...]
+cargo run -p luban-app -- [OPTIONS] [FILE ...]
 ```
 
-- `FILE ...` 在启动时打开一个或多个文件。
+常用选项：
+
+- `FILE ...` 在启动时打开一个或多个文件；默认转发给已运行的实例。
+- `--goto path:line[:col]` 打开文件并定位到行列。
+- `--new-window` 由主实例创建新窗口（没有主实例时启动新窗口）。
+- `--wait` 等到本次打开的标签页关闭后退出，适合把编辑器当作外部工具使用。
+- `--diff left right` 打开只读的行级统一差异标签。
+- `--stdin`（或文件参数 `-`）把标准输入读入新的未命名缓冲区。
+- `--command <id>` 在文件打开后执行命令（包括插件命令）。
+- `--safe-mode` 本次启动不加载任何插件。
 - `--new` 启动全新会话，而不是恢复上一次会话。
 - `--smoke-test` 打开窗口并在三秒后自动退出；CI 用它验证 GUI 能够初始化。
+
+示例：
+
+```bash
+luban-notepad --goto src/main.rs:42:5
+luban-notepad --wait --goto build.log:1200
+git diff | luban-notepad --stdin
+luban-notepad --diff old.txt new.txt
+luban-notepad --command edit.insert-snippet
+```
+
+第二次启动默认通过配置目录下的单实例端点转发请求；`--safe-mode` 和 `--new`
+需要独立进程，因此不会复用主实例。只有主实例写会话文件。
 
 在 Linux 上，如果 WGPU 选择了错误的后端：
 
@@ -224,6 +252,16 @@ Luban Notepad 使用平台的配置目录：
   和 U 盘安装）。
 - 设置 `LUBAN_NOTEPAD_LANG=en` 或 `LUBAN_NOTEPAD_LANG=zh-CN` 可临时强制
   界面语言，优先级高于 `settings.json`，适合测试和脚本化启动。
+
+## 插件与用户包
+
+插件位于配置目录的 `plugins/<id>/`，由 `plugin.json` 和 `main.lua` 组成；用户
+语法、主题和片段位于 `packages/{syntaxes,themes,snippets}/`。首选项 → 插件可以
+启用/禁用、批准权限、安装、更新和卸载插件；设置搜索中的“插件”分组可以打开
+管理器。`--safe-mode` 禁用插件但保留用户语法、主题和片段。
+
+插件清单、Lua API、权限和限制见 [docs/PLUGINS.md](docs/PLUGINS.md)；包格式和
+片段占位符见 [docs/PACKAGES.md](docs/PACKAGES.md)。
 
 ## 键盘快捷键
 
@@ -292,15 +330,17 @@ xvfb-run -a -s "-screen 0 1440x900x24" \
 
 ## 功能对齐程度
 
-Luban Notepad 实现了 Notepad++ 的核心编辑工作流，而非其完整的插件与扩展生态。
-详细对照表见 [docs/FEATURES.md](docs/FEATURES.md)。主要差距：
+Luban Notepad 实现了 Notepad++ 的核心编辑工作流，并提供 1.0 的插件 API、Lua
+运行时和用户包；它不追求 Notepad++ 的二进制插件兼容生态。详细对照表见
+[docs/FEATURES.md](docs/FEATURES.md)。主要差距：
 
-- 没有插件 API、打印或拼写检查。
+- 没有打印或拼写检查；插件 API、插件管理器和用户包已实现。
 - 没有 minimap（提供文档地图）、多级嵌套分屏（最多两个编辑组）或跨窗口
   拖拽标签。
 - 符号导航使用正则启发式大纲，不提供 LSP/自动补全集成。
-- 语法高亮使用 syntect 而非 Notepad++ 的 Lexilla 词法分析器，暂不支持
-  用户自定义词法分析器。
+- 语法高亮使用 syntect 而非 Notepad++ 的 Lexilla 词法分析器；支持
+  `.sublime-syntax` 用户语法（见 [docs/PACKAGES.md](docs/PACKAGES.md)），
+  不提供 Lexilla UDL 兼容。
 - 内置文件对话框取代了原生对话框以保证行为一致；多选打开、文件类型过滤、
   键盘导航和可访问性语义均已支持，但不提供系统原生对话框的搜索、最近位置、
   收藏和预览。

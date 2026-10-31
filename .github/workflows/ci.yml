@@ -58,6 +58,11 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
 
+      - name: Extension smoke test (Xvfb + lavapipe)
+        run: scripts/smoke-extensions.sh
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+
   windows:
     name: Windows
     runs-on: windows-latest

@@ -145,6 +145,16 @@ pub struct Settings {
     /// Path to an imported `.tmTheme` file. `None` uses a built-in theme.
     #[serde(default)]
     pub syntax_theme_path: Option<PathBuf>,
+    /// Load plugins at startup. `--safe-mode` overrides this for one run.
+    #[serde(default = "default_true")]
+    pub plugins_enabled: bool,
+    /// Plugin IDs disabled by the user. Approved plugins are enabled by default.
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
+    /// Values for plugin-contributed settings, keyed by plugin id.
+    #[serde(default)]
+    pub plugin_settings:
+        std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 fn default_true() -> bool {
@@ -224,6 +234,9 @@ impl Default for Settings {
             macros: MacroSet::default(),
             language_settings: std::collections::BTreeMap::new(),
             syntax_theme_path: None,
+            plugins_enabled: true,
+            disabled_plugins: Vec::new(),
+            plugin_settings: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -313,6 +326,11 @@ impl Settings {
         if self.syntax_theme.is_empty() {
             self.syntax_theme = "InspiredGitHub".to_string();
         }
+        self.disabled_plugins.retain(|id| !id.trim().is_empty());
+        self.disabled_plugins.sort();
+        self.disabled_plugins.dedup();
+        self.plugin_settings
+            .retain(|id, values| !id.trim().is_empty() && !values.is_empty());
         self.recent_files.retain(|p| !p.as_os_str().is_empty());
         self.recent_files.dedup_by(|a, b| paths_equal(a, b));
         self.recent_files.truncate(self.max_recent_files);
@@ -420,6 +438,9 @@ impl Settings {
         self.macros = other.macros.clone();
         self.language_settings = other.language_settings.clone();
         self.syntax_theme_path = other.syntax_theme_path.clone();
+        self.plugins_enabled = other.plugins_enabled;
+        self.disabled_plugins = other.disabled_plugins.clone();
+        self.plugin_settings = other.plugin_settings.clone();
     }
 
     pub fn max_file_size_bytes(&self) -> u64 {
@@ -519,6 +540,16 @@ pub const PORTABLE_MARKER: &str = "luban-notepad.portable";
 /// A portable install keeps `settings.json` and `session.json` in `data/` next
 /// to the executable, selected by a [`PORTABLE_MARKER`] file. Installed builds
 /// fall back to the normal per-user directory.
+/// Directory containing installed plugins.
+pub fn plugins_dir() -> PathBuf {
+    config_dir().join("plugins")
+}
+
+/// Directory containing user syntax, theme and snippet packages.
+pub fn packages_dir() -> PathBuf {
+    config_dir().join("packages")
+}
+
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = env::var("LUBAN_NOTEPAD_CONFIG_DIR") {
         if !dir.is_empty() {
