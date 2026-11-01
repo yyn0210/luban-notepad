@@ -4,15 +4,21 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+## [1.0.0-preview.2] — 2026-11-01
+
 ### 新增
 
 - 插件面板富文本：行级样式（`h1`–`h6`、`code`、`quote`、`list`、`table`、
-  `rule`、`muted`）、行内 spans（bold/italic/underline/strike/code/link 与语法
-  主题 role）、面板 `width` 和 `refresh: edit` 自动刷新。
+  `rule`、`muted`）、行内 spans（bold/italic/underline/strike/code/link/muted 与
+  语法主题 role）、面板 `width` 和 `refresh: edit` 自动刷新。
 - `luban.syntax.highlight` 复用编辑器的 syntect 语法集与语义角色配色；
   `luban.panel.open` 允许插件命令打开自己声明的面板。
+- 面板内容区可滚动，右侧滚动条始终可见；自动刷新保持滚动位置，点击面板聚焦
+  预览、点击编辑器回到编辑。
 - 面板富文本和自动刷新是向后兼容扩展：旧宿主忽略新字段并按纯文本渲染，
   旧插件在新宿主中保持原来的纯文本、380px、手动刷新行为。
+- 官方商店插件 `io.github.yyn0210.markdown-preview`（独立仓库）：GFM 表格/
+  任务列表、代码高亮和自动刷新；旧宿主仍显示纯文本回退。
 
 ## [1.0.0-preview.1] — 2026-11-01
 
