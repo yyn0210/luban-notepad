@@ -4,12 +4,21 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+## [1.0.0-preview.1] — 2026-11-01
+
 ### 新增
 
 - 扩展性平台：`plugin.json` 清单、依赖/版本/权限校验、安全模式、沙箱化
   Lua 5.4（mlua）运行时、受控文档/设置/状态栏/文件 API、命令/菜单/快捷键/
   状态栏/设置/面板贡献点，以及插件管理器（本地目录/zip/Git 安装、更新、卸载、
   权限批准、依赖错误展示）。
+- 插件商店：插件管理器“商店”页签和 `plugins.store` 命令；后台获取并缓存
+  `catalog/index.json`，支持搜索、详情、安装和更新；按当前 OS/CPU 选择精确
+  目标或 `universal` 产物，只展示当前平台可安装的插件；下载校验 SHA-256/大小
+  后复用现有 zip 安装事务，更新保留插件数据和设置。
+- 商店目录仓库 `yyn0210/luban-notepad-store`：`catalog/index.json`、
+  `plugins/<id>.json`、JSON Schema、`build_catalog.py`、`validate.py`、贡献
+  文档和 GitHub Actions 校验；编辑器默认地址指向 `main` 分支。
 - 用户包：`packages/syntaxes` 的 `.sublime-syntax`、`packages/themes` 的
   `.tmTheme`、`packages/snippets` 的 `.sublime-snippet` 和 `snippets.json`；
   用户语法进入语言选择器/高亮/导出，用户主题进入语法主题列表，片段支持
@@ -17,8 +26,8 @@ Luban Notepad 的所有重要变更都记录在此。
 - CLI：`--goto`、`--new-window`、`--wait`、`--diff`、`--stdin`、`--command`、
   `--safe-mode`；单实例转发（PID 锁 + 本地端点），只有主实例写会话。
 - 只读行级差异视图（`--diff`）；`edit.insert-snippet`（`Ctrl+Alt+S`）。
-- 文档：`docs/PLUGINS.md`、`docs/PACKAGES.md`，并同步 README、FEATURES、
-  ROADMAP、KEYBINDINGS 和 ARCHITECTURE。
+- 文档：`docs/PLUGINS.md`、`docs/PLUGIN_STORE.md`、`docs/PACKAGES.md`，并同步
+  README、FEATURES、ROADMAP、KEYBINDINGS 和 ARCHITECTURE。
 - 官方插件（差异/格式化/Markdown 预览/CSV）、WASM 运行时和签名/分发不在本轮
   范围内，留给后续 change。
 
