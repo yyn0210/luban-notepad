@@ -25,6 +25,9 @@ const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PANEL_LINES: usize = 5_000;
 const MAX_PANEL_LINE_BYTES: usize = 4 * 1024;
+const MAX_PANEL_SPANS: usize = 512;
+const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_ROLE_BYTES: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct PluginIdentity {
@@ -64,6 +67,9 @@ pub enum HostAction {
         id: String,
         text: String,
     },
+    OpenPanel {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -95,6 +101,135 @@ pub struct PanelContent {
 pub struct PanelLine {
     pub text: String,
     pub command: Option<String>,
+    pub style: PanelLineStyle,
+    /// Nesting level for list/quote lines, clamped to `0..=8`.
+    pub indent: u8,
+    /// Inline runs. Empty means the line is rendered as plain `text`.
+    pub spans: Vec<PanelSpan>,
+}
+
+impl PanelLine {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            command: None,
+            style: PanelLineStyle::Text,
+            indent: 0,
+            spans: Vec::new(),
+        }
+    }
+}
+
+/// Block-level presentation for one panel line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelLineStyle {
+    #[default]
+    Text,
+    Muted,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    Code,
+    Quote,
+    List,
+    Table,
+    Rule,
+}
+
+impl PanelLineStyle {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "muted" => Some(Self::Muted),
+            "h1" => Some(Self::H1),
+            "h2" => Some(Self::H2),
+            "h3" => Some(Self::H3),
+            "h4" => Some(Self::H4),
+            "h5" => Some(Self::H5),
+            "h6" => Some(Self::H6),
+            "code" => Some(Self::Code),
+            "quote" => Some(Self::Quote),
+            "list" => Some(Self::List),
+            "table" => Some(Self::Table),
+            "rule" => Some(Self::Rule),
+            _ => None,
+        }
+    }
+}
+
+/// Inline flags for a panel span.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanelSpanStyle(u8);
+
+impl PanelSpanStyle {
+    pub const BOLD: u8 = 1 << 0;
+    pub const ITALIC: u8 = 1 << 1;
+    pub const UNDERLINE: u8 = 1 << 2;
+    pub const STRIKE: u8 = 1 << 3;
+    pub const CODE: u8 = 1 << 4;
+    pub const LINK: u8 = 1 << 5;
+    pub const MUTED: u8 = 1 << 6;
+
+    pub fn parse(value: &str) -> Self {
+        let mut flags = 0;
+        for part in value.split_whitespace() {
+            flags |= match part {
+                "bold" => Self::BOLD,
+                "italic" => Self::ITALIC,
+                "underline" => Self::UNDERLINE,
+                "strike" => Self::STRIKE,
+                "code" => Self::CODE,
+                "link" => Self::LINK,
+                "muted" => Self::MUTED,
+                _ => 0,
+            };
+        }
+        Self(flags)
+    }
+
+    pub fn contains(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    pub fn bold(self) -> bool {
+        self.contains(Self::BOLD)
+    }
+
+    pub fn italic(self) -> bool {
+        self.contains(Self::ITALIC)
+    }
+
+    pub fn underline(self) -> bool {
+        self.contains(Self::UNDERLINE)
+    }
+
+    pub fn strike(self) -> bool {
+        self.contains(Self::STRIKE)
+    }
+
+    pub fn code(self) -> bool {
+        self.contains(Self::CODE)
+    }
+
+    pub fn link(self) -> bool {
+        self.contains(Self::LINK)
+    }
+
+    pub fn muted(self) -> bool {
+        self.contains(Self::MUTED)
+    }
+}
+
+/// One inline run inside a panel line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelSpan {
+    pub text: String,
+    pub style: PanelSpanStyle,
+    /// Syntax role resolved against the active syntax theme.
+    pub role: Option<String>,
 }
 
 struct CallState {
@@ -588,6 +723,46 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
     )?;
     luban.set("status", status)?;
 
+    let syntax = lua.create_table()?;
+    syntax.set(
+        "highlight",
+        lua.create_function(move |lua, (text, language): (String, String)| {
+            if text.len() > MAX_HIGHLIGHT_BYTES {
+                return Ok((
+                    Value::Nil,
+                    Some(format!("text is larger than {MAX_HIGHLIGHT_BYTES} bytes")),
+                ));
+            }
+            let spans = luban_core::syntax::highlight_spans(&text, &language);
+            let table = lua.create_table()?;
+            for (index, (part, role)) in spans.into_iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("text", part)?;
+                item.set("role", role)?;
+                table.set(index + 1, item)?;
+            }
+            Ok((Value::Table(table), None))
+        })?,
+    )?;
+    luban.set("syntax", syntax)?;
+
+    let panel = lua.create_table()?;
+    let panel_state = state.clone();
+    panel.set(
+        "open",
+        lua.create_function(move |_, id: String| {
+            if id.is_empty() || id.len() > 128 {
+                return Ok((Value::Nil, Some("invalid panel id".to_string())));
+            }
+            panel_state
+                .borrow_mut()
+                .actions
+                .push(HostAction::OpenPanel { id });
+            Ok((Value::Boolean(true), None))
+        })?,
+    )?;
+    luban.set("panel", panel)?;
+
     let fs = lua.create_table()?;
     let read_state = state.clone();
     fs.set(
@@ -911,13 +1086,11 @@ fn parse_panel(value: Value) -> Result<PanelContent, String> {
     match value {
         Value::String(text) => Ok(PanelContent {
             title: None,
-            lines: vec![PanelLine {
-                text: text
-                    .to_str()
+            lines: vec![PanelLine::plain(
+                text.to_str()
                     .map_err(|error| error.to_string())?
                     .to_string(),
-                command: None,
-            }],
+            )],
             truncated: false,
         }),
         Value::Table(table) => {
@@ -943,13 +1116,11 @@ fn parse_panel_lines(value: Value) -> Result<(Vec<PanelLine>, bool), String> {
     let mut truncated = false;
     match value {
         Value::String(text) => {
-            lines.push(PanelLine {
-                text: text
-                    .to_str()
+            lines.push(PanelLine::plain(
+                text.to_str()
                     .map_err(|error| error.to_string())?
                     .to_string(),
-                command: None,
-            });
+            ));
         }
         Value::Table(table) => {
             for value in table.sequence_values::<Value>() {
@@ -959,30 +1130,115 @@ fn parse_panel_lines(value: Value) -> Result<(Vec<PanelLine>, bool), String> {
                     break;
                 }
                 match value {
-                    Value::String(text) => lines.push(PanelLine {
-                        text: text
-                            .to_str()
+                    Value::String(text) => lines.push(PanelLine::plain(
+                        text.to_str()
                             .map_err(|error| error.to_string())?
                             .to_string(),
-                        command: None,
-                    }),
-                    Value::Table(line) => {
-                        let text: String = line
-                            .get("text")
-                            .map_err(|error| format!("panel line text: {error}"))?;
-                        let command: Option<String> = line.get("command").ok().flatten();
-                        if text.len() > MAX_PANEL_LINE_BYTES {
-                            return Err("panel line is too long".to_string());
-                        }
-                        lines.push(PanelLine { text, command });
-                    }
-                    _ => return Err("panel lines must be strings or { text, command }".to_string()),
+                    )),
+                    Value::Table(line) => lines.push(parse_panel_line(&line)?),
+                    _ => return Err("panel lines must be strings or tables".to_string()),
                 }
             }
         }
         _ => return Err("panel lines must be a string or an array".to_string()),
     }
     Ok((lines, truncated))
+}
+
+fn parse_panel_line(line: &Table) -> Result<PanelLine, String> {
+    let text: String = line
+        .get("text")
+        .map_err(|error| format!("panel line text: {error}"))?;
+    if text.len() > MAX_PANEL_LINE_BYTES {
+        return Err("panel line is too long".to_string());
+    }
+    let command: Option<String> = line.get("command").ok().flatten();
+    let style = line
+        .get::<Option<String>>("style")
+        .ok()
+        .flatten()
+        .and_then(|value| PanelLineStyle::parse(&value))
+        .unwrap_or_default();
+    let indent = line
+        .get::<Option<i64>>("indent")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .clamp(0, 8) as u8;
+    let spans = parse_panel_spans(&text, line.get::<Value>("spans").unwrap_or(Value::Nil))?;
+    Ok(PanelLine {
+        text,
+        command,
+        style,
+        indent,
+        spans,
+    })
+}
+
+fn parse_panel_spans(text: &str, value: Value) -> Result<Vec<PanelSpan>, String> {
+    let Value::Table(table) = value else {
+        return Ok(Vec::new());
+    };
+    let mut spans: Vec<PanelSpan> = Vec::new();
+    let mut total = 0usize;
+    for value in table.sequence_values::<Value>() {
+        let value = value.map_err(|error| format!("cannot read panel span: {error}"))?;
+        let Value::Table(span) = value else {
+            return Err("panel spans must be tables".to_string());
+        };
+        let part: String = span
+            .get("text")
+            .map_err(|error| format!("panel span text: {error}"))?;
+        if part.is_empty() {
+            continue;
+        }
+        total = total.saturating_add(part.len());
+        if total > MAX_PANEL_LINE_BYTES {
+            return Err("panel line spans are too long".to_string());
+        }
+        if spans.len() >= MAX_PANEL_SPANS {
+            return Err("panel line has too many spans".to_string());
+        }
+        let style = span
+            .get::<Option<String>>("style")
+            .ok()
+            .flatten()
+            .map(|value| PanelSpanStyle::parse(&value))
+            .unwrap_or_default();
+        let role = span
+            .get::<Option<String>>("role")
+            .ok()
+            .flatten()
+            .and_then(|role| sanitize_role(&role));
+        spans.push(PanelSpan {
+            text: part,
+            style,
+            role,
+        });
+    }
+    if !spans.is_empty() {
+        let joined: String = spans.iter().map(|span| span.text.as_str()).collect();
+        if joined != text {
+            log::warn!("plugin panel spans do not match the line text; rendering plain text");
+            spans.clear();
+        }
+    }
+    Ok(spans)
+}
+
+fn sanitize_role(role: &str) -> Option<String> {
+    if role.is_empty() || role.len() > MAX_ROLE_BYTES {
+        return None;
+    }
+    role.bytes()
+        .all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'.'
+                || byte == b'_'
+                || byte == b'-'
+        })
+        .then(|| role.to_string())
 }
 
 impl Drop for PluginRuntime {
@@ -1227,5 +1483,119 @@ mod tests {
         let call = runtime.activate(input(&manifest, dir.path()));
         assert!(!call.is_ok());
         assert!(call.error.unwrap().contains("activate failed"));
+    }
+
+    #[test]
+    fn syntax_highlighting_returns_covering_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    local spans = assert(luban.syntax.highlight("fn main() {}\n", "rust"))
+                    local joined, seen = "", {}
+                    for _, span in ipairs(spans) do
+                        assert(type(span.text) == "string")
+                        assert(type(span.role) == "string")
+                        joined = joined .. span.text
+                        seen[span.role] = true
+                    end
+                    assert(joined == "fn main() {}\n", joined)
+                    assert(seen.keyword, "keyword role missing")
+                    assert(seen.primary, "primary role missing")
+                    local plain = assert(luban.syntax.highlight("hello", "no-such-language"))
+                    assert(#plain == 1 and plain[1].role == "primary")
+                    local missing, err = luban.syntax.highlight(string.rep("x", 70000), "rust")
+                    assert(missing == nil and err:find("larger than"))
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{:?}", call.error);
+    }
+
+    #[test]
+    fn rich_panel_lines_parse_styles_spans_and_indent() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return { title = "Rich", lines = {
+                        { text = "Title", style = "h1" },
+                        { text = "code line", style = "code", spans = {
+                            { text = "code", style = "bold code", role = "keyword" },
+                            { text = " line", style = "italic" },
+                        }},
+                        { text = "", style = "rule" },
+                        { text = "item", style = "list", indent = 2 },
+                        { text = "mismatch", style = "muted", spans = {
+                            { text = "other", style = "bold" },
+                        }},
+                    } }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(panel.lines[0].style, PanelLineStyle::H1);
+        assert_eq!(panel.lines[1].style, PanelLineStyle::Code);
+        assert_eq!(panel.lines[1].spans.len(), 2);
+        assert!(panel.lines[1].spans[0].style.bold());
+        assert!(panel.lines[1].spans[0].style.code());
+        assert_eq!(panel.lines[1].spans[0].role.as_deref(), Some("keyword"));
+        assert!(panel.lines[1].spans[1].style.italic());
+        assert_eq!(panel.lines[2].style, PanelLineStyle::Rule);
+        assert_eq!(panel.lines[3].indent, 2);
+        // A span list that does not reconstruct the line falls back to text.
+        assert_eq!(panel.lines[4].spans.len(), 0);
+        assert_eq!(panel.lines[4].text, "mismatch");
+    }
+
+    #[test]
+    fn panel_lines_reject_excessive_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    local spans = {}
+                    for i = 1, 600 do spans[i] = { text = "x" } end
+                    return { lines = { { text = string.rep("x", 600), spans = spans } } }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        assert!(panel.error.is_some());
+    }
+
+    #[test]
+    fn opening_a_panel_is_reported_as_a_host_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    local ok, err = luban.panel.open("test.panel")
+                    assert(ok, err)
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{:?}", call.error);
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::OpenPanel {
+                id: "test.panel".into()
+            }]
+        );
     }
 }

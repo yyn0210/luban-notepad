@@ -11,9 +11,10 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{
-    Copy, Cut, Editor, EditorState, FoldRange, Indent, Input, InputEvent, InputState, Outdent,
-    Paste, Position, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Redo,
-    RopeExt, Search, SelectAll, TabSize, TextDecoration, TextDecorationCollection, Undo,
+    Copy, Cut, Editor, EditorState, FoldRange, HighlightStyleResolver, Indent, Input, InputEvent,
+    InputState, Outdent, Paste, Position, RangeDecoration, RangeDecorationCollection,
+    RangeDecorationStyle, Redo, RopeExt, Search, SelectAll, TabSize, TextDecoration,
+    TextDecorationCollection, Undo,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarMode};
@@ -207,9 +208,14 @@ struct PluginPanelState {
     panel_id: String,
     title: String,
     placement: luban_plugin::manifest::PanelPlacement,
+    width: Option<u16>,
     lines: Vec<luban_plugin::runtime::PanelLine>,
     error: Option<String>,
     truncated: bool,
+    /// Token identifying the watcher task allowed to refresh this panel.
+    watch: u64,
+    /// Scroll position, preserved across automatic refreshes.
+    scroll: ScrollHandle,
 }
 
 /// Quick-open rows and the current query error.
@@ -349,6 +355,9 @@ pub struct Tab {
     /// The editor emitted a real text change that has not been synced into
     /// the document yet. Selection and focus events do not set this.
     pub pending_edit: bool,
+    /// Incremented for every editor text change. Live plugin panels use it to
+    /// debounce work without forcing a buffer sync on every key press.
+    pub edit_generation: u64,
     /// Cached word count and the document revision it was computed for.
     word_count: Option<(u64, usize)>,
     /// Present when the tab is backed by the disk engine.
@@ -568,6 +577,7 @@ pub struct LubanApp {
     explorer_focus: FocusHandle,
     /// Focus target and selection for the symbol outline.
     outline_focus: FocusHandle,
+    plugin_panel_focus: FocusHandle,
     outline_selected: Option<usize>,
     /// Additional workspace roots beyond `workspace_root`.
     pub workspace_roots: Vec<PathBuf>,
@@ -699,6 +709,8 @@ pub struct LubanApp {
     snippet_picker_rows: Vec<crate::snippet_ui::SnippetRow>,
     pub plugin_manager: crate::plugin_manager::PluginManagerState,
     plugin_panel: Option<PluginPanelState>,
+    /// Monotonic token handed to the single live plugin-panel watcher.
+    plugin_panel_watch: u64,
     ipc_queue: Option<
         std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<crate::ipc::IpcCommand>>>,
     >,
@@ -1012,6 +1024,7 @@ impl LubanApp {
             explorer: ExplorerState::new(),
             explorer_focus: cx.focus_handle(),
             outline_focus: cx.focus_handle(),
+            plugin_panel_focus: cx.focus_handle(),
             outline_selected: None,
             large_file: LargeFilePanel::new(window, cx),
             large_loads: Vec::new(),
@@ -1098,6 +1111,7 @@ impl LubanApp {
                 &plugin_store_url,
             ),
             plugin_panel: None,
+            plugin_panel_watch: 0,
             ipc_queue: options.ipc_queue,
             pending_waits: Vec::new(),
             wait: options.wait,
@@ -1673,6 +1687,7 @@ impl LubanApp {
                 if matches!(event, InputEvent::Change) {
                     tab.needs_sync = true;
                     tab.pending_edit = true;
+                    tab.edit_generation = tab.edit_generation.wrapping_add(1);
                     // Large documents never run the whole-buffer diff; the
                     // editor event is enough to track the modified state.
                     if tab.large_file {
@@ -1741,6 +1756,7 @@ impl LubanApp {
             fold_generation: 0,
             needs_sync: false,
             pending_edit: false,
+            edit_generation: 0,
             word_count: None,
             huge: huge_ui,
             highlighted_revision: u64::MAX,
@@ -11997,6 +12013,21 @@ impl LubanApp {
                     self.plugin_host.set_status(plugin_id, &id, text);
                     cx.notify();
                 }
+                luban_plugin::runtime::HostAction::OpenPanel { id } => {
+                    if self
+                        .plugin_host
+                        .panels
+                        .iter()
+                        .any(|panel| panel.plugin_id == plugin_id && panel.id == id)
+                    {
+                        self.open_plugin_panel(plugin_id, &id, window, cx);
+                    } else {
+                        self.set_status(
+                            format!("plugin '{plugin_id}' requested unknown panel '{id}'"),
+                            cx,
+                        );
+                    }
+                }
             }
         }
         if let Some(error) = call.error {
@@ -12423,6 +12454,129 @@ impl LubanApp {
         &mut self,
         plugin_id: &str,
         panel_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let auto_refresh = self
+            .plugin_host
+            .panels
+            .iter()
+            .find(|panel| panel.plugin_id == plugin_id && panel.id == panel_id)
+            .is_some_and(|panel| panel.refresh == luban_plugin::manifest::PanelRefresh::Edit);
+        self.plugin_panel_watch = self.plugin_panel_watch.wrapping_add(1);
+        let watch = self.plugin_panel_watch;
+        self.render_plugin_panel_content(plugin_id, panel_id, watch, window, cx);
+        if auto_refresh
+            && self
+                .plugin_panel
+                .as_ref()
+                .is_some_and(|panel| panel.watch == watch)
+        {
+            self.watch_plugin_panel(watch, window, cx);
+        }
+    }
+
+    /// Recompute the open panel while keeping its watcher token.
+    fn refresh_plugin_panel(
+        &mut self,
+        plugin_id: &str,
+        panel_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let watch = self
+            .plugin_panel
+            .as_ref()
+            .filter(|panel| panel.plugin_id == plugin_id && panel.panel_id == panel_id)
+            .map(|panel| panel.watch)
+            .unwrap_or_else(|| {
+                self.plugin_panel_watch = self.plugin_panel_watch.wrapping_add(1);
+                self.plugin_panel_watch
+            });
+        self.render_plugin_panel_content(plugin_id, panel_id, watch, window, cx);
+    }
+
+    /// Pull edits into the document, then recompute a watched panel.
+    fn refresh_watched_plugin_panel(
+        &mut self,
+        watch: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.plugin_panel.as_ref() else {
+            return;
+        };
+        if panel.watch != watch {
+            return;
+        }
+        let plugin_id = panel.plugin_id.clone();
+        let panel_id = panel.panel_id.clone();
+        if self.active_tab().is_some_and(|tab| {
+            !tab.large_file
+                && !tab.doc.is_huge()
+                && tab.doc.partial_range().is_none()
+                && !tab.doc.is_non_text()
+                && !tab.doc.read_only
+        }) {
+            self.sync_active(window, cx);
+        }
+        self.render_plugin_panel_content(&plugin_id, &panel_id, watch, window, cx);
+    }
+
+    /// State that makes a live panel stale. `None` closes the watcher.
+    fn plugin_panel_generation(&self, watch: u64) -> Option<(u64, u64, u64, u64)> {
+        let panel = self.plugin_panel.as_ref()?;
+        if panel.watch != watch {
+            return None;
+        }
+        match self.active_tab() {
+            Some(tab) => Some((watch, tab.id, tab.edit_generation, tab.doc.revision())),
+            None => Some((watch, 0, 0, 0)),
+        }
+    }
+
+    fn watch_plugin_panel(&mut self, watch: u64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let mut last_generation: Option<(u64, u64, u64, u64)> = None;
+            let mut changed_at: Option<Instant> = None;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(180))
+                    .await;
+                let Ok(generation) = this.update(cx, |app, _cx| app.plugin_panel_generation(watch))
+                else {
+                    break;
+                };
+                let Some(generation) = generation else {
+                    break;
+                };
+                match last_generation {
+                    None => last_generation = Some(generation),
+                    Some(previous) if previous != generation => {
+                        last_generation = Some(generation);
+                        changed_at = Some(Instant::now());
+                    }
+                    Some(_) => {
+                        if changed_at
+                            .is_some_and(|since| since.elapsed() >= Duration::from_millis(150))
+                        {
+                            changed_at = None;
+                            let _ = this.update_in(cx, |app, window, cx| {
+                                app.refresh_watched_plugin_panel(watch, window, cx);
+                            });
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn render_plugin_panel_content(
+        &mut self,
+        plugin_id: &str,
+        panel_id: &str,
+        watch: u64,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -12463,6 +12617,9 @@ impl LubanApp {
                 luban_plugin::runtime::HostAction::SetStatus { id, text } => {
                     self.plugin_host.set_status(plugin_id, &id, text);
                 }
+                luban_plugin::runtime::HostAction::OpenPanel { id } => {
+                    log::warn!("plugin panel '{panel_id}' requested panel '{id}'; action ignored");
+                }
             }
         }
         if let Some(message) = &error {
@@ -12479,8 +12636,10 @@ impl LubanApp {
             .map(|panel| panel.title.clone())
             .unwrap_or_else(|| panel_id.to_string());
         let placement = panel_spec
+            .as_ref()
             .map(|panel| panel.placement)
             .unwrap_or(luban_plugin::manifest::PanelPlacement::Right);
+        let width = panel_spec.as_ref().and_then(|panel| panel.width);
         let content_title = call
             .value
             .as_ref()
@@ -12488,14 +12647,25 @@ impl LubanApp {
             .filter(|title| !title.trim().is_empty());
         let truncated = call.value.as_ref().is_some_and(|panel| panel.truncated);
         let lines = call.value.map(|panel| panel.lines).unwrap_or_default();
+        // Reuse the scroll position for the same panel so live refreshes do
+        // not jump back to the top; a newly opened panel starts at the top.
+        let scroll = self
+            .plugin_panel
+            .as_ref()
+            .filter(|panel| panel.plugin_id == plugin_id && panel.panel_id == panel_id)
+            .map(|panel| panel.scroll.clone())
+            .unwrap_or_default();
         self.plugin_panel = Some(PluginPanelState {
             plugin_id: plugin_id.to_string(),
             panel_id: panel_id.to_string(),
             title: content_title.unwrap_or(manifest_title),
             placement,
+            width,
             truncated,
             lines,
             error: error.take(),
+            watch,
+            scroll,
         });
         cx.notify();
     }
@@ -12511,13 +12681,28 @@ impl LubanApp {
         let has_error = error.is_some();
         let truncated = panel.truncated;
         let placement = panel.placement;
+        let width = panel.width;
+        let scroll = panel.scroll.clone();
+        let focus = self.plugin_panel_focus.clone();
         let plugin_id = panel.plugin_id.clone();
         let panel_id = panel.panel_id.clone();
+        let code_font_family = if self.settings.font_family.trim().is_empty() {
+            cx.theme().mono_font_family.clone()
+        } else {
+            SharedString::from(self.settings.font_family.clone())
+        };
+        let base_font = window.text_style().font();
         let weak_close = cx.weak_entity();
         let weak_refresh = cx.weak_entity();
+        let weak_focus = cx.weak_entity();
+        let rows: Vec<AnyElement> = lines
+            .into_iter()
+            .map(|line| Self::plugin_panel_line(line, &code_font_family, &base_font, cx))
+            .collect();
         let content = div()
             .flex()
             .flex_col()
+            .h_full()
             .gap_2()
             .p_5()
             .child(
@@ -12544,7 +12729,7 @@ impl LubanApp {
                                         let plugin_id = plugin_id.clone();
                                         let panel_id = panel_id.clone();
                                         let _ = weak_refresh.update(cx, |this, cx| {
-                                            this.open_plugin_panel(
+                                            this.refresh_plugin_panel(
                                                 &plugin_id, &panel_id, window, cx,
                                             );
                                         });
@@ -12554,9 +12739,10 @@ impl LubanApp {
                                 Button::new("plugin-panel-close")
                                     .label(tr("common.close"))
                                     .compact()
-                                    .on_click(move |_, _, cx| {
+                                    .on_click(move |_, window, cx| {
                                         let _ = weak_close.update(cx, |this, cx| {
                                             this.plugin_panel = None;
+                                            this.focus_editor(window, cx);
                                             cx.notify();
                                         });
                                     }),
@@ -12573,43 +12759,25 @@ impl LubanApp {
             })
             .child(
                 div()
-                    .id("plugin-panel-lines")
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                    .relative()
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .children(lines.into_iter().map(|line| {
-                        let weak = cx.weak_entity();
-                        let element = div()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .text_sm()
-                            .child(line.text.clone());
-                        match line.command {
-                            Some(command) => element
-                                .cursor_pointer()
-                                .hover(|this| this.bg(cx.theme().colors.secondary))
-                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.plugin_panel = None;
-                                        if !this.run_command(&command, window, cx) {
-                                            this.set_status(
-                                                tr_args(
-                                                    "status.command_failed",
-                                                    &[("command", command.clone())],
-                                                ),
-                                                cx,
-                                            );
-                                        }
-                                    });
-                                }),
-                            None => element,
-                        }
-                        .into_any_element()
-                    })),
+                    .child(
+                        div()
+                            .id("plugin-panel-lines")
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .track_scroll(&scroll)
+                            .track_focus(&focus)
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                    .child(
+                        Scrollbar::vertical(&scroll)
+                            .id("plugin-panel-scrollbar")
+                            .mode(ScrollbarMode::Always),
+                    ),
             )
             .when(empty && !has_error, |this| {
                 this.child(
@@ -12627,35 +12795,249 @@ impl LubanApp {
                         .child(tr("plugins.panel_truncated")),
                 )
             });
-        let _ = window;
         let card = div()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
             .bg(cx.theme().colors.background)
+            // Clicking the panel focuses its scroll area; the editor keeps
+            // focus until the user clicks the preview. The panel may have been
+            // closed by a row's command before this bubbles up.
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                let _ = weak_focus.update(cx, |this, cx| {
+                    if this.plugin_panel.is_some() {
+                        this.plugin_panel_focus.focus(window, cx);
+                    }
+                });
+            })
             .child(content);
         match placement {
-            luban_plugin::manifest::PanelPlacement::Right => div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .w(px(380.))
-                .border_l_1()
-                .border_color(cx.theme().colors.border)
-                .child(card)
-                .into_any_element(),
+            luban_plugin::manifest::PanelPlacement::Right => {
+                let available = window.bounds().size.width.as_f32() - 320.0;
+                let width = f32::from(width.unwrap_or(380)).clamp(280.0, 1200.0);
+                let width = width.min(available.max(280.0));
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(width))
+                    .occlude()
+                    .border_l_1()
+                    .border_color(cx.theme().colors.border)
+                    .child(card)
+                    .into_any_element()
+            }
             luban_plugin::manifest::PanelPlacement::Bottom => div()
                 .absolute()
                 .left_0()
                 .right_0()
                 .bottom(px(24.))
                 .h(px(260.))
+                .occlude()
                 .border_t_1()
                 .border_color(cx.theme().colors.border)
                 .child(card)
                 .into_any_element(),
+        }
+    }
+
+    /// Build one rich panel row. `text` is the plain fallback; `spans` and
+    /// `style` carry the presentation added in 1.0.0-preview.2.
+    fn plugin_panel_line(
+        line: luban_plugin::runtime::PanelLine,
+        code_font_family: &SharedString,
+        base_font: &Font,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use luban_plugin::runtime::{PanelLineStyle, PanelSpan, PanelSpanStyle};
+
+        let theme = cx.theme().clone();
+        let colors = theme.colors;
+        let highlight = theme.highlight_theme.clone();
+        let syntax_background = colors.secondary;
+        let syntax_foreground = highlight
+            .style
+            .editor_foreground
+            .unwrap_or(colors.foreground);
+
+        let mut base_color = colors.foreground;
+        let mut code_family = false;
+        let mut element = div().px(px(8.0)).rounded_sm();
+        match line.style {
+            PanelLineStyle::Text => {
+                element = element.py(px(3.0)).mb(px(4.0));
+            }
+            PanelLineStyle::Muted => {
+                base_color = colors.muted_foreground;
+                element = element.py(px(3.0)).mb(px(4.0));
+            }
+            PanelLineStyle::H1 => {
+                element = element
+                    .text_2xl()
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(14.0))
+                    .pb(px(6.0));
+            }
+            PanelLineStyle::H2 => {
+                element = element
+                    .text_xl()
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(12.0))
+                    .pb(px(4.0));
+            }
+            PanelLineStyle::H3 => {
+                element = element
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(10.0))
+                    .pb(px(4.0));
+            }
+            PanelLineStyle::H4 | PanelLineStyle::H5 | PanelLineStyle::H6 => {
+                element = element
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(8.0))
+                    .pb(px(2.0));
+            }
+            PanelLineStyle::Code => {
+                base_color = syntax_foreground;
+                code_family = true;
+                element = element
+                    .bg(syntax_background)
+                    .text_sm()
+                    .py(px(2.0))
+                    .min_h(px(18.0));
+            }
+            PanelLineStyle::Quote => {
+                base_color = colors.muted_foreground;
+                element = element
+                    .text_sm()
+                    .border_l_2()
+                    .border_color(colors.border)
+                    .pl(px(12.0 + f32::from(line.indent) * 12.0))
+                    .py(px(1.0))
+                    .mb(px(1.0));
+            }
+            PanelLineStyle::List => {
+                element = element
+                    .text_sm()
+                    .pl(px(8.0 + f32::from(line.indent) * 14.0))
+                    .py(px(2.0))
+                    .mb(px(1.0));
+            }
+            PanelLineStyle::Table => {
+                code_family = true;
+                element = element.text_sm().py(px(1.0));
+            }
+            PanelLineStyle::Rule => {
+                return div()
+                    .py(px(8.0))
+                    .child(div().h(px(1.0)).w_full().bg(colors.border))
+                    .into_any_element();
+            }
+        }
+        if !matches!(line.style, PanelLineStyle::Quote | PanelLineStyle::List) {
+            element = element.pl(px(8.0 + f32::from(line.indent) * 14.0));
+        }
+
+        let heading = matches!(
+            line.style,
+            PanelLineStyle::H1
+                | PanelLineStyle::H2
+                | PanelLineStyle::H3
+                | PanelLineStyle::H4
+                | PanelLineStyle::H5
+                | PanelLineStyle::H6
+        );
+
+        let spans: Vec<PanelSpan> = if line.spans.is_empty() {
+            vec![PanelSpan {
+                text: line.text.clone(),
+                style: PanelSpanStyle::default(),
+                role: None,
+            }]
+        } else {
+            line.spans.clone()
+        };
+        let mut runs: Vec<TextRun> = Vec::new();
+        for span in &spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            let role = span.role.as_deref().and_then(|role| highlight.style(role));
+            let mut font = base_font.clone();
+            if code_family || span.style.code() {
+                font.family = code_font_family.clone();
+            }
+            if let Some(style) = &role {
+                if let Some(weight) = style.font_weight {
+                    font.weight = weight;
+                }
+                if let Some(style) = style.font_style {
+                    font.style = style;
+                }
+            }
+            if heading || span.style.bold() {
+                font.weight = FontWeight::BOLD;
+            }
+            if span.style.italic() {
+                font.style = FontStyle::Italic;
+            }
+            let color = if span.style.link() {
+                colors.link
+            } else if let Some(style) = &role {
+                style.color.unwrap_or(base_color)
+            } else if span.style.muted() {
+                colors.muted_foreground
+            } else {
+                base_color
+            };
+            let background_color = span.style.code().then_some(syntax_background);
+            let underline =
+                (span.style.link() || span.style.underline()).then_some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(color),
+                    wavy: false,
+                });
+            let strikethrough = span.style.strike().then_some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(color),
+            });
+            runs.push(TextRun {
+                len: span.text.len(),
+                font,
+                color,
+                background_color,
+                underline,
+                strikethrough,
+            });
+        }
+        let mut text = StyledText::new(line.text.clone());
+        if !runs.is_empty() {
+            text = text.with_runs(runs);
+        }
+        let weak = cx.weak_entity();
+        let element = element.child(text);
+        match line.command {
+            Some(command) => element
+                .cursor_pointer()
+                .hover(move |this| this.bg(colors.secondary))
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.plugin_panel = None;
+                        this.focus_editor(window, cx);
+                        if !this.run_command(&command, window, cx) {
+                            this.set_status(
+                                tr_args("status.command_failed", &[("command", command.clone())]),
+                                cx,
+                            );
+                        }
+                    });
+                })
+                .into_any_element(),
+            None => element.into_any_element(),
         }
     }
 

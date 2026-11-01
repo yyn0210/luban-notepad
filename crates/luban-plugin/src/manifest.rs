@@ -185,6 +185,17 @@ pub enum PanelPlacement {
     Bottom,
 }
 
+/// When the host recomputes an open panel's content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelRefresh {
+    /// Only on open and when the user presses Refresh.
+    #[default]
+    Manual,
+    /// Follow edits of the active document and tab switches while open.
+    Edit,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PanelContribution {
     pub id: String,
@@ -192,6 +203,12 @@ pub struct PanelContribution {
     pub entry: String,
     #[serde(default)]
     pub placement: PanelPlacement,
+    /// Preferred width in pixels for right-placement panels. Clamped to
+    /// `280..=1200` and to the window width by the host.
+    #[serde(default)]
+    pub width: Option<u16>,
+    #[serde(default)]
+    pub refresh: PanelRefresh,
 }
 
 impl PluginManifest {
@@ -404,6 +421,14 @@ impl PluginManifest {
                     "panel '{}' entry '{}' is not an identifier",
                     panel.id, panel.entry
                 ));
+            }
+            if let Some(width) = panel.width {
+                if !(280..=1200).contains(&width) {
+                    errors.push(format!(
+                        "panel '{}' width {width} is outside 280..=1200",
+                        panel.id
+                    ));
+                }
             }
         }
     }

@@ -77,8 +77,7 @@ Luban Notepad 1.0 的插件由一个 JSON 清单和一个沙箱化 Lua 文件组
     ],
     "panels": [
       { "id": "hello.list", "title": "Hello", "entry": "list", "placement": "right" }
-    ]
-  }
+    ]  }
 }
 ```
 
@@ -144,6 +143,8 @@ Lua 栈回溯和出错位置；完整错误写入应用日志，状态栏保留�
 | `luban.replace_selection(text)` | 替换选区。 |
 | `luban.settings.get(key)` | 读取插件设置。 |
 | `luban.status.set(id, text)` | 更新已声明的状态栏项。 |
+| `luban.panel.open(id)` | 打开或刷新本插件声明过的面板；旧宿主没有此 API。 |
+| `luban.syntax.highlight(text, language)` | 用当前语法主题高亮文本，返回 `{ text, role }` 数组；单次上限 64 KiB；旧宿主没有此 API。 |
 | `luban.fs.read(path)` | 读取文本文件（需要 `filesystem` 权限）。 |
 | `luban.fs.write(path, text)` | 原子写入文件（需要 `filesystem` 权限）。 |
 | `luban.data_dir()` | 返回并创建插件数据目录。 |
@@ -187,11 +188,45 @@ Lua 栈回溯和出错位置；完整错误写入应用日志，状态栏保留�
 
 ### 面板
 
-`panels` 由宿主渲染为模型态浮层（右缘或下缘）。`entry` 返回：
+`panels` 由宿主渲染为模型态浮层（右缘或下缘）。面板清单支持两个可选字段：
+
+```json
+{
+  "id": "hello.list",
+  "title": "Hello",
+  "entry": "list",
+  "placement": "right",
+  "width": 640,
+  "refresh": "edit"
+}
+```
+
+- `width`：右侧面板宽度，280–1200，缺省 380；宿主会再按窗口宽度收敛。
+- `refresh`：`manual`（缺省）或 `edit`。`edit` 表示面板打开期间跟随活动文档的
+  编辑和标签切换自动重算，编辑停止约 150ms 后刷新；面板关闭即停止。
+
+`entry` 返回：
 
 - 字符串数组：每项一行。
-- `{ title = "...", lines = [ ... ] }`，行可以是字符串或
-  `{ text = "...", command = "hello.greet" }`。
+- `{ title = "...", lines = [ ... ] }`，行可以是字符串或：
+  ```lua
+  {
+    text = "纯文本回退",              -- 必填
+    style = "text",                  -- text|muted|h1..h6|code|quote|list|table|rule
+    indent = 0,                      -- 0..8
+    spans = {                        -- 可选；拼接后必须等于 text
+      { text = "粗体", style = "bold" },
+      { text = "fn", role = "keyword" },
+    },
+    command = "hello.greet",
+  }
+  ```
+- span 的 `style` 是空格分隔的标志：`bold`、`italic`、`underline`、`strike`、
+  `code`、`link`、`muted`；`role` 使用 `luban.syntax.highlight` 返回的语义角色，宿主用当前
+  语法主题着色。spans 总字节不超过 4 KiB，且拼接必须等于 `text`，否则整行按
+  `text` 渲染。
+- 旧宿主忽略 `width`、`refresh`、`style`、`indent`、`spans` 和 `role`，只显示
+  `text`，因此插件应始终提供完整可读的纯文本回退。
 
 面板最多显示 5,000 行，超过时截断并提示。点击带 `command` 的行执行命令。
 面板不会阻止编辑、保存或标签切换。
@@ -250,7 +285,9 @@ SHA-256 哈希）保存在 `<config-dir>/plugins/.installed.json`。权限集合
 
 - 不支持 WASM 插件、网络请求或子进程。
 - 插件是单文件 Lua；不提供 `require`/多文件模块。
-- 不提供任意 GPUI 视图注入；面板是宿主渲染的文本/列表浮层。
+- 不提供任意 GPUI 视图注入；面板是宿主渲染的富文本行浮层（标题、span、代码、
+  引用、表格等），不能嵌入自定义控件或 HTML。
+- 面板里的链接不可点击；需要交互的行只能绑定已声明的插件命令。
 - 插件命令在 UI 线程同步执行；长时间计算受指令上限保护，但会阻塞界面直到
   回调返回。
 - 插件设置是全局设置，不随工作区切换。

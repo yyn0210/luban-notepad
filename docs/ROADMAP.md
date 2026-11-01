@@ -257,8 +257,12 @@ Luban Notepad 0.13 不是“功能少”，而是**能力结构偏科**：超大
 - [x] **插件商店**：Git 目录仓库 + 应用内商店页签；后台获取/缓存目录、搜索/
       详情、按 OS/CPU 选择 `universal` 或目标平台产物、SHA-256 校验后复用安装
       事务；目录 Schema、校验脚本和 CI。
-- [ ] **首批官方插件**：文件比较/差异、JSON/XML 格式化、Markdown 预览、
-      CSV 模式（后续 change，使用本轮的插件 API）。
+- [x] **Markdown 预览插件**：官方商店插件
+      `io.github.yyn0210.markdown-preview`（GFM、表格/任务列表、代码高亮、
+      自动刷新）；宿主新增富文本面板行、`luban.syntax.highlight` 和
+      `luban.panel.open`，API 保持 v1 向后兼容。
+- [ ] **其余官方插件**：文件比较/差异、JSON/XML 格式化、CSV 模式（后续
+      change，使用本轮的插件 API）。
 - [x] **UDL/主题/片段包**：`.sublime-syntax`、`.tmTheme`、
       `.sublime-snippet`/`snippets.json`；用户包目录。
 - [x] **CLI 自动化**：`--goto file:line:col`、`--wait`、`--new-window`、

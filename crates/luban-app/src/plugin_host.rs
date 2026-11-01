@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use luban_core::Settings;
 use luban_plugin::install::{self, InstallRecords};
 use luban_plugin::manifest::{
-    CommandCondition, PanelPlacement, PluginManifest, SettingContribution, StatusAlignment,
+    CommandCondition, PanelPlacement, PanelRefresh, PluginManifest, SettingContribution,
+    StatusAlignment,
 };
 use luban_plugin::registry::{LoadPlan, PluginRegistry, PluginState};
 use luban_plugin::runtime::{
@@ -46,6 +47,8 @@ pub struct PluginPanelSpec {
     pub title: String,
     pub entry: String,
     pub placement: PanelPlacement,
+    pub width: Option<u16>,
+    pub refresh: PanelRefresh,
 }
 
 pub struct PluginHost {
@@ -163,6 +166,8 @@ impl PluginHost {
                     title: panel.title.clone(),
                     entry: panel.entry.clone(),
                     placement: panel.placement,
+                    width: panel.width,
+                    refresh: panel.refresh,
                 });
             }
             for command in &manifest.contributes.commands {

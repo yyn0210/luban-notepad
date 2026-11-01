@@ -31,6 +31,7 @@ pub mod session;
 pub mod settings;
 pub mod snippet;
 pub mod symbols;
+pub mod syntax;
 pub mod text;
 pub mod undo;
 pub mod user_packages;
