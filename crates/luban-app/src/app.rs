@@ -20602,6 +20602,11 @@ impl LubanApp {
 
     fn render_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut overlays = Vec::new();
+        // The plugin panel is modeless: it stays above the editor but below
+        // every modal dialog.
+        if self.plugin_panel.is_some() {
+            overlays.push(self.render_plugin_panel(window, cx));
+        }
         if self.find_in_files.open {
             overlays.push(self.render_find_in_files(window, cx));
         }
@@ -20637,9 +20642,6 @@ impl LubanApp {
         }
         if self.plugin_manager.open {
             overlays.push(self.render_plugin_manager(window, cx));
-        }
-        if self.plugin_panel.is_some() {
-            overlays.push(self.render_plugin_panel(window, cx));
         }
         if self.about_open {
             overlays.push(self.render_about(window, cx));
