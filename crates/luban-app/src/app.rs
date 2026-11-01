@@ -22478,6 +22478,7 @@ impl LubanApp {
                 .id(format!("store-plugin-{id}"))
                 .flex()
                 .flex_col()
+                .min_w(px(0.))
                 .gap_1()
                 .p_3()
                 .rounded_md()
@@ -22501,27 +22502,32 @@ impl LubanApp {
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap_2()
+                        .min_w(px(0.))
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap_2()
+                                .min_w(px(0.))
                                 .child(
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
+                                        .truncate()
                                         .child(format!("{} {}", row.name, row.version)),
                                 )
                                 .when(!row.tags.is_empty(), |this| {
                                     this.child(
                                         div()
                                             .text_xs()
+                                            .truncate()
                                             .text_color(cx.theme().colors.muted_foreground)
                                             .child(format!("#{}", row.tags)),
                                     )
                                 }),
                         )
-                        .child(install),
+                        .child(div().flex_shrink_0().child(install)),
                 )
                 .child(
                     div()
@@ -22582,6 +22588,7 @@ impl LubanApp {
         let mut details_panel = div()
             .id("plugin-store-details")
             .w(px(300.))
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap_2()
@@ -22795,7 +22802,15 @@ impl LubanApp {
                     .gap_3()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(div().flex().flex_col().flex_1().min_h(px(0.)).child(list))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .child(list),
+                    )
                     .child(details_panel),
             );
         self.overlay_card(880.0, Some(680.0), cx, content.into_any_element())
