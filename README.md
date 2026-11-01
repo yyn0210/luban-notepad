@@ -43,9 +43,10 @@ Notepad++ 中人们日常最常用的部分——快速的标签页编辑、语�
   面包屑显示工作区→目录→文件→当前符号；符号大纲按缩进分层并可点击跳转；
   `Alt+←/→` 提供每窗口独立的前进/后退历史。
 - **扩展性**：`plugin.json` 清单 + 沙箱化 Lua 5.4 插件（命令、菜单、快捷键、
-  状态栏、设置和文本/列表面板），权限批准与安全模式，以及本地目录/zip/Git
-  安装、更新、卸载的插件管理器；用户包支持 `.sublime-syntax`、`.tmTheme`、
-  `.sublime-snippet` 和 `snippets.json`。
+  状态栏、设置和文本/列表面板），权限批准与安全模式，本地目录/zip/Git
+  安装、更新、卸载的插件管理器，以及按 OS/CPU 筛选、SHA-256 校验的插件商店；
+  用户包支持 `.sublime-syntax`、`.tmTheme`、`.sublime-snippet` 和
+  `snippets.json`。
 - **CLI 自动化**：`--goto`、`--new-window`、`--wait`、`--diff`、`--stdin`、
   `--command`、`--safe-mode` 和单实例转发；`--diff` 打开只读统一差异标签。
 - **工作区与文件树**：`.luban-workspace` 多根工作区、最近工作区、工作区设置
@@ -258,9 +259,13 @@ Luban Notepad 使用平台的配置目录：
 插件位于配置目录的 `plugins/<id>/`，由 `plugin.json` 和 `main.lua` 组成；用户
 语法、主题和片段位于 `packages/{syntaxes,themes,snippets}/`。首选项 → 插件可以
 启用/禁用、批准权限、安装、更新和卸载插件；设置搜索中的“插件”分组可以打开
-管理器。`--safe-mode` 禁用插件但保留用户语法、主题和片段。
+管理器。插件管理器顶部的“商店”页签（或“插件 → 插件商店…”）从
+[yyn0210/luban-notepad-store](https://github.com/yyn0210/luban-notepad-store)
+读取目录，只显示当前 OS/CPU 可安装的插件，并在校验 SHA-256 后复用现有安装流程。
+`--safe-mode` 禁用插件但保留用户语法、主题和片段。
 
-插件清单、Lua API、权限和限制见 [docs/PLUGINS.md](docs/PLUGINS.md)；包格式和
+插件清单、Lua API、权限和限制见 [docs/PLUGINS.md](docs/PLUGINS.md)；商店目录格式、
+目标平台和发布流程见 [docs/PLUGIN_STORE.md](docs/PLUGIN_STORE.md)；包格式和
 片段占位符见 [docs/PACKAGES.md](docs/PACKAGES.md)。
 
 ## 键盘快捷键

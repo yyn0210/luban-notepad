@@ -30,6 +30,7 @@ mod palette;
 mod path_prompt;
 mod plugin_host;
 mod plugin_manager;
+mod plugin_store;
 mod preferences;
 mod quick_open;
 mod settings_search;

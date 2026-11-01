@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +33,9 @@ pub enum InstallSource {
     Zip {
         path: PathBuf,
     },
+    Store {
+        catalog: String,
+    },
     Git {
         url: String,
         #[serde(default)]
@@ -45,6 +48,7 @@ impl InstallSource {
         match self {
             Self::Local { path } => format!("local:{}", path.display()),
             Self::Zip { path } => format!("zip:{}", path.display()),
+            Self::Store { catalog } => format!("store:{catalog}"),
             Self::Git { url, reference } => match reference {
                 Some(reference) => format!("git:{url}#{reference}"),
                 None => format!("git:{url}"),
@@ -259,17 +263,178 @@ pub fn install_zip_with(
     let source = InstallSource::Zip {
         path: absolute(zip_path)?,
     };
-    let record = install_from_dir(root, &plugin_dir, source, None, replace);
+    let mut record = install_from_dir(root, &plugin_dir, source, None, replace);
     let _ = fs::remove_dir_all(&temp);
-    if let Ok(record) = &record {
-        if let Err(error) = stash_zip(root, &record.id, zip_path) {
-            log::warn!(
+    if let Ok(record) = &mut record {
+        match stash_zip(root, &record.id, zip_path) {
+            Ok(()) => {
+                let cached = InstallSource::Zip {
+                    path: zip_stash_path(root, &record.id),
+                };
+                match set_record_source(root, &record.id, cached.clone()) {
+                    Ok(()) => record.source = cached,
+                    Err(error) => log::warn!("cannot update the install record source: {error}"),
+                }
+            }
+            Err(error) => log::warn!(
                 "cannot keep a cached copy of {}: {error}",
                 zip_path.display()
-            );
+            ),
         }
     }
     record
+}
+
+/// Identity a store package must match before it is installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedPlugin {
+    pub id: String,
+    pub version: String,
+}
+
+/// Install a store package after checking the manifest identity.
+///
+/// The archive is unpacked and its `plugin.json` is loaded before the
+/// transactional install runs, so a package whose id or version differs from
+/// the catalog entry can never replace an installed plugin. An existing
+/// permission approval is kept when the permission set did not change.
+pub fn install_zip_checked(
+    root: &Path,
+    zip_path: &Path,
+    replace: bool,
+    expected: &ExpectedPlugin,
+) -> Result<InstallRecord, String> {
+    let source = InstallSource::Zip {
+        path: absolute(zip_path)?,
+    };
+    install_zip_checked_with_source(root, zip_path, replace, expected, source)
+}
+
+/// Install a store package and record which catalog it came from.
+pub fn install_zip_checked_with_source(
+    root: &Path,
+    zip_path: &Path,
+    replace: bool,
+    expected: &ExpectedPlugin,
+    source: InstallSource,
+) -> Result<InstallRecord, String> {
+    let temp = temp_dir(root, "zip")?;
+    let install_source = source.clone();
+    let mut result = extract_zip(zip_path, &temp).and_then(|()| {
+        let plugin_dir = find_plugin_root(&temp)?;
+        let manifest = PluginManifest::load(&plugin_dir)?;
+        if manifest.id != expected.id {
+            return Err(format!(
+                "package contains plugin '{}' but the catalog lists '{}'",
+                manifest.id, expected.id
+            ));
+        }
+        if manifest.version != expected.version {
+            return Err(format!(
+                "package version '{}' does not match the catalog version '{}'",
+                manifest.version, expected.version
+            ));
+        }
+        reject_native_binaries(&plugin_dir)?;
+        let previous = current_approval(root, &expected.id);
+        install_from_dir(root, &plugin_dir, install_source, previous, replace)
+    });
+    let _ = fs::remove_dir_all(&temp);
+    if result.is_ok() {
+        match stash_zip(root, &expected.id, zip_path) {
+            Ok(()) => {
+                if matches!(source, InstallSource::Zip { .. }) {
+                    let cached = InstallSource::Zip {
+                        path: zip_stash_path(root, &expected.id),
+                    };
+                    match set_record_source(root, &expected.id, cached.clone()) {
+                        Ok(()) => {
+                            if let Ok(record) = &mut result {
+                                record.source = cached;
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("cannot update the install record source: {error}")
+                        }
+                    }
+                }
+            }
+            Err(error) => log::warn!(
+                "cannot keep a cached copy of {}: {error}",
+                zip_path.display()
+            ),
+        }
+    }
+    result
+}
+
+fn current_approval(root: &Path, id: &str) -> Option<String> {
+    load_records(root)
+        .ok()?
+        .plugins
+        .get(id)?
+        .approved_permissions_hash
+        .clone()
+}
+
+/// Point an install record at the cached package instead of a download path
+/// that is deleted after installation.
+fn set_record_source(root: &Path, id: &str, source: InstallSource) -> Result<(), String> {
+    let mut records = load_records(root)?;
+    let Some(record) = records.plugins.get_mut(id) else {
+        return Ok(());
+    };
+    record.source = source;
+    save_records(root, &records)
+}
+
+/// Store packages are pure Lua. Reject native executables, shared libraries
+/// and platform-specific launcher scripts even when the manifest is valid.
+fn reject_native_binaries(dir: &Path) -> Result<(), String> {
+    for entry in WalkDir::new(dir).follow_links(false).sort_by_file_name() {
+        let entry = entry.map_err(|error| format!("cannot walk package: {error}"))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            extension.as_str(),
+            "exe" | "dll" | "so" | "dylib" | "node" | "msi" | "wasm" | "sh" | "bat" | "cmd" | "ps1"
+        ) {
+            return Err(format!(
+                "store packages must be pure Lua; '{name}' is a native or platform script file"
+            ));
+        }
+        let mut file = fs::File::open(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let mut magic = [0u8; 4];
+        let read = file
+            .read(&mut magic)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let native = read >= 4
+            && (magic == *b"\x7fELF"
+                || &magic[..2] == b"MZ"
+                || magic == [0xcf, 0xfa, 0xed, 0xfe]
+                || magic == [0xfe, 0xed, 0xfa, 0xcf]
+                || magic == [0xfe, 0xed, 0xfa, 0xce]
+                || magic == [0xce, 0xfa, 0xed, 0xfe]
+                || magic == *b"\0asm");
+        if native {
+            return Err(format!(
+                "store packages must be pure Lua; '{name}' is a native binary"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Install a plugin by cloning a Git repository.
@@ -323,18 +488,36 @@ pub fn update(root: &Path, id: &str) -> Result<InstallRecord, String> {
                     path.display()
                 ));
             };
-            let temp = temp_dir(root, "zip")?;
-            let result = extract_zip(&source_path, &temp).and_then(|()| {
-                let plugin_dir = find_plugin_root(&temp)?;
-                install_from_dir(root, &plugin_dir, record.source.clone(), previous, true)
-            });
-            let _ = fs::remove_dir_all(&temp);
-            result
+            reinstall_zip(root, &source_path, record.source.clone(), previous)
+        }
+        InstallSource::Store { .. } => {
+            let cached = zip_stash_path(root, id);
+            if !cached.is_file() {
+                return Err(format!(
+                    "the cached package for '{id}' no longer exists; install it again from the plugin store"
+                ));
+            }
+            reinstall_zip(root, &cached, record.source.clone(), previous)
         }
         InstallSource::Git { url, reference } => {
             install_git_from(root, url, reference.as_deref(), previous, true)
         }
     }
+}
+
+fn reinstall_zip(
+    root: &Path,
+    source_path: &Path,
+    source: InstallSource,
+    previous: Option<String>,
+) -> Result<InstallRecord, String> {
+    let temp = temp_dir(root, "zip")?;
+    let result = extract_zip(source_path, &temp).and_then(|()| {
+        let plugin_dir = find_plugin_root(&temp)?;
+        install_from_dir(root, &plugin_dir, source, previous, true)
+    });
+    let _ = fs::remove_dir_all(&temp);
+    result
 }
 
 fn install_git_from(
@@ -463,6 +646,16 @@ fn install_from_dir(
         return Err(format!("{REPLACE_CONFIRMATION}{}", staged_manifest.id));
     }
     restore_stashed_data(root, &staged_manifest.id, &staged)?;
+    if replace {
+        // An update replaces the plugin directory; keep the live data folder.
+        let existing_data = root.join(&staged_manifest.id).join("data");
+        if existing_data.is_dir() {
+            if let Err(error) = merge_copy(&existing_data, &staged.join("data")) {
+                let _ = fs::remove_dir_all(&temp);
+                return Err(error);
+            }
+        }
+    }
     if let Err(error) = commit_dir(root, &staged_manifest.id, &staged) {
         let _ = fs::remove_dir_all(&temp);
         return Err(error);
@@ -977,8 +1170,10 @@ mod tests {
             &[("plugin.json", manifest), ("main.lua", "return {}\n")],
         );
         let plugins = root.path().join("plugins");
-        install_zip(&plugins, &zip_path).unwrap();
-        assert!(zip_stash_path(&plugins, "com.example.cached").is_file());
+        let record = install_zip(&plugins, &zip_path).unwrap();
+        let cached = zip_stash_path(&plugins, "com.example.cached");
+        assert!(cached.is_file());
+        assert_eq!(record.source, InstallSource::Zip { path: cached });
 
         fs::remove_file(&zip_path).unwrap();
         let record = update(&plugins, "com.example.cached").unwrap();
@@ -1080,6 +1275,177 @@ mod tests {
                 .version,
             "1.1.0"
         );
+    }
+
+    #[test]
+    fn checked_zip_install_verifies_identity_and_preserves_data() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        let zip_path = root.path().join("store.zip");
+        let manifest = |version: &str, permissions: &str| {
+            format!(
+                r#"{{
+                    "id": "com.example.store",
+                    "name": "Store",
+                    "version": "{version}",
+                    "api_version": 1,
+                    "main": "main.lua",
+                    "permissions": [{permissions}]
+                }}"#
+            )
+        };
+        zip_plugin(
+            &zip_path,
+            &[
+                ("plugin.json", &manifest("1.0.0", "\"filesystem\"")),
+                ("main.lua", "return {}\n"),
+            ],
+        );
+        let expected = ExpectedPlugin {
+            id: "com.example.store".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        install_zip_checked(&plugins, &zip_path, false, &expected).unwrap();
+        let installed = PluginManifest::load(&plugins.join("com.example.store")).unwrap();
+        approve(&plugins, &installed).unwrap();
+        fs::create_dir_all(plugins.join("com.example.store/data")).unwrap();
+        fs::write(plugins.join("com.example.store/data/state.txt"), "keep").unwrap();
+
+        let mismatch = ExpectedPlugin {
+            id: "com.example.other".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        assert!(install_zip_checked(&plugins, &zip_path, true, &mismatch).is_err());
+        assert_eq!(
+            PluginManifest::load(&plugins.join("com.example.store"))
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+
+        zip_plugin(
+            &zip_path,
+            &[
+                ("plugin.json", &manifest("1.1.0", "\"filesystem\"")),
+                ("main.lua", "return {}\n-- v2\n"),
+            ],
+        );
+        let expected = ExpectedPlugin {
+            id: "com.example.store".to_string(),
+            version: "1.1.0".to_string(),
+        };
+        let record = install_zip_checked(&plugins, &zip_path, true, &expected).unwrap();
+        assert_eq!(record.version, "1.1.0");
+        assert!(
+            record.approved_permissions_hash.is_some(),
+            "an unchanged permission set keeps its approval"
+        );
+        assert_eq!(
+            fs::read_to_string(plugins.join("com.example.store/data/state.txt")).unwrap(),
+            "keep"
+        );
+
+        zip_plugin(
+            &zip_path,
+            &[
+                (
+                    "plugin.json",
+                    &manifest("1.2.0", "\"filesystem\", \"network\""),
+                ),
+                ("main.lua", "return {}\n-- v3\n"),
+            ],
+        );
+        let expected = ExpectedPlugin {
+            id: "com.example.store".to_string(),
+            version: "1.2.0".to_string(),
+        };
+        let record = install_zip_checked(&plugins, &zip_path, true, &expected).unwrap();
+        assert_eq!(record.version, "1.2.0");
+        assert!(
+            record.approved_permissions_hash.is_none(),
+            "changed permissions need a new approval"
+        );
+    }
+
+    #[test]
+    fn store_install_records_the_catalog_source() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        let zip_path = root.path().join("store.zip");
+        let manifest = r#"{
+            "id": "com.example.catalog",
+            "name": "Catalog",
+            "version": "1.0.0",
+            "api_version": 1,
+            "main": "main.lua"
+        }"#;
+        zip_plugin(
+            &zip_path,
+            &[("plugin.json", manifest), ("main.lua", "return {}\n")],
+        );
+        let source = InstallSource::Store {
+            catalog: "https://example.com/catalog.json".to_string(),
+        };
+        let expected = ExpectedPlugin {
+            id: "com.example.catalog".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let record =
+            install_zip_checked_with_source(&plugins, &zip_path, false, &expected, source.clone())
+                .unwrap();
+        assert_eq!(record.source, source);
+        assert!(zip_stash_path(&plugins, "com.example.catalog").is_file());
+        assert_eq!(
+            load_records(&plugins).unwrap().plugins["com.example.catalog"].source,
+            source
+        );
+
+        let reinstalled = update(&plugins, "com.example.catalog").unwrap();
+        assert_eq!(reinstalled.source, source);
+        assert_eq!(reinstalled.version, "1.0.0");
+    }
+
+    #[test]
+    fn checked_zip_install_rejects_native_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        let zip_path = root.path().join("native.zip");
+        let manifest = r#"{
+            "id": "com.example.native",
+            "name": "Native",
+            "version": "1.0.0",
+            "api_version": 1,
+            "main": "main.lua"
+        }"#;
+        zip_plugin(
+            &zip_path,
+            &[
+                ("plugin.json", manifest),
+                ("main.lua", "return {}\n"),
+                ("tool.exe", "MZ fake executable"),
+                ("run.sh", "#!/bin/sh\n"),
+            ],
+        );
+        let expected = ExpectedPlugin {
+            id: "com.example.native".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let error = install_zip_checked(&plugins, &zip_path, false, &expected).unwrap_err();
+        assert!(error.contains("pure Lua"), "{error}");
+        assert!(!plugins.join("com.example.native").exists());
+
+        let magic_zip = root.path().join("magic.zip");
+        zip_plugin(
+            &magic_zip,
+            &[
+                ("plugin.json", manifest),
+                ("main.lua", "return {}\n"),
+                ("payload.dat", "\x7fELF"),
+            ],
+        );
+        let error = install_zip_checked(&plugins, &magic_zip, false, &expected).unwrap_err();
+        assert!(error.contains("native binary"), "{error}");
+        assert!(!plugins.join("com.example.native").exists());
     }
 
     fn git(dir: &Path, args: &[&str]) -> bool {

@@ -69,6 +69,8 @@
 | 插件贡献点 | 是 | 命令、插件菜单、默认快捷键、状态栏项、声明式设置（布尔/字符串/数字/枚举）和文本/列表面板；插件命令进入命令面板、快捷键帮助、快捷键编辑器和宏录制。 |
 | 插件文档 API | 是 | 读取路径/全文/语言/光标/选区；替换全文、在光标处插入、替换选区；只对可编辑全文文档生效，写入可撤销并走现有保存/外部修改保护。 |
 | 插件管理器 | 是 | 首选项“插件”页和“管理插件”浮层；启用/禁用、批准权限、卸载、从本地目录/zip/Git 安装、从记录源更新；安装前校验并原子替换，zip 路径穿越和逃逸符号链接被拒绝。 |
+| 插件商店 | 是 | 插件管理器“商店”页签和 `plugins.store` 命令；从目录仓库后台获取并缓存 `catalog/index.json`，支持搜索、详情、安装和更新；按当前 OS/CPU 选择精确目标或 `universal` 产物，只展示当前平台可安装的插件；下载校验 SHA-256/大小后复用现有 zip 安装事务。 |
+| 商店目录仓库 | 是 | `yyn0210/luban-notepad-store` 提供 `catalog/index.json`、`plugins/<id>.json`、JSON Schema、`build_catalog.py`、`validate.py`、贡献文档和 CI；默认地址指向 `main` 分支。 |
 | 用户语法 | 是 | `packages/syntaxes/**.sublime-syntax` 合并到内置语法集；新语言进入语言选择器、扩展名检测和首行匹配；编辑器高亮与 HTML/RTF 导出共用同一语法集；非法文件跳过。 |
 | 用户主题 | 是 | `packages/themes/**.tmTheme` 出现在语法主题列表；选择后应用到编辑器高亮和导出；损坏/缺失回退默认；旧版单个 `.tmTheme` 导入仍可用。 |
 | 用户片段 | 是 | `packages/snippets/**.sublime-snippet` 和 `.json`；按语言/scope 过滤；`edit.insert-snippet`（`Ctrl+Alt+S`）打开选择器；支持 `$1`/`${1:默认}`/`$0`，Tab/Shift+Tab 导航，Esc 结束，整体撤销。 |

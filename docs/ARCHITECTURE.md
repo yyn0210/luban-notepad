@@ -48,8 +48,9 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 | `permissions` | 权限集合规范化、批准哈希（SHA-256）。 |
 | `registry` | 插件发现、重复 ID/非法清单隔离、依赖拓扑/环、启用/批准/安全模式状态。 |
 | `runtime` | 每个插件独立的 Lua 5.4 状态：沙箱标准库、指令/内存上限、`luban` 宿主 API、文档/状态/文件操作收集为 `HostAction`。 |
-| `install` | 本地目录/zip/Git 安装、原子替换、更新、卸载、安装记录 `.installed.json`、路径穿越/符号链接防护。 |
+| `install` | 本地目录/zip/Git 安装、原子替换、更新、卸载、安装记录 `.installed.json`、路径穿越/符号链接防护；商店使用带预期 ID/版本的 zip 安装入口，并在替换时保留 `data/`。 |
 | `settings` | 插件设置默认值、校验和回退。 |
+| `store` | 商店目录模型与校验：目标平台、产物、版本、本地化、SemVer 可更新判断、当前 OS/CPU 目标匹配、`universal` 回退、目录来源校验和文件 SHA-256。 |
 
 ### `luban-app`
 
@@ -78,7 +79,8 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 | `syntax_theme` | 内置/用户包 `.tmTheme` 到语义高亮角色的映射、解析与应用。 |
 | `highlighter` | 基于活动 `SyntaxSet` 的 `InputHighlighterFactory`；用户 `.sublime-syntax` 因而能用于编辑器和导出。 |
 | `plugin_host` | 应用侧插件加载计划、贡献点注册、命令/面板调用、文档快照与 `HostAction` 应用。 |
-| `plugin_manager` | 插件管理器输入/设置控件状态。 |
+| `plugin_manager` | 插件管理器输入/设置控件状态和“已安装 / 商店”页签。 |
+| `plugin_store` | 商店客户端：后台目录获取、缓存读写、HTTPS/代理与大小限制、产物下载和 SHA-256/大小校验、安装任务状态。 |
 | `snippet_ui` | 片段选择行、插入会话和 tab stop 导航。 |
 | `ipc` | 单实例 PID 锁、`interprocess` 本地套接字（Unix domain socket/Windows 命名管道）、请求/响应协议、主实例请求队列。 |
 | `column_editor` | 列编辑器对话框状态和输入校验。 |
@@ -103,6 +105,14 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 `InputHighlighter` 适配器，但使用 `luban-core::user_syntax::active_set()`。
 `packages.reload` 重新构建活动 `SyntaxSet`、用户语言表和片段集合，并为所有
 已打开编辑器重新安装高亮器；编辑器与 HTML/RTF 导出因此看到同一套语法。
+
+插件商店分为目录模型和客户端两层。`luban-plugin::store` 只做纯数据校验和
+目标选择：解析插件条目、检查 URL/SHA-256/大小/重复目标和版本、按当前 OS/CPU
+选择精确产物或 `universal`、比较已安装版本。`luban-app::plugin_store` 负责后台
+线程获取目录和下载产物，用 `ureq`（rustls）读取代理环境变量，限制响应大小、
+超时和重定向；成功目录原子写入 `<config-dir>/plugins/.store/`，失败时回退同源
+缓存。下载完成并校验后才调用 `luban-plugin::install::install_zip_checked`，
+它核对压缩包清单的 ID/版本并复用现有原子安装、权限批准和依赖校验。
 
 ## 单实例与 CLI
 

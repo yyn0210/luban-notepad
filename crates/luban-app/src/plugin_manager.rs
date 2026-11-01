@@ -9,8 +9,15 @@ use crate::i18n::tr;
 
 use crate::app::LubanApp;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginManagerTab {
+    Installed,
+    Store,
+}
+
 pub struct PluginManagerState {
     pub open: bool,
+    pub tab: PluginManagerTab,
     pub install_source: Entity<InputState>,
     pub message: Option<String>,
     pub error: Option<String>,
@@ -22,14 +29,18 @@ pub struct PluginManagerState {
     pub remove_data: bool,
     /// Text inputs for plugin string settings, keyed by `plugin:key`.
     pub text_inputs: BTreeMap<String, Entity<InputState>>,
+    /// Store catalog, search and download state.
+    pub store: crate::plugin_store::PluginStoreState,
 }
 
 impl PluginManagerState {
-    pub fn new(window: &mut Window, cx: &mut Context<LubanApp>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<LubanApp>, store_url: &str) -> Self {
         let install_source =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr("plugins.install_placeholder")));
+        let store = crate::plugin_store::PluginStoreState::new(window, cx, store_url);
         Self {
             open: false,
+            tab: PluginManagerTab::Installed,
             install_source,
             message: None,
             error: None,
@@ -37,11 +48,13 @@ impl PluginManagerState {
             pending_uninstall: None,
             remove_data: false,
             text_inputs: BTreeMap::new(),
+            store,
         }
     }
 
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<LubanApp>) {
         self.open = true;
+        self.tab = PluginManagerTab::Installed;
         self.message = None;
         self.error = None;
         self.pending_replace = None;

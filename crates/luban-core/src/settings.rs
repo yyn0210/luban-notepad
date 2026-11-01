@@ -155,6 +155,9 @@ pub struct Settings {
     #[serde(default)]
     pub plugin_settings:
         std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// Catalog URL or absolute path of the plugin store.
+    #[serde(default = "default_plugin_store_url")]
+    pub plugin_store_url: String,
 }
 
 fn default_true() -> bool {
@@ -171,6 +174,14 @@ fn default_history_max_mb() -> u64 {
 
 fn default_ui_language() -> String {
     "system".to_string()
+}
+
+/// Default catalog address published by the Luban Notepad store repository.
+pub const DEFAULT_PLUGIN_STORE_URL: &str =
+    "https://raw.githubusercontent.com/yyn0210/luban-notepad-store/main/catalog/index.json";
+
+fn default_plugin_store_url() -> String {
+    DEFAULT_PLUGIN_STORE_URL.to_string()
 }
 
 fn default_ruler_columns() -> Vec<usize> {
@@ -237,6 +248,7 @@ impl Default for Settings {
             plugins_enabled: true,
             disabled_plugins: Vec::new(),
             plugin_settings: std::collections::BTreeMap::new(),
+            plugin_store_url: default_plugin_store_url(),
         }
     }
 }
@@ -331,6 +343,10 @@ impl Settings {
         self.disabled_plugins.dedup();
         self.plugin_settings
             .retain(|id, values| !id.trim().is_empty() && !values.is_empty());
+        self.plugin_store_url = self.plugin_store_url.trim().to_string();
+        if self.plugin_store_url.is_empty() {
+            self.plugin_store_url = default_plugin_store_url();
+        }
         self.recent_files.retain(|p| !p.as_os_str().is_empty());
         self.recent_files.dedup_by(|a, b| paths_equal(a, b));
         self.recent_files.truncate(self.max_recent_files);
@@ -441,6 +457,7 @@ impl Settings {
         self.plugins_enabled = other.plugins_enabled;
         self.disabled_plugins = other.disabled_plugins.clone();
         self.plugin_settings = other.plugin_settings.clone();
+        self.plugin_store_url = other.plugin_store_url.clone();
     }
 
     pub fn max_file_size_bytes(&self) -> u64 {

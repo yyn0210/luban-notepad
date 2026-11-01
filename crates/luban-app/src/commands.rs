@@ -940,6 +940,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("ctrl+alt+p"),
         Always
     ),
+    command!("plugins.store", Plugins, "menu.plugins.store", None, Always),
     command!(
         "plugins.reload",
         Settings,

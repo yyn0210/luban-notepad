@@ -165,3 +165,40 @@ core.file_ops.trash_failed:
 core.file_ops.rename_same_parent:
   en: "a rename must stay in the same folder; use Save As to move a file"
   zh-CN: "重命名不能跨文件夹；移动文件请使用另存为"
+
+plugins.tab.installed:
+  en: "Installed"
+  zh-CN: "已安装"
+plugins.tab.store:
+  en: "Store"
+  zh-CN: "商店"
+plugins.store.search_placeholder:
+  en: "Search plugins…"
+  zh-CN: "搜索插件…"
+plugins.store.refresh:
+  en: "Refresh"
+  zh-CN: "刷新"
+plugins.store.loading:
+  en: "Loading the plugin catalog…"
+  zh-CN: "正在加载插件目录…"
+plugins.store.offline_cache:
+  en: "Offline cache from %{time}"
+  zh-CN: "离线缓存，获取于 %{time}"
+plugins.store.empty:
+  en: "The plugin catalog is empty."
+  zh-CN: "插件目录为空。"
+plugins.store.load_failed:
+  en: "The plugin catalog could not be loaded."
+  zh-CN: "无法加载插件目录。"
+plugins.store.hash_mismatch:
+  en: "The downloaded package failed its SHA-256 check."
+  zh-CN: "下载的安装包 SHA-256 校验失败。"
+plugins.store.size_mismatch:
+  en: "Package size mismatch: expected %{expected} bytes, got %{actual} bytes."
+  zh-CN: "安装包大小不符：应为 %{expected} 字节，实际 %{actual} 字节。"
+plugins.store.incompatible_api:
+  en: "This plugin requires API version %{version} or newer."
+  zh-CN: "此插件需要 API 版本 %{version} 或更新。"
+plugins.store.unsupported_platform:
+  en: "This OS/CPU combination is not supported by the plugin store."
+  zh-CN: "插件商店不支持当前 OS/CPU 组合。"

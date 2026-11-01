@@ -2272,6 +2272,9 @@ menu.plugins:
 menu.plugins.manage:
   en: "Manage plugins…"
   zh-CN: "管理插件…"
+menu.plugins.store:
+  en: "Plugin store…"
+  zh-CN: "插件商店…"
 menu.plugins.reload:
   en: "Reload plugins"
   zh-CN: "重新加载插件"
@@ -2338,6 +2341,9 @@ plugins.approve:
 plugins.update:
   en: "Update"
   zh-CN: "更新"
+plugins.reinstall:
+  en: "Reinstall"
+  zh-CN: "重新安装"
 plugins.uninstall:
   en: "Uninstall"
   zh-CN: "卸载"
@@ -2440,6 +2446,208 @@ plugins.state.dependency_cycle:
 plugins.state.unknown:
   en: "unknown"
   zh-CN: "未知"
+
+plugins.tab.installed:
+  en: "Installed"
+  zh-CN: "已安装"
+plugins.tab.store:
+  en: "Store"
+  zh-CN: "商店"
+plugins.store.search_placeholder:
+  en: "Search plugins…"
+  zh-CN: "搜索插件…"
+plugins.store.url_label:
+  en: "Catalog URL"
+  zh-CN: "目录地址"
+plugins.store.url_placeholder:
+  en: "Catalog URL or absolute path"
+  zh-CN: "目录地址或绝对路径"
+plugins.store.apply:
+  en: "Apply"
+  zh-CN: "应用"
+plugins.store.reset:
+  en: "Reset"
+  zh-CN: "重置"
+plugins.store.refresh:
+  en: "Refresh"
+  zh-CN: "刷新"
+plugins.store.refreshing:
+  en: "Refreshing…"
+  zh-CN: "正在刷新…"
+plugins.store.loading:
+  en: "Loading the plugin catalog…"
+  zh-CN: "正在加载插件目录…"
+plugins.store.offline_cache:
+  en: "Offline cache from %{time}"
+  zh-CN: "离线缓存，获取于 %{time}"
+plugins.store.offline_cache_hint:
+  en: "Showing the offline catalog cache."
+  zh-CN: "正在显示离线目录缓存。"
+plugins.store.unknown_time:
+  en: "an unknown time"
+  zh-CN: "未知时间"
+plugins.store.skipped_entries:
+  en: "Skipped %{count} invalid catalog entry/entries."
+  zh-CN: "已跳过 %{count} 个无效目录条目。"
+plugins.store.load_failed:
+  en: "The plugin catalog could not be loaded."
+  zh-CN: "无法加载插件目录。"
+plugins.store.busy:
+  en: "A store operation is already running."
+  zh-CN: "已有商店操作正在进行。"
+plugins.store.worker_failed:
+  en: "The store worker stopped unexpectedly."
+  zh-CN: "商店后台任务意外停止。"
+plugins.store.install:
+  en: "Install"
+  zh-CN: "安装"
+plugins.store.update:
+  en: "Update"
+  zh-CN: "更新"
+plugins.store.installing:
+  en: "Installing…"
+  zh-CN: "正在安装…"
+plugins.store.installed_button:
+  en: "Installed"
+  zh-CN: "已安装"
+plugins.store.installed:
+  en: "Installed %{plugin} %{version}."
+  zh-CN: "已安装 %{plugin} %{version}。"
+plugins.store.not_installed:
+  en: "Not installed"
+  zh-CN: "未安装"
+plugins.store.update_from:
+  en: "Update available: %{installed} → %{latest}"
+  zh-CN: "可更新：%{installed} → %{latest}"
+plugins.store.installed_version:
+  en: "Installed version: %{version}"
+  zh-CN: "已安装版本：%{version}"
+plugins.store.latest_version:
+  en: "Latest version: %{version}"
+  zh-CN: "最新版本：%{version}"
+plugins.store.incompatible_api:
+  en: "This plugin requires API version %{version} or newer."
+  zh-CN: "此插件需要 API 版本 %{version} 或更新。"
+plugins.store.incompatible_short:
+  en: "Incompatible (API %{version})"
+  zh-CN: "不兼容（API %{version}）"
+plugins.store.unavailable_for_platform:
+  en: "No package is available for the current platform."
+  zh-CN: "当前平台没有可用安装包。"
+plugins.store.unsupported_platform:
+  en: "This OS/CPU combination is not supported by the plugin store."
+  zh-CN: "插件商店不支持当前 OS/CPU 组合。"
+plugins.store.unsupported_platform_short:
+  en: "Unsupported platform"
+  zh-CN: "不支持当前平台"
+plugins.store.plugins_disabled_hint:
+  en: "Plugins are disabled; installed plugins will not run until plugins are enabled."
+  zh-CN: "插件已禁用；重新启用插件前，已安装插件不会运行。"
+plugins.store.no_compatible:
+  en: "No plugins are available for the current platform."
+  zh-CN: "当前平台没有可用插件。"
+plugins.store.empty:
+  en: "The plugin catalog is empty."
+  zh-CN: "插件目录为空。"
+plugins.store.no_results:
+  en: "No plugins match the search."
+  zh-CN: "没有匹配搜索的插件。"
+plugins.store.select_plugin:
+  en: "Select a plugin to see its details."
+  zh-CN: "选择一个插件查看详情。"
+plugins.store.details_title:
+  en: "Details"
+  zh-CN: "详情"
+plugins.store.release_notes:
+  en: "Release notes"
+  zh-CN: "发布说明"
+plugins.store.platforms_label:
+  en: "Platforms"
+  zh-CN: "平台"
+plugins.store.permissions_label:
+  en: "Permissions"
+  zh-CN: "权限"
+plugins.store.size_label:
+  en: "Download size"
+  zh-CN: "下载大小"
+plugins.store.license_label:
+  en: "License"
+  zh-CN: "许可证"
+plugins.store.source_label:
+  en: "Source"
+  zh-CN: "源码"
+plugins.store.homepage_label:
+  en: "Homepage"
+  zh-CN: "主页"
+plugins.store.all_platforms:
+  en: "All platforms"
+  zh-CN: "全部平台"
+plugins.store.verified:
+  en: "Verified"
+  zh-CN: "已验证"
+plugins.store.hash_mismatch:
+  en: "The downloaded package failed its SHA-256 check."
+  zh-CN: "下载的安装包 SHA-256 校验失败。"
+plugins.store.size_mismatch:
+  en: "Package size mismatch: expected %{expected} bytes, got %{actual} bytes."
+  zh-CN: "安装包大小不符：应为 %{expected} 字节，实际 %{actual} 字节。"
+plugins.store.artifact_too_large:
+  en: "The package is larger than the store download limit."
+  zh-CN: "安装包超过商店下载上限。"
+plugins.store.unsupported_url:
+  en: "Unsupported store URL: %{url}"
+  zh-CN: "不支持的商店地址：%{url}"
+plugins.store.install_mismatch:
+  en: "The downloaded package does not match the store entry."
+  zh-CN: "下载的安装包与商店条目不一致。"
+plugins.store.url_empty:
+  en: "Enter a catalog URL or path."
+  zh-CN: "请输入目录地址。"
+plugins.store.url_invalid:
+  en: "The catalog URL must use https://, file://, or an absolute path."
+  zh-CN: "目录地址必须使用 https://、file:// 或绝对路径。"
+plugins.store.unknown_error:
+  en: "The store operation failed without an error message."
+  zh-CN: "商店操作失败，未返回错误信息。"
+plugins.store.unsupported_catalog_version:
+  en: "This build does not support plugin catalog version %{version}."
+  zh-CN: "此版本不支持插件目录版本 %{version}。"
+plugins.store.error_fetch:
+  en: "Cannot fetch %{url}: %{detail}"
+  zh-CN: "无法获取 %{url}：%{detail}"
+plugins.store.error_download_url:
+  en: "Cannot download %{url}: %{detail}"
+  zh-CN: "无法下载 %{url}：%{detail}"
+plugins.store.error_download:
+  en: "Cannot download the package: %{detail}"
+  zh-CN: "无法下载安装包：%{detail}"
+plugins.store.error_http:
+  en: "%{url} returned HTTP %{status}."
+  zh-CN: "%{url} 返回 HTTP %{status}。"
+plugins.store.error_redirect:
+  en: "The server redirected to a non-HTTPS URL: %{url}"
+  zh-CN: "服务器重定向到了非 HTTPS 地址：%{url}"
+plugins.store.error_catalog:
+  en: "Cannot load the plugin catalog: %{detail}"
+  zh-CN: "无法加载插件目录：%{detail}"
+plugins.store.error_install:
+  en: "Cannot install the plugin: %{detail}"
+  zh-CN: "无法安装插件：%{detail}"
+plugins.store.network_refused:
+  en: "connection refused"
+  zh-CN: "连接被拒绝"
+plugins.store.network_timeout:
+  en: "connection timed out"
+  zh-CN: "连接超时"
+plugins.store.network_dns:
+  en: "DNS lookup failed"
+  zh-CN: "域名解析失败"
+plugins.store.network_tls:
+  en: "TLS certificate or handshake error"
+  zh-CN: "TLS 证书或握手失败"
+plugins.store.network_reset:
+  en: "connection reset"
+  zh-CN: "连接被重置"
 
 diff.identical:
   en: "No differences\n"
