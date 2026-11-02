@@ -3881,6 +3881,7 @@ dependencies = [
  "globset",
  "ignore",
  "log",
+ "proptest",
  "quick-xml 0.42.0",
  "regex",
  "rust-i18n",

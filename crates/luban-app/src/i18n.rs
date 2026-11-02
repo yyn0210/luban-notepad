@@ -83,7 +83,10 @@ mod tests {
         }
 
         for source in [
-            include_str!("app.rs"),
+            include_str!("app/mod.rs"),
+            include_str!("app/save.rs"),
+            include_str!("app/session.rs"),
+            include_str!("app/tabs.rs"),
             include_str!("dialogs.rs"),
             include_str!("find.rs"),
             include_str!("preferences.rs"),

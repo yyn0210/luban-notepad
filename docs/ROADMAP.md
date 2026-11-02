@@ -297,10 +297,17 @@ API、包格式和 CLI 协议。
 #### 工程质量
 
 - [ ] 拆分 `app.rs`：命令、标签、菜单、编辑器视图、状态、会话。
+  > 首切片已完成：保存、会话、标签逻辑迁入 `crates/luban-app/src/app/{save,session,tabs}.rs`，
+  > `LubanApp::new` 保留在 `mod.rs`，剩余标签分组/生命周期方法也已迁入 `tabs.rs`；
+  > `app.rs` 从 25,987 行降到 22,586 行；命令、菜单、编辑器视图和状态拆分留待后续 change。
 - [ ] 建立编辑器能力适配层，收敛普通/大文件/磁盘引擎三条路径。
-- [ ] 关键流程的 Xvfb/xdotool 集成测试。
-- [ ] 磁盘引擎属性测试/fuzz（piece 表、撤销、保存）。
-- [ ] 性能预算进 CI（可夜间运行）。
+- [x] 关键流程的 Xvfb/xdotool 集成测试：`scripts/gui-integration.sh` 用真实键鼠覆盖输入保存、
+  查找替换、标签切换和未保存关闭提示；Linux CI 以 `--require-display` 强制执行并上传失败日志与截图。
+- [x] 磁盘引擎属性测试/fuzz（piece 表、撤销、保存）：`crates/luban-core/tests/disk_engine_props.rs`
+  使用 proptest 对随机编辑序列、撤销/重做和保存重开做模型对照；持续 fuzz（cargo-fuzz）仍待独立 change。
+- [x] 性能预算进 CI（可夜间运行）：`crates/luban-core/benches/disk_engine_perf.rs` 与
+  `scripts/perf-nightly.sh` 测量 200 MB 打开、1 GB 打开/查找/保存和 3 GB 内存增量，
+  `.github/workflows/nightly.yml` 定时运行并上传报告，普通 PR 不执行。
 - [ ] Wayland/macOS 手工测试矩阵；无障碍审计。
 
 #### 文档

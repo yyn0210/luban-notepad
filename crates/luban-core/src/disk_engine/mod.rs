@@ -1065,7 +1065,9 @@ impl DiskEngine {
             let offset = journal.append(inserted.as_bytes())?;
             vec![Piece {
                 kind: PieceKind::Journal { offset },
-                offset: 0,
+                // `offset` is the byte offset inside the journal, matching the
+                // kind. Splitting and piece compaction rely on it.
+                offset,
                 len: inserted.len() as u64,
                 chars: inserted.chars().count() as u64,
                 newlines: count_newlines(inserted),
@@ -2034,6 +2036,14 @@ impl DiskEngine {
         self.read_only = checkpoint.read_only;
         self.blocks = checkpoint.blocks.clone();
         self.pieces = checkpoint.pieces.clone();
+        // Checkpoints written by older builds stored `offset: 0` for journal
+        // pieces. The kind holds the real journal offset; rebuild the field so
+        // splitting and compaction see a consistent table.
+        for piece in &mut self.pieces {
+            if let PieceKind::Journal { offset } = piece.kind {
+                piece.offset = offset;
+            }
+        }
         self.total_len = checkpoint.total_len;
         self.total_chars = checkpoint.total_chars;
         self.total_newlines = checkpoint.total_newlines;
@@ -2573,6 +2583,34 @@ mod tests {
         assert_eq!(
             engine.read_text(0, engine.total_len()).unwrap(),
             "one one one\n"
+        );
+    }
+
+    #[test]
+    fn undo_reads_journal_pieces_after_compacting_adjacent_runs() {
+        // Splitting a journal piece and inserting again used to leave two
+        // pieces whose `offset` fields looked contiguous even though their
+        // journal offsets were not. Compaction then merged them into a run
+        // longer than the journal, and undoing the delete failed with an
+        // unexpected EOF.
+        let initial = "🦀a  line\n🦀é\naa";
+        let (_dir, path) = write_file("undo-journal.txt", initial.as_bytes());
+        let mut engine = open(&path);
+        engine.apply_edit(5, 0, "中🦀").unwrap();
+        engine.apply_edit(23, 5, "").unwrap();
+        engine.apply_edit(5, 0, "b").unwrap();
+        engine.apply_edit(6, 0, "中line\n").unwrap();
+        engine.apply_edit(23, 2, "").unwrap();
+        engine.apply_edit(12, 0, "aé中").unwrap();
+        engine.apply_edit(32, 4, "").unwrap();
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "🦀ab中linaé中e\n中🦀  ne\n"
+        );
+        engine.undo().unwrap();
+        assert_eq!(
+            engine.read_text(0, engine.total_len()).unwrap(),
+            "🦀ab中linaé中e\n中🦀  ne\n🦀"
         );
     }
 

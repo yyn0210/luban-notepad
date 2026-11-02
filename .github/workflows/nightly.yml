@@ -1,0 +1,51 @@
+name: Nightly performance
+
+on:
+  schedule:
+    # 18:00 UTC (02:00 Beijing) every day.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  performance:
+    name: Performance budgets (nightly)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config clang cmake \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxcb1-dev libxcb-xkb-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libbz2-dev libpng-dev libbrotli-dev libffi-dev zlib1g-dev \
+            libexpat1-dev uuid-dev \
+            mesa-vulkan-drivers xvfb xauth xdotool
+
+      - name: Performance budgets (Xvfb + lavapipe)
+        run: scripts/perf-nightly.sh
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          LUBAN_PERF_REPORT: ${{ runner.temp }}/perf-report.json
+
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: ${{ runner.temp }}/perf-report.json
+          if-no-files-found: ignore

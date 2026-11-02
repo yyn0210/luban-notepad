@@ -202,6 +202,42 @@ xvfb-run -a -s "-screen 0 1440x900x24" \
 `--smoke-test` 会创建窗口、渲染初始编辑器，然后以退出码 0 退出。若无法创建窗口
 或初始化 GPUI，则以非零码退出。
 
+### GUI 集成测试（Xvfb + xdotool）
+
+```bash
+sudo apt-get install -y xvfb xauth xdotool
+scripts/gui-integration.sh --require-display
+```
+
+脚本用真实键鼠事件驱动主窗口：鼠标点击定位并输入、`Ctrl+S` 落盘、`Ctrl+F`
+查找替换、打开对话框切换标签、未保存关闭提示；断言使用保存后的文件内容、
+窗口标题和进程状态，不比较截图。没有显示服务时脚本默认跳过并返回 0；
+`--require-display` 把“跳过”变成失败，CI 使用该模式。
+
+- `LUBAN_BIN` 指定应用二进制，默认 `$CARGO_TARGET_DIR/debug/luban-notepad`。
+- `LUBAN_GUI_DISPLAY` 复用指定显示；默认总是启动私有 Xvfb，避免影响当前桌面。
+- `LUBAN_GUI_ARTIFACTS` 指定失败截图与日志目录；CI 在失败时上传该目录。
+
+### 性能预算（夜间）
+
+```bash
+# 完整预算：200 MB GUI 打开、1 GB 打开/查找/保存、3 GB 内存增量
+scripts/perf-nightly.sh
+
+# 快速本地验证（缩放文件与引擎预算；GUI 打开预算仍按 4,500 ms 判定）
+scripts/perf-nightly.sh --scale 0.02
+
+# 验证超预算时的失败路径
+scripts/perf-nightly.sh --self-test
+```
+
+基准使用 release 构建，输出逐项 JSON（实测值、预算、路线图目标），任一项超预算
+时以非零码退出。`.github/workflows/nightly.yml` 每天定时运行并上传报告；普通
+PR 不运行。`LUBAN_PERF_SCALE` 缩放文件与引擎预算（GUI 打开时间不随文件大小
+线性缩放，预算保持完整值），`LUBAN_PERF_BUDGET_FACTOR` 整体缩放预算，
+`LUBAN_PERF_REPORT` 指定报告路径。基准每次运行都会增量构建 release 应用，
+避免测量过期二进制。
+
 ## 配置覆盖
 
 `LUBAN_NOTEPAD_CONFIG_DIR` 可重定向 `settings.json` 和 `session.json`。

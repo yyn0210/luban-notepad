@@ -35,7 +35,7 @@ jobs:
             libfontconfig1-dev libfreetype-dev \
             libbz2-dev libpng-dev libbrotli-dev libffi-dev zlib1g-dev \
             libexpat1-dev uuid-dev \
-            mesa-vulkan-drivers xvfb xauth
+            mesa-vulkan-drivers xvfb xauth xdotool ffmpeg
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -62,6 +62,20 @@ jobs:
         run: scripts/smoke-extensions.sh
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
+
+      - name: GUI integration test (Xvfb + xdotool)
+        run: scripts/gui-integration.sh --require-display
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          LUBAN_GUI_ARTIFACTS: ${{ runner.temp }}/gui-artifacts
+
+      - name: Upload GUI integration artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-integration-artifacts
+          path: ${{ runner.temp }}/gui-artifacts
+          if-no-files-found: ignore
 
   windows:
     name: Windows
