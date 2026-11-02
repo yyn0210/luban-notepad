@@ -369,6 +369,7 @@ fn main() {
             }
         }
     }
+    let owns_ipc = server.is_some();
     let _server = server;
     if let Some(bridge) = &bridge {
         ipc::set_shared_queue(bridge.queue.clone());
@@ -379,22 +380,34 @@ fn main() {
     if let Some(target) = &args.goto {
         if !readable_file(&target.path) {
             eprintln!("cannot open {}", target.path.display());
+            if owns_ipc {
+                ipc::cleanup(&config_dir);
+            }
             std::process::exit(3);
         }
     }
     if let Some((left, right)) = &args.diff {
         if !readable_file(left) {
             eprintln!("cannot open {}", left.display());
+            if owns_ipc {
+                ipc::cleanup(&config_dir);
+            }
             std::process::exit(3);
         }
         if !readable_file(right) {
             eprintln!("cannot open {}", right.display());
+            if owns_ipc {
+                ipc::cleanup(&config_dir);
+            }
             std::process::exit(3);
         }
     }
     for file in &args.files {
         if !readable_file(file) {
             eprintln!("cannot open {}", file.display());
+            if owns_ipc {
+                ipc::cleanup(&config_dir);
+            }
             std::process::exit(3);
         }
     }

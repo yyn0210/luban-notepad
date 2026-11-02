@@ -1493,6 +1493,12 @@ impl LubanApp {
             if let Some(message) = &message {
                 if options.exit_on_command_failure {
                     eprintln!("{message}");
+                    // `process::exit` skips `IpcServer`'s destructor; release
+                    // the lock and socket so the next launch does not read a
+                    // stale instance that this process no longer serves.
+                    if app.ipc_queue.is_some() {
+                        crate::ipc::cleanup(&luban_core::settings::config_dir());
+                    }
                     std::process::exit(3);
                 }
                 app.set_status(message.clone(), cx);

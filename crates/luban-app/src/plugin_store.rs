@@ -824,6 +824,20 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// A `file://` URL for a local path. Windows needs forward slashes and an
+    /// empty authority segment before the drive letter (`file:///C:/...`);
+    /// `Path::display` yields backslashes and a two-slash URL there.
+    fn file_url(path: &std::path::Path) -> String {
+        #[cfg(windows)]
+        {
+            format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
+        }
+        #[cfg(not(windows))]
+        {
+            format!("file://{}", path.display())
+        }
+    }
+
     fn catalog_bytes(
         plugin_id: &str,
         target: &str,
@@ -870,7 +884,7 @@ mod tests {
             10,
         );
         fs::write(&path, &bytes).unwrap();
-        let source = format!("file://{}", path.display());
+        let source = file_url(&path);
         let payload = fetch_catalog(&source).unwrap();
         assert_eq!(payload.catalog.plugins.len(), 1);
         assert_eq!(payload.bytes, bytes);
@@ -894,7 +908,7 @@ mod tests {
             10,
         );
         fs::write(&path, &bytes).unwrap();
-        let source = format!("file://{}", path.display());
+        let source = file_url(&path);
         let payload = fetch_catalog(&source).unwrap();
         write_cache(dir.path(), &source, &payload).unwrap();
         fs::remove_file(&path).unwrap();
@@ -932,7 +946,7 @@ mod tests {
         let hash = store::sha256_file(&package).unwrap();
         let artifact = Artifact {
             target: store::Target::Universal,
-            url: format!("file://{}", package.display()),
+            url: file_url(&package),
             sha256: hash,
             size: 13,
         };
@@ -963,7 +977,7 @@ mod tests {
         let root = dir.path().join("root");
         let artifact = Artifact {
             target: store::Target::Universal,
-            url: format!("file://{}", package.display()),
+            url: file_url(&package),
             sha256: hash.clone(),
             size: 9,
         };
@@ -1030,7 +1044,7 @@ mod tests {
                 release_notes: None,
                 artifacts: vec![Artifact {
                     target: store::Target::Universal,
-                    url: format!("file://{}", package.display()),
+                    url: file_url(&package),
                     sha256: hash,
                     size,
                 }],
@@ -1129,10 +1143,28 @@ mod tests {
             local_source_path("file://localhost/tmp/c.json"),
             Some(PathBuf::from("/tmp/c.json"))
         );
+        // Plain absolute paths are accepted too; Windows has no absolute path
+        // form without a drive prefix, so build the path from a temp directory.
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = dir.path().join("c.json");
         assert_eq!(
-            local_source_path("/tmp/c.json"),
-            Some(PathBuf::from("/tmp/c.json"))
+            local_source_path(&absolute.to_string_lossy()),
+            Some(absolute.clone())
         );
+        assert_eq!(local_source_path("relative/c.json"), None);
         assert_eq!(local_source_path("https://example.com"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decodes_windows_file_urls() {
+        assert_eq!(
+            local_source_path("file:///C:/store/catalog.json"),
+            Some(PathBuf::from("C:/store/catalog.json"))
+        );
+        assert_eq!(
+            local_source_path(&file_url(std::path::Path::new("C:/store/demo.zip"))),
+            Some(PathBuf::from("C:/store/demo.zip"))
+        );
     }
 }

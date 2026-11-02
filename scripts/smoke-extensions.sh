@@ -179,15 +179,25 @@ if grep -q "SMOKE_PLUGIN_ACTIVATED" "$TMP/logs/luban.log"; then
   echo "smoke-extensions: safe mode loaded the plugin" >&2
   exit 1
 fi
+# The failing command exits directly while owning the instance endpoint, so
+# the lock and socket must be released before the process goes away.
+if [ -e "$TMP/instance.lock" ] || [ -e "$TMP/instance.sock" ]; then
+  echo "smoke-extensions: safe mode exit left IPC files behind" >&2
+  exit 1
+fi
 
 echo "smoke-extensions: single instance and wait"
+# A crashed launch can leave its lock and socket behind too. Drop any
+# leftovers before starting the primary: otherwise the wait below mistakes a
+# stale lock for a live instance and lets the first client become the primary.
+rm -f "$TMP/instance.lock" "$TMP/instance.sock"
 "${RUNNER[@]}" "$BIN" --new >"$TMP/primary.out" 2>&1 &
 PRIMARY=$!
 for _ in $(seq 1 100); do
-  [ -f "$TMP/instance.lock" ] && break
+  [ -e "$TMP/instance.sock" ] && break
   sleep 0.1
 done
-if [ ! -f "$TMP/instance.lock" ]; then
+if [ ! -e "$TMP/instance.sock" ]; then
   echo "smoke-extensions: primary did not start" >&2
   cat "$TMP/primary.out" >&2 || true
   exit 1
