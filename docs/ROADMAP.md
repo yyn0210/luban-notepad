@@ -300,6 +300,13 @@ API、包格式和 CLI 协议。
   > 首切片已完成：保存、会话、标签逻辑迁入 `crates/luban-app/src/app/{save,session,tabs}.rs`，
   > `LubanApp::new` 保留在 `mod.rs`，剩余标签分组/生命周期方法也已迁入 `tabs.rs`；
   > `app.rs` 从 25,987 行降到 22,586 行；命令、菜单、编辑器视图和状态拆分留待后续 change。
+  > 第二切片已完成：菜单/标题栏/工具栏/状态栏迁入 `app/menus.rs`，编辑组窗格、编辑器区域、
+  > 面包屑、标尺和文档地图迁入 `app/editor_view.rs`，命令分发、键位映射和快捷键表迁入
+  > `app/command_ui.rs`；`app/mod.rs` 从 22,586 行降到 19,186 行；状态与其余视图切片留待后续 change。
+  > 第三切片已完成：插件运行时交互、差异标签、片段选择和插件面板迁入 `app/plugin_ui.rs`，
+  > 插件设置、商店和已安装插件管理器迁入 `app/plugin_manager_ui.rs`；为达到本切片确认的
+  > `app/mod.rs` 规模目标，设置首选项与字体选择器一并迁入 `app/preferences_ui.rs`；
+  > `app/mod.rs` 从 19,186 行降到 14,576 行；状态、会话和其余视图切片留待后续 change。
 - [ ] 建立编辑器能力适配层，收敛普通/大文件/磁盘引擎三条路径。
 - [x] 关键流程的 Xvfb/xdotool 集成测试：`scripts/gui-integration.sh` 用真实键鼠覆盖输入保存、
   查找替换、标签切换和未保存关闭提示；Linux CI 以 `--require-display` 强制执行并上传失败日志与截图。
