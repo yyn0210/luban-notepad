@@ -155,6 +155,10 @@ pub struct Settings {
     #[serde(default)]
     pub plugin_settings:
         std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// Width in points of a host-rendered plugin panel the user resized, keyed
+    /// by `plugin_id/panel_id`. Missing entries keep the manifest width.
+    #[serde(default)]
+    pub plugin_panel_widths: std::collections::BTreeMap<String, f32>,
     /// Catalog URL or absolute path of the plugin store.
     #[serde(default = "default_plugin_store_url")]
     pub plugin_store_url: String,
@@ -183,6 +187,12 @@ pub const DEFAULT_PLUGIN_STORE_URL: &str =
 fn default_plugin_store_url() -> String {
     DEFAULT_PLUGIN_STORE_URL.to_string()
 }
+
+/// Narrowest width, in points, a plugin panel may be dragged to.
+pub const PLUGIN_PANEL_MIN_WIDTH: f32 = 280.0;
+
+/// Widest width, in points, a plugin panel may be dragged to.
+pub const PLUGIN_PANEL_MAX_WIDTH: f32 = 1200.0;
 
 fn default_ruler_columns() -> Vec<usize> {
     vec![80, 120]
@@ -248,6 +258,7 @@ impl Default for Settings {
             plugins_enabled: true,
             disabled_plugins: Vec::new(),
             plugin_settings: std::collections::BTreeMap::new(),
+            plugin_panel_widths: std::collections::BTreeMap::new(),
             plugin_store_url: default_plugin_store_url(),
         }
     }
@@ -343,6 +354,11 @@ impl Settings {
         self.disabled_plugins.dedup();
         self.plugin_settings
             .retain(|id, values| !id.trim().is_empty() && !values.is_empty());
+        self.plugin_panel_widths
+            .retain(|key, width| !key.trim().is_empty() && width.is_finite());
+        for width in self.plugin_panel_widths.values_mut() {
+            *width = width.clamp(PLUGIN_PANEL_MIN_WIDTH, PLUGIN_PANEL_MAX_WIDTH);
+        }
         self.plugin_store_url = self.plugin_store_url.trim().to_string();
         if self.plugin_store_url.is_empty() {
             self.plugin_store_url = default_plugin_store_url();
@@ -457,6 +473,7 @@ impl Settings {
         self.plugins_enabled = other.plugins_enabled;
         self.disabled_plugins = other.disabled_plugins.clone();
         self.plugin_settings = other.plugin_settings.clone();
+        self.plugin_panel_widths = other.plugin_panel_widths.clone();
         self.plugin_store_url = other.plugin_store_url.clone();
     }
 
@@ -728,6 +745,45 @@ mod tests {
         );
         s.remove_recent(Path::new("/c"));
         assert!(!s.recent_files.contains(&PathBuf::from("/c")));
+    }
+
+    #[test]
+    fn plugin_panel_widths_round_trip_and_clamp() {
+        let defaults = Settings::default();
+        assert!(defaults.plugin_panel_widths.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"plugin_panel_widths": {
+                "markdown.preview/markdown.preview.panel": 720.0,
+                "tiny/panel": 10.0,
+                "huge/panel": 5000.0,
+                "": 500.0
+            }}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(
+            loaded
+                .plugin_panel_widths
+                .get("markdown.preview/markdown.preview.panel"),
+            Some(&720.0)
+        );
+        assert_eq!(
+            loaded.plugin_panel_widths.get("tiny/panel"),
+            Some(&PLUGIN_PANEL_MIN_WIDTH)
+        );
+        assert_eq!(
+            loaded.plugin_panel_widths.get("huge/panel"),
+            Some(&PLUGIN_PANEL_MAX_WIDTH)
+        );
+        assert!(!loaded.plugin_panel_widths.contains_key(""));
+
+        loaded.save_to(&path).unwrap();
+        let reloaded = Settings::load_from(&path);
+        assert_eq!(reloaded.plugin_panel_widths, loaded.plugin_panel_widths);
     }
 
     #[test]

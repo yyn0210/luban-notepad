@@ -41,7 +41,9 @@ use luban_core::local_history::{HistoryEntry, HistoryStore};
 use luban_core::macros::SavedMacro;
 use luban_core::search::{ByteMatch, Match, ReplacePreview};
 use luban_core::session::{GroupSession, Session, SessionTab, SplitLayout, WindowSession};
-use luban_core::settings::{LanguageSettings, Settings, ThemeChoice};
+use luban_core::settings::{
+    LanguageSettings, Settings, ThemeChoice, PLUGIN_PANEL_MAX_WIDTH, PLUGIN_PANEL_MIN_WIDTH,
+};
 use luban_core::text as textutil;
 use luban_core::undo::EditKind;
 use luban_core::workspace::{
@@ -208,7 +210,9 @@ struct PluginPanelState {
     panel_id: String,
     title: String,
     placement: luban_plugin::manifest::PanelPlacement,
-    width: Option<u16>,
+    /// Preferred width in points: the width the user dragged to, or the
+    /// remembered/manifest width until the panel is resized.
+    width: f32,
     lines: Vec<luban_plugin::runtime::PanelLine>,
     error: Option<String>,
     truncated: bool,
@@ -216,6 +220,17 @@ struct PluginPanelState {
     watch: u64,
     /// Scroll position, preserved across automatic refreshes.
     scroll: ScrollHandle,
+}
+
+/// Width drag in progress on the inner edge of a plugin panel.
+#[derive(Clone, Debug)]
+struct PluginPanelDrag {
+    /// `plugin_id/panel_id` of the panel being resized.
+    panel_key: String,
+    /// Pointer x when the drag started.
+    origin_x: Pixels,
+    /// Rendered panel width when the drag started.
+    origin_width: f32,
 }
 
 /// Quick-open rows and the current query error.
@@ -709,6 +724,8 @@ pub struct LubanApp {
     snippet_picker_rows: Vec<crate::snippet_ui::SnippetRow>,
     pub plugin_manager: crate::plugin_manager::PluginManagerState,
     plugin_panel: Option<PluginPanelState>,
+    /// Resize drag in progress on the open panel's inner edge.
+    plugin_panel_drag: Option<PluginPanelDrag>,
     /// Monotonic token handed to the single live plugin-panel watcher.
     plugin_panel_watch: u64,
     ipc_queue: Option<
@@ -733,6 +750,60 @@ const RECENT_PATH_COLUMNS: usize = 48;
 /// while the range keeps tiny and very long labels usable.
 const TAB_MIN_WIDTH: f32 = 80.0;
 const TAB_MAX_WIDTH: f32 = 180.0;
+
+/// Width of a plugin panel that does not declare one in its manifest.
+const PLUGIN_PANEL_DEFAULT_WIDTH: f32 = 380.0;
+/// Space the editor keeps when a right-side plugin panel is open.
+const PLUGIN_PANEL_EDITOR_RESERVE: f32 = 320.0;
+/// Grab band drawn along the inner edge of a right-side plugin panel.
+const PLUGIN_PANEL_HANDLE_WIDTH: f32 = 8.0;
+
+/// Widest a right-side plugin panel may get in a window `window_width` wide:
+/// the manifest cap, the editor reserve, or the panel minimum when the window
+/// is too narrow for both.
+fn plugin_panel_max_width(window_width: f32) -> f32 {
+    (window_width - PLUGIN_PANEL_EDITOR_RESERVE)
+        .clamp(PLUGIN_PANEL_MIN_WIDTH, PLUGIN_PANEL_MAX_WIDTH)
+}
+
+/// Fit a preferred panel width into the window without breaking the bounds.
+fn fit_plugin_panel_width(preferred: f32, window_width: f32) -> f32 {
+    preferred.clamp(PLUGIN_PANEL_MIN_WIDTH, plugin_panel_max_width(window_width))
+}
+
+/// Width a drag has reached: the pointer moved the edge by the distance since
+/// it went down, fitted into the window. Rounded so a dragged panel never
+/// stores fractional points.
+fn plugin_panel_drag_width(
+    origin_width: f32,
+    origin_x: f32,
+    position_x: f32,
+    window_width: f32,
+) -> f32 {
+    fit_plugin_panel_width(origin_width + (origin_x - position_x), window_width).round()
+}
+
+/// Settings key remembering one panel's dragged width.
+fn plugin_panel_width_key(plugin_id: &str, panel_id: &str) -> String {
+    format!("{plugin_id}/{panel_id}")
+}
+
+/// Width a panel opens with: the width the user dragged for this panel, else
+/// the manifest width, else the default. Panels remember their own width.
+fn plugin_panel_open_width(
+    settings: &Settings,
+    plugin_id: &str,
+    panel_id: &str,
+    manifest_width: Option<u16>,
+) -> f32 {
+    settings
+        .plugin_panel_widths
+        .get(&plugin_panel_width_key(plugin_id, panel_id))
+        .copied()
+        .or_else(|| manifest_width.map(f32::from))
+        .unwrap_or(PLUGIN_PANEL_DEFAULT_WIDTH)
+        .clamp(PLUGIN_PANEL_MIN_WIDTH, PLUGIN_PANEL_MAX_WIDTH)
+}
 
 /// Elide the middle of a string that is wider than `max_columns`, keeping
 /// both ends readable. Paths benefit from the trailing component, so the
@@ -1111,6 +1182,7 @@ impl LubanApp {
                 &plugin_store_url,
             ),
             plugin_panel: None,
+            plugin_panel_drag: None,
             plugin_panel_watch: 0,
             ipc_queue: options.ipc_queue,
             pending_waits: Vec::new(),
@@ -12100,6 +12172,7 @@ impl LubanApp {
         self.rebuild_keymap();
         self.snippet_session = None;
         self.plugin_panel = None;
+        self.plugin_panel_drag = None;
         self.plugin_manager.text_inputs.clear();
         cx.notify();
     }
@@ -12572,6 +12645,75 @@ impl LubanApp {
         .detach();
     }
 
+    /// Start resizing the open panel from its inner edge.
+    fn begin_plugin_panel_drag(
+        &mut self,
+        origin_x: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.plugin_panel.as_ref() else {
+            return;
+        };
+        let origin_width = fit_plugin_panel_width(panel.width, window.bounds().size.width.as_f32());
+        self.plugin_panel_drag = Some(PluginPanelDrag {
+            panel_key: plugin_panel_width_key(&panel.plugin_id, &panel.panel_id),
+            origin_x,
+            origin_width,
+        });
+        cx.notify();
+    }
+
+    /// Follow the pointer while the panel edge is held.
+    fn drag_plugin_panel_to(
+        &mut self,
+        position_x: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.plugin_panel_drag.clone() else {
+            return;
+        };
+        let Some(panel) = self.plugin_panel.as_mut() else {
+            return;
+        };
+        if plugin_panel_width_key(&panel.plugin_id, &panel.panel_id) != drag.panel_key {
+            return;
+        }
+        // The edge moves with the pointer, so dragging left widens the panel.
+        let width = plugin_panel_drag_width(
+            drag.origin_width,
+            drag.origin_x.as_f32(),
+            position_x.as_f32(),
+            window.bounds().size.width.as_f32(),
+        );
+        if (panel.width - width).abs() > f32::EPSILON {
+            panel.width = width;
+            cx.notify();
+        }
+    }
+
+    /// Remember the width the user dragged to and stop following the pointer.
+    fn end_plugin_panel_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.plugin_panel_drag.take() else {
+            return;
+        };
+        let width = self
+            .plugin_panel
+            .as_ref()
+            .filter(|panel| {
+                plugin_panel_width_key(&panel.plugin_id, &panel.panel_id) == drag.panel_key
+            })
+            .map(|panel| panel.width);
+        if let Some(width) = width.filter(|width| (width - drag.origin_width).abs() > 0.5) {
+            self.settings
+                .plugin_panel_widths
+                .insert(drag.panel_key, width);
+            self.commit_settings();
+        }
+        cx.notify();
+    }
+
     fn render_plugin_panel_content(
         &mut self,
         plugin_id: &str,
@@ -12639,7 +12781,22 @@ impl LubanApp {
             .as_ref()
             .map(|panel| panel.placement)
             .unwrap_or(luban_plugin::manifest::PanelPlacement::Right);
-        let width = panel_spec.as_ref().and_then(|panel| panel.width);
+        // Reuse the width of the panel that is already open so a refresh does
+        // not undo a drag; otherwise use the width remembered for this panel,
+        // then the manifest default on first open.
+        let width = self
+            .plugin_panel
+            .as_ref()
+            .filter(|panel| panel.plugin_id == plugin_id && panel.panel_id == panel_id)
+            .map(|panel| panel.width)
+            .unwrap_or_else(|| {
+                plugin_panel_open_width(
+                    &self.settings,
+                    plugin_id,
+                    panel_id,
+                    panel_spec.as_ref().and_then(|panel| panel.width),
+                )
+            });
         let content_title = call
             .value
             .as_ref()
@@ -12686,6 +12843,7 @@ impl LubanApp {
         let focus = self.plugin_panel_focus.clone();
         let plugin_id = panel.plugin_id.clone();
         let panel_id = panel.panel_id.clone();
+        let panel_key = plugin_panel_width_key(&plugin_id, &panel_id);
         let code_font_family = if self.settings.font_family.trim().is_empty() {
             cx.theme().mono_font_family.clone()
         } else {
@@ -12712,13 +12870,16 @@ impl LubanApp {
                     .justify_between()
                     .child(
                         div()
+                            .min_w_0()
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
                             .child(title),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
                             .gap_2()
                             .child(
@@ -12742,6 +12903,7 @@ impl LubanApp {
                                     .on_click(move |_, window, cx| {
                                         let _ = weak_close.update(cx, |this, cx| {
                                             this.plugin_panel = None;
+                                            this.plugin_panel_drag = None;
                                             this.focus_editor(window, cx);
                                             cx.notify();
                                         });
@@ -12814,9 +12976,69 @@ impl LubanApp {
             .child(content);
         match placement {
             luban_plugin::manifest::PanelPlacement::Right => {
-                let available = window.bounds().size.width.as_f32() - 320.0;
-                let width = f32::from(width.unwrap_or(380)).clamp(280.0, 1200.0);
-                let width = width.min(available.max(280.0));
+                let width = fit_plugin_panel_width(width, window.bounds().size.width.as_f32());
+                let dragging = self
+                    .plugin_panel_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.panel_key == panel_key);
+                let handle_hover = cx.theme().colors.secondary;
+                let handle_active = cx.theme().colors.selection;
+                let weak_drag_start = cx.weak_entity();
+                let weak_drag_move = cx.weak_entity();
+                let weak_drag_end = cx.weak_entity();
+                // The band straddles the panel edge so the visible divider is
+                // what the pointer grabs.
+                let handle = div()
+                    .id("plugin-panel-resize-handle")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-PLUGIN_PANEL_HANDLE_WIDTH / 2.0))
+                    .w(px(PLUGIN_PANEL_HANDLE_WIDTH))
+                    .occlude()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(move |this| this.bg(handle_hover))
+                    .when(dragging, move |this| this.bg(handle_active))
+                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        let _ = weak_drag_start.update(cx, |this, cx| {
+                            this.begin_plugin_panel_drag(event.position.x, window, cx);
+                        });
+                    })
+                    .child(div().size_full().child(canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _cx| {
+                            // A panel edge has no room to follow the pointer, so
+                            // the drag is tracked on the window instead.
+                            let weak_move = weak_drag_move.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if !phase.bubble() {
+                                        return;
+                                    }
+                                    let held = event.pressed_button == Some(MouseButton::Left);
+                                    let _ = weak_move.update(cx, |this, cx| {
+                                        if held {
+                                            this.drag_plugin_panel_to(event.position.x, window, cx);
+                                        } else {
+                                            // The button came up outside the window,
+                                            // so its mouse-up never arrived: finish
+                                            // the gesture on the next move instead of
+                                            // leaving the edge highlighted.
+                                            this.end_plugin_panel_drag(cx);
+                                        }
+                                    });
+                                },
+                            );
+                            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                                if !phase.bubble() {
+                                    return;
+                                }
+                                let _ = weak_drag_end.update(cx, |this, cx| {
+                                    this.end_plugin_panel_drag(cx);
+                                });
+                            });
+                        },
+                    )));
                 div()
                     .absolute()
                     .top_0()
@@ -12827,6 +13049,7 @@ impl LubanApp {
                     .border_l_1()
                     .border_color(cx.theme().colors.border)
                     .child(card)
+                    .child(handle)
                     .into_any_element()
             }
             luban_plugin::manifest::PanelPlacement::Bottom => div()
@@ -25160,9 +25383,36 @@ fn client_decorated_frame(root: AnyElement, border: Hsla, maximized: bool) -> An
         .into_any_element()
 }
 
+/// One config directory for every `#[gpui::test]` in this binary:
+/// `LUBAN_NOTEPAD_CONFIG_DIR` is process-wide, so the tests have to agree on
+/// its value instead of each installing its own.
+#[cfg(test)]
+fn test_config_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test config directory");
+        // SAFETY: set once, while this `OnceLock` initializes, before any test
+        // creates a window or loads settings.
+        unsafe { std::env::set_var("LUBAN_NOTEPAD_CONFIG_DIR", dir.path()) };
+        dir
+    })
+    .path()
+}
+
+/// Serializes `#[gpui::test]`s that share the config directory, so one test's
+/// `settings.json` write cannot land between another test's save and assert.
+#[cfg(test)]
+fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod focus_tests {
-    use super::{LaunchOptions, LubanApp, PaletteKind, PaletteOverlay, WindowInit};
+    use super::{
+        test_config_dir, test_lock, LaunchOptions, LubanApp, PaletteKind, PaletteOverlay,
+        WindowInit,
+    };
     use gpui::TestAppContext;
     use gpui_kit::component::command::CommandState;
     use gpui_kit::component::IndexPath;
@@ -25192,9 +25442,8 @@ mod focus_tests {
 
     #[gpui::test]
     fn palette_commands_and_escape_restore_editor_focus(cx: &mut TestAppContext) {
-        let config = tempfile::tempdir().unwrap();
-        // SAFETY: no other test in this binary reads the config directory.
-        unsafe { std::env::set_var("LUBAN_NOTEPAD_CONFIG_DIR", config.path()) };
+        let _guard = test_lock();
+        test_config_dir();
         cx.update(gpui_kit::init);
         let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
         for (command, opened, closed) in [
@@ -25470,5 +25719,263 @@ mod restore_tests {
         assert!(range.start < 8);
         assert!(range.end <= 8);
         assert_eq!(doc.text, "bbb\n");
+    }
+}
+
+#[cfg(test)]
+mod plugin_panel_tests {
+    use super::{
+        fit_plugin_panel_width, plugin_panel_drag_width, plugin_panel_max_width,
+        plugin_panel_open_width, test_config_dir, test_lock, LaunchOptions, LubanApp,
+        PluginPanelState, WindowInit, PLUGIN_PANEL_DEFAULT_WIDTH, PLUGIN_PANEL_HANDLE_WIDTH,
+        PLUGIN_PANEL_MAX_WIDTH, PLUGIN_PANEL_MIN_WIDTH,
+    };
+    use gpui::{point, px, Modifiers, MouseButton, ScrollHandle, TestAppContext};
+    use luban_core::settings::Settings;
+
+    fn options() -> LaunchOptions {
+        LaunchOptions {
+            files: Vec::new(),
+            smoke_test: false,
+            safe_mode: true,
+            session_writer: false,
+            wait: false,
+            goto: None,
+            diff: None,
+            stdin: None,
+            command: None,
+            exit_on_command_failure: false,
+            command_result: None,
+            ipc_queue: None,
+            manual_window_chrome: false,
+            recoveries: Vec::new(),
+            init: WindowInit::Blank,
+            auto_recovery: false,
+            window_id: 1,
+        }
+    }
+
+    /// Open a right-side panel the way the plugin host would, without loading
+    /// a plugin.
+    fn open_panel(app: &mut LubanApp, cx: &mut gpui::Context<LubanApp>, width: f32) {
+        app.plugin_panel = Some(PluginPanelState {
+            plugin_id: "markdown.preview".to_string(),
+            panel_id: "markdown.preview.panel".to_string(),
+            title: "Preview".to_string(),
+            placement: luban_plugin::manifest::PanelPlacement::Right,
+            width,
+            lines: Vec::new(),
+            error: None,
+            truncated: false,
+            watch: 1,
+            scroll: ScrollHandle::default(),
+        });
+        cx.notify();
+    }
+
+    /// Width bounds keep the panel inside the manifest range and leave the
+    /// editor its reserve, even when the window cannot satisfy both.
+    #[test]
+    fn width_bounds_clamp_to_window_and_manifest() {
+        assert_eq!(plugin_panel_max_width(1600.0), 1200.0);
+        assert_eq!(plugin_panel_max_width(1000.0), 680.0);
+        assert_eq!(plugin_panel_max_width(500.0), 280.0);
+        assert_eq!(fit_plugin_panel_width(640.0, 1600.0), 640.0);
+        assert_eq!(fit_plugin_panel_width(900.0, 1000.0), 680.0);
+        assert_eq!(fit_plugin_panel_width(120.0, 1600.0), 280.0);
+        assert_eq!(fit_plugin_panel_width(900.0, 400.0), 280.0);
+    }
+
+    /// A drag stores whole points even when the pointer lands between pixels,
+    /// and still respects both bounds.
+    #[test]
+    fn drag_width_rounds_and_clamps() {
+        assert_eq!(plugin_panel_drag_width(640.0, 802.0, 701.6, 1280.0), 740.0);
+        assert_eq!(plugin_panel_drag_width(640.0, 802.0, 700.4, 1280.0), 742.0);
+        assert_eq!(plugin_panel_drag_width(640.0, 100.0, 900.0, 1280.0), 280.0);
+        assert_eq!(plugin_panel_drag_width(640.0, 900.0, 100.0, 1280.0), 960.0);
+        assert_eq!(plugin_panel_drag_width(640.0, 900.0, 100.0, 1600.0), 1200.0);
+    }
+
+    /// Dragging the panel edge left widens the panel, and the width is
+    /// remembered for that panel and restored the next time it opens.
+    #[gpui::test]
+    fn dragging_the_edge_resizes_and_remembers_the_width(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| open_panel(app, cx, 640.0));
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.update(|window, _| window.bounds());
+        let right = bounds.origin.x + bounds.size.width;
+        let edge = right - px(640.0);
+        let middle = bounds.origin.y + bounds.size.height / 2.0;
+
+        // Grab the band that straddles the panel's left edge.
+        let grab = point(edge, middle);
+        assert!(
+            grab.x > edge - px(PLUGIN_PANEL_HANDLE_WIDTH / 2.0),
+            "handle band starts at the panel edge"
+        );
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(grab.x - px(100.0), middle),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| app.read(cx).plugin_panel.as_ref().unwrap().width),
+            740.0,
+            "dragging left widens the panel while the edge is held"
+        );
+
+        cx.simulate_mouse_up(
+            point(grab.x - px(100.0), middle),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| app
+                .read(cx)
+                .settings
+                .plugin_panel_widths
+                .get("markdown.preview/markdown.preview.panel")
+                .copied()),
+            Some(740.0),
+            "the dragged width is remembered for this panel"
+        );
+
+        // The width is written to settings.json, so it survives a restart.
+        let reloaded = Settings::load_from(&Settings::path());
+        assert_eq!(
+            reloaded
+                .plugin_panel_widths
+                .get("markdown.preview/markdown.preview.panel")
+                .copied(),
+            Some(740.0),
+            "the dragged width is persisted"
+        );
+        // Opening the same panel again resolves to the remembered width, and
+        // other panels keep their own default.
+        assert_eq!(
+            plugin_panel_open_width(
+                &reloaded,
+                "markdown.preview",
+                "markdown.preview.panel",
+                Some(640)
+            ),
+            740.0
+        );
+        assert_eq!(
+            plugin_panel_open_width(&reloaded, "other.plugin", "other.plugin.panel", Some(500)),
+            500.0,
+            "other panels are unaffected"
+        );
+    }
+
+    /// First open uses the manifest width, falling back to 380 points.
+    #[test]
+    fn first_open_uses_the_manifest_width() {
+        let settings = Settings::default();
+        assert_eq!(
+            plugin_panel_open_width(&settings, "a", "b", None),
+            PLUGIN_PANEL_DEFAULT_WIDTH
+        );
+        assert_eq!(
+            plugin_panel_open_width(&settings, "a", "b", Some(640)),
+            640.0
+        );
+        assert_eq!(
+            plugin_panel_open_width(&settings, "a", "b", Some(2000)),
+            PLUGIN_PANEL_MAX_WIDTH,
+            "manifest widths never exceed the draggable range"
+        );
+        assert_eq!(
+            plugin_panel_open_width(&settings, "a", "b", Some(10)),
+            PLUGIN_PANEL_MIN_WIDTH
+        );
+    }
+
+    /// A panel without a remembered width starts at its manifest width, and
+    /// dragging cannot push it past the editor reserve.
+    #[gpui::test]
+    fn dragging_stops_at_the_editor_reserve(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| open_panel(app, cx, 640.0));
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.update(|window, _| window.bounds());
+        let right = bounds.origin.x + bounds.size.width;
+        let edge = right - px(640.0);
+        let middle = bounds.origin.y + bounds.size.height / 2.0;
+        cx.simulate_mouse_down(point(edge, middle), MouseButton::Left, Modifiers::none());
+        // Drag far past the widest the window can give the panel.
+        cx.simulate_mouse_move(
+            point(bounds.origin.x, middle),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| app.read(cx).plugin_panel.as_ref().unwrap().width),
+            plugin_panel_max_width(bounds.size.width.as_f32()),
+            "the panel never takes the editor's reserve"
+        );
+    }
+
+    /// Releasing the button outside the window drops its mouse-up; the next
+    /// move has to finish the drag instead of leaving the edge highlighted.
+    #[gpui::test]
+    fn a_move_without_the_button_ends_a_lost_drag(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| open_panel(app, cx, 640.0));
+            window.draw(cx).clear(cx);
+        });
+
+        let bounds = cx.update(|window, _| window.bounds());
+        let edge = bounds.origin.x + bounds.size.width - px(640.0);
+        let middle = bounds.origin.y + bounds.size.height / 2.0;
+        cx.simulate_mouse_down(point(edge, middle), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(edge - px(60.0), middle),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| app.read(cx).plugin_panel_drag.is_some()));
+
+        // The release happened outside the window, so only this button-less
+        // move tells the app the gesture is over.
+        cx.simulate_mouse_move(point(edge - px(60.0), middle), None, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| app.read(cx).plugin_panel_drag.is_none()),
+            "a move without the button ends the drag"
+        );
+        assert_eq!(
+            cx.update(|_, cx| app
+                .read(cx)
+                .settings
+                .plugin_panel_widths
+                .get("markdown.preview/markdown.preview.panel")
+                .copied()),
+            Some(700.0),
+            "the width dragged before the lost release is still saved"
+        );
     }
 }
