@@ -1189,7 +1189,10 @@ mod tests {
         assert!(validate_catalog_source(DEFAULT_CATALOG_URL).is_ok());
         assert!(validate_catalog_source("https://example.com/catalog.json").is_ok());
         assert!(validate_catalog_source("file:///tmp/catalog.json").is_ok());
-        assert!(validate_catalog_source("/tmp/catalog.json").is_ok());
+        // A unix-style `/tmp/...` is rooted but not absolute on Windows, so use
+        // the platform temp directory for the plain-path form.
+        let absolute = std::env::temp_dir().join("catalog.json");
+        assert!(validate_catalog_source(&absolute.to_string_lossy()).is_ok());
         assert!(validate_catalog_source("http://example.com/catalog.json").is_err());
         assert!(validate_catalog_source("ftp://example.com/catalog.json").is_err());
         assert!(validate_catalog_source("relative/catalog.json").is_err());
