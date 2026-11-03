@@ -71,32 +71,6 @@ impl LubanApp {
         let weak_settings = weak.clone();
         let weak_help = weak.clone();
         let weak_plugins = weak.clone();
-        let command_context = self.command_context();
-        let plugin_commands: Vec<(&'static str, String, bool)> = self
-            .plugin_host
-            .commands
-            .iter()
-            .filter(|command| command.in_menu)
-            .map(|command| {
-                (
-                    command.id,
-                    command.label.clone(),
-                    command.when.enabled(&command_context),
-                )
-            })
-            .collect();
-        let plugin_panels: Vec<(String, String, String)> = self
-            .plugin_host
-            .panels
-            .iter()
-            .map(|panel| {
-                (
-                    panel.plugin_id.clone(),
-                    panel.id.clone(),
-                    panel.title.clone(),
-                )
-            })
-            .collect();
         let recent_items = recent.clone();
 
         let file_menu = Button::new("menu-file")
@@ -1361,36 +1335,6 @@ impl LubanApp {
                         this.run_command("plugins.store", window, cx);
                     },
                 ));
-                if plugin_commands.is_empty() {
-                    menu = menu.item(PopupMenuItem::new(tr("menu.plugins.none")).disabled(true));
-                } else {
-                    for (id, label, enabled) in &plugin_commands {
-                        let id = *id;
-                        let enabled = *enabled;
-                        menu = menu.item(Self::menu_item(
-                            &weak_plugins,
-                            label.clone(),
-                            !enabled,
-                            None,
-                            move |this, window, cx| {
-                                this.run_command(id, window, cx);
-                            },
-                        ));
-                    }
-                }
-                for (plugin_id, panel_id, title) in &plugin_panels {
-                    let plugin_id = plugin_id.clone();
-                    let panel_id = panel_id.clone();
-                    menu = menu.item(Self::menu_item(
-                        &weak_plugins,
-                        title.clone(),
-                        false,
-                        None,
-                        move |this, window, cx| {
-                            this.open_plugin_panel(&plugin_id, &panel_id, window, cx);
-                        },
-                    ));
-                }
                 menu.item(Self::menu_item(
                     &weak_plugins,
                     Self::command_label("plugins.reload"),

@@ -2278,9 +2278,6 @@ menu.plugins.store:
 menu.plugins.reload:
   en: "Reload plugins"
   zh-CN: "重新加载插件"
-menu.plugins.none:
-  en: "No plugin commands"
-  zh-CN: "没有插件命令"
 menu.packages.reload:
   en: "Reload user packages"
   zh-CN: "重新加载用户包"
