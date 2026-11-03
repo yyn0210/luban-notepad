@@ -307,6 +307,10 @@ API、包格式和 CLI 协议。
   > 插件设置、商店和已安装插件管理器迁入 `app/plugin_manager_ui.rs`；为达到本切片确认的
   > `app/mod.rs` 规模目标，设置首选项与字体选择器一并迁入 `app/preferences_ui.rs`；
   > `app/mod.rs` 从 19,186 行降到 14,576 行；状态、会话和其余视图切片留待后续 change。
+  > 第四切片已完成：查找/替换、替换预览与在文件中查找迁入 `app/find_replace_ui.rs`，
+  > 侧栏/大纲/资源管理器迁入 `app/sidebar.rs`，内置文件对话框迁入 `app/file_dialog.rs`，
+  > 大文件/磁盘引擎界面迁入 `app/huge_file_ui.rs`；`app/mod.rs` 从 14,576 行降到 8,183 行；
+  > 状态与剩余视图切片留待后续 change。
 - [ ] 建立编辑器能力适配层，收敛普通/大文件/磁盘引擎三条路径。
 - [x] 关键流程的 Xvfb/xdotool 集成测试：`scripts/gui-integration.sh` 用真实键鼠覆盖输入保存、
   查找替换、标签切换和未保存关闭提示；Linux CI 以 `--require-display` 强制执行并上传失败日志与截图。
