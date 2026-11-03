@@ -76,6 +76,7 @@ impl LubanApp {
             .plugin_host
             .commands
             .iter()
+            .filter(|command| command.in_menu)
             .map(|command| {
                 (
                     command.id,

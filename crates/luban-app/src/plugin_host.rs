@@ -29,6 +29,16 @@ pub struct PluginCommand {
     pub entry: String,
     pub when: CommandWhen,
     pub default_binding: Option<String>,
+    /// Whether the manifest contributes this command to the Plugins menu.
+    pub in_menu: bool,
+}
+
+fn contributes_to_plugins_menu(manifest: &PluginManifest, command_id: &str) -> bool {
+    manifest
+        .contributes
+        .menus
+        .iter()
+        .any(|menu| menu.menu == "plugins" && menu.command == command_id)
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +205,7 @@ impl PluginHost {
                         CommandCondition::EditText => CommandWhen::CanEditFullText,
                     },
                     default_binding: command.default_keybinding.clone(),
+                    in_menu: contributes_to_plugins_menu(manifest, &command.id),
                 });
             }
             schemas.insert(id.clone(), manifest.contributes.settings.clone());
@@ -465,5 +476,20 @@ mod tests {
         }
         assert_eq!(dependent_plugin_ids(&registry, "base"), ["first", "second"]);
         assert!(dependent_plugin_ids(&registry, "second").is_empty());
+    }
+
+    #[test]
+    fn plugins_menu_only_lists_contributed_commands() {
+        let mut manifest = entry("demo", &[]).manifest.unwrap();
+        manifest
+            .contributes
+            .menus
+            .push(luban_plugin::manifest::MenuContribution {
+                menu: "plugins".to_string(),
+                command: "demo.show".to_string(),
+                label: None,
+            });
+        assert!(contributes_to_plugins_menu(&manifest, "demo.show"));
+        assert!(!contributes_to_plugins_menu(&manifest, "demo.hidden"));
     }
 }
