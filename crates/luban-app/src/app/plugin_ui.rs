@@ -907,10 +907,7 @@ impl LubanApp {
                     let _ = weak.update(cx, |this, cx| {
                         if !this.run_command(&command, window, cx) {
                             this.set_status(
-                                tr_args(
-                                    "status.command_failed",
-                                    &[("command", command.clone())],
-                                ),
+                                tr_args("status.command_failed", &[("command", command.clone())]),
                                 cx,
                             );
                         }
