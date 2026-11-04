@@ -1,4 +1,93 @@
+use std::collections::HashMap;
+
+use crate::plugin_host::{PluginCommand, PluginPanelSpec};
+
 use super::*;
+
+/// One plugin's entry in the Plugins menu: the manifest name plus the
+/// commands and panels the plugin contributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginMenuGroup {
+    plugin_id: String,
+    name: String,
+    commands: Vec<PluginMenuCommand>,
+    panels: Vec<PluginMenuPanel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginMenuCommand {
+    id: &'static str,
+    label: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginMenuPanel {
+    id: String,
+    title: String,
+}
+
+/// Normalize a menu label for duplicate detection: lowercase and keep only
+/// letters, digits and CJK characters, so "JSON: Preview" matches "JSON Preview".
+fn normalize_menu_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+/// Group menu-contributed plugin commands and panels by plugin, preserving
+/// command/panel order and skipping plugins with nothing to show. Panels whose
+/// title duplicates a shown command label are skipped.
+fn plugin_menu_groups(
+    commands: &[PluginCommand],
+    panels: &[PluginPanelSpec],
+    command_context: &CommandContext,
+    plugin_name: impl Fn(&str) -> Option<String>,
+) -> Vec<PluginMenuGroup> {
+    let mut groups: Vec<PluginMenuGroup> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut group_index = |plugin_id: &str, groups: &mut Vec<PluginMenuGroup>| {
+        if let Some(index) = index.get(plugin_id) {
+            return *index;
+        }
+        let group = groups.len();
+        groups.push(PluginMenuGroup {
+            plugin_id: plugin_id.to_string(),
+            name: plugin_name(plugin_id).unwrap_or_else(|| plugin_id.to_string()),
+            commands: Vec::new(),
+            panels: Vec::new(),
+        });
+        index.insert(plugin_id.to_string(), group);
+        group
+    };
+
+    for command in commands.iter().filter(|command| command.in_menu) {
+        let group = group_index(&command.plugin_id, &mut groups);
+        groups[group].commands.push(PluginMenuCommand {
+            id: command.id,
+            label: command.label.clone(),
+            enabled: command.when.enabled(command_context),
+        });
+    }
+    for panel in panels {
+        let group = group_index(&panel.plugin_id, &mut groups);
+        let title = normalize_menu_label(&panel.title);
+        if groups[group]
+            .commands
+            .iter()
+            .any(|command| normalize_menu_label(&command.label) == title)
+        {
+            continue;
+        }
+        groups[group].panels.push(PluginMenuPanel {
+            id: panel.id.clone(),
+            title: panel.title.clone(),
+        });
+    }
+    groups
+}
 
 impl LubanApp {
     // ------------------------------------------------------------------
@@ -71,6 +160,17 @@ impl LubanApp {
         let weak_settings = weak.clone();
         let weak_help = weak.clone();
         let weak_plugins = weak.clone();
+        let command_context = self.command_context();
+        let plugin_groups = plugin_menu_groups(
+            &self.plugin_host.commands,
+            &self.plugin_host.panels,
+            &command_context,
+            |plugin_id| {
+                self.plugin_host
+                    .manifest(plugin_id)
+                    .map(|manifest| manifest.name.clone())
+            },
+        );
         let recent_items = recent.clone();
 
         let file_menu = Button::new("menu-file")
@@ -1316,7 +1416,7 @@ impl LubanApp {
             .label(tr("menu.plugins"))
             .ghost()
             .compact()
-            .dropdown_menu(move |mut menu, _window, _cx| {
+            .dropdown_menu(move |mut menu, window, cx| {
                 menu = menu.item(Self::menu_item(
                     &weak_plugins,
                     Self::command_label("plugins.manage"),
@@ -1335,6 +1435,57 @@ impl LubanApp {
                         this.run_command("plugins.store", window, cx);
                     },
                 ));
+                if !plugin_groups.is_empty() {
+                    menu = menu.separator();
+                    for group in &plugin_groups {
+                        let plugin_id = group.plugin_id.clone();
+                        let commands = group.commands.clone();
+                        let panels = group.panels.clone();
+                        let weak_submenu = weak_plugins.clone();
+                        menu = menu.submenu(
+                            group.name.clone(),
+                            window,
+                            cx,
+                            move |mut submenu, _window, _cx| {
+                                for command in &commands {
+                                    let weak_item = weak_submenu.clone();
+                                    let id = command.id;
+                                    let enabled = command.enabled;
+                                    submenu = submenu.item(Self::menu_item(
+                                        &weak_item,
+                                        command.label.clone(),
+                                        !enabled,
+                                        None,
+                                        move |this, window, cx| {
+                                            this.run_command(id, window, cx);
+                                        },
+                                    ));
+                                }
+                                if !commands.is_empty() && !panels.is_empty() {
+                                    submenu = submenu.separator();
+                                }
+                                for panel in &panels {
+                                    let weak_item = weak_submenu.clone();
+                                    let plugin_id = plugin_id.clone();
+                                    let panel_id = panel.id.clone();
+                                    submenu = submenu.item(Self::menu_item(
+                                        &weak_item,
+                                        panel.title.clone(),
+                                        false,
+                                        None,
+                                        move |this, window, cx| {
+                                            this.open_plugin_panel(
+                                                &plugin_id, &panel_id, window, cx,
+                                            );
+                                        },
+                                    ));
+                                }
+                                submenu
+                            },
+                        );
+                    }
+                    menu = menu.separator();
+                }
                 menu.item(Self::menu_item(
                     &weak_plugins,
                     Self::command_label("plugins.reload"),
@@ -2015,5 +2166,149 @@ impl LubanApp {
                     .children(right_items),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plugin_menu_groups;
+    use crate::commands::{CommandContext, CommandWhen};
+    use crate::plugin_host::{PluginCommand, PluginPanelSpec};
+    use luban_plugin::manifest::{PanelPlacement, PanelRefresh};
+
+    fn command(plugin_id: &str, id: &'static str, in_menu: bool) -> PluginCommand {
+        PluginCommand {
+            id,
+            label: format!("{plugin_id}: {id}"),
+            plugin_id: plugin_id.to_string(),
+            entry: "main".to_string(),
+            when: CommandWhen::Always,
+            default_binding: None,
+            in_menu,
+        }
+    }
+
+    fn panel(plugin_id: &str, id: &str, title: &str) -> PluginPanelSpec {
+        PluginPanelSpec {
+            plugin_id: plugin_id.to_string(),
+            id: id.to_string(),
+            title: title.to_string(),
+            entry: "main".to_string(),
+            placement: PanelPlacement::Right,
+            width: None,
+            refresh: PanelRefresh::Manual,
+        }
+    }
+
+    fn context() -> CommandContext {
+        CommandContext {
+            has_document: true,
+            has_path: false,
+            can_save: false,
+            can_undo: false,
+            can_redo: false,
+            can_edit_full_text: true,
+            can_go_back: false,
+            can_go_forward: false,
+            diff_running: false,
+        }
+    }
+
+    #[test]
+    fn groups_contributed_commands_and_panels_by_plugin() {
+        let commands = vec![
+            command("json", "json.preview", true),
+            command("json", "json.fold", false),
+            command("markdown", "markdown.preview", true),
+        ];
+        let panels = vec![
+            panel("json", "json.preview.panel", "JSON Preview"),
+            panel("markdown", "markdown.preview.panel", "Markdown Preview"),
+        ];
+        let groups = plugin_menu_groups(
+            &commands,
+            &panels,
+            &context(),
+            |plugin_id| match plugin_id {
+                "json" => Some("JSON Preview".to_string()),
+                "markdown" => Some("Markdown Preview".to_string()),
+                _ => None,
+            },
+        );
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].plugin_id, "json");
+        assert_eq!(groups[0].name, "JSON Preview");
+        assert_eq!(
+            groups[0]
+                .commands
+                .iter()
+                .map(|command| command.id)
+                .collect::<Vec<_>>(),
+            ["json.preview"]
+        );
+        assert_eq!(groups[0].panels[0].title, "JSON Preview");
+        assert_eq!(groups[1].plugin_id, "markdown");
+        assert_eq!(groups[1].name, "Markdown Preview");
+        assert_eq!(groups[1].commands[0].id, "markdown.preview");
+        assert_eq!(groups[1].panels[0].title, "Markdown Preview");
+    }
+
+    #[test]
+    fn skips_plugins_without_menu_entries_and_keeps_panel_only_plugins() {
+        let commands = vec![command("empty", "empty.hidden", false)];
+        let panels = vec![panel("panels-only", "panels-only.panel", "Panels Only")];
+        let groups = plugin_menu_groups(&commands, &panels, &context(), |_| None);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].plugin_id, "panels-only");
+        assert_eq!(groups[0].name, "panels-only");
+        assert!(groups[0].commands.is_empty());
+        assert_eq!(groups[0].panels[0].title, "Panels Only");
+    }
+
+    #[test]
+    fn command_enabled_state_follows_when_condition() {
+        let mut save = command("demo", "demo.save", true);
+        save.when = CommandWhen::CanSave;
+        let groups = plugin_menu_groups(&[save], &[], &context(), |_| Some("Demo".to_string()));
+
+        assert!(!groups[0].commands[0].enabled);
+    }
+
+    #[test]
+    fn hides_panels_that_duplicate_shown_command_labels() {
+        let mut json_preview = command("json", "json.preview", true);
+        json_preview.label = "JSON: Preview".to_string();
+        let mut markdown_preview = command("markdown", "markdown.preview", true);
+        markdown_preview.label = "Markdown: Preview".to_string();
+        let commands = vec![json_preview, markdown_preview];
+        let panels = vec![
+            panel("json", "json.preview.panel", "JSON Preview"),
+            panel("json", "json.inspector.panel", "JSON Inspector"),
+            panel("markdown", "markdown.preview.panel", "Markdown Preview"),
+        ];
+        let groups = plugin_menu_groups(&commands, &panels, &context(), |_| None);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0]
+                .panels
+                .iter()
+                .map(|panel| panel.id.as_str())
+                .collect::<Vec<_>>(),
+            ["json.inspector.panel"]
+        );
+        assert!(groups[1].panels.is_empty());
+    }
+
+    #[test]
+    fn duplicate_panel_detection_ignores_case_and_punctuation() {
+        let mut preview = command("demo", "demo.preview", true);
+        preview.label = "DEMO — preview!".to_string();
+        let panels = vec![panel("demo", "demo.panel", "demo preview.")];
+        let groups = plugin_menu_groups(&[preview], &panels, &context(), |_| None);
+
+        assert!(groups[0].panels.is_empty());
     }
 }
