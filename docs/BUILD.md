@@ -97,8 +97,8 @@ Windows 使用多尺寸 `.ico`，macOS 使用 `.icns`。
 版本并提交后，推送同名标签：
 
 ```bash
-git tag v1.0.0-preview.6
-git push origin v1.0.0-preview.6
+git tag v1.0.0-preview.7
+git push origin v1.0.0-preview.7
 ```
 
 工作流会校验标签与 `Cargo.toml` 版本一致，构建 Linux（`.tar.gz`、`.deb`）、

@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "luban-app"
-version = "1.0.0-preview.6"
+version = "1.0.0-preview.7"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3872,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "luban-core"
-version = "1.0.0-preview.6"
+version = "1.0.0-preview.7"
 dependencies = [
  "chardetng",
  "dirs 6.0.0",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "luban-plugin"
-version = "1.0.0-preview.6"
+version = "1.0.0-preview.7"
 dependencies = [
  "anyhow",
  "log",
