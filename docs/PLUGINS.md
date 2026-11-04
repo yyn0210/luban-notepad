@@ -144,6 +144,7 @@ Lua 栈回溯和出错位置；完整错误写入应用日志，状态栏保留�
 | `luban.settings.get(key)` | 读取插件设置。 |
 | `luban.status.set(id, text)` | 更新已声明的状态栏项。 |
 | `luban.panel.open(id)` | 打开或刷新本插件声明过的面板；旧宿主没有此 API。 |
+| `luban.panel.version` | 面板 API 版本；支持面板操作栏的宿主为 `2`，旧宿主为 `nil`。 |
 | `luban.syntax.highlight(text, language)` | 用当前语法主题高亮文本，返回 `{ text, role }` 数组；单次上限 64 KiB；旧宿主没有此 API。 |
 | `luban.fs.read(path)` | 读取文本文件（需要 `filesystem` 权限）。 |
 | `luban.fs.write(path, text)` | 原子写入文件（需要 `filesystem` 权限）。 |
@@ -221,6 +222,20 @@ Lua 栈回溯和出错位置；完整错误写入应用日志，状态栏保留�
     command = "hello.greet",
   }
   ```
+- 可选 `actions`：在面板标题旁显示一排扁平操作按钮，不占用正文行：
+  ```lua
+  return {
+    title = "解析结果",
+    lines = { ... },
+    actions = {
+      { label = "折叠", command = "json.fold.toggle-all" },
+      { label = "元数据", command = "json.metadata" },
+    },
+  }
+  ```
+  最多 8 个操作，`label` 不超过 64 字节，`command` 不超过 128 字节。宿主通过
+  `luban.panel.version >= 2` 表示支持；旧宿主忽略该字段。点击操作与点击带
+  `command` 的面板行不同，不会先关闭面板。
 - span 的 `style` 是空格分隔的标志：`bold`、`italic`、`underline`、`strike`、
   `code`、`link`、`muted`；`role` 使用 `luban.syntax.highlight` 返回的语义角色，宿主用当前
   语法主题着色。spans 总字节不超过 4 KiB，且拼接必须等于 `text`，否则整行按

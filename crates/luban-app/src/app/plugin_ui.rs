@@ -829,6 +829,11 @@ impl LubanApp {
             .and_then(|panel| panel.title.clone())
             .filter(|title| !title.trim().is_empty());
         let truncated = call.value.as_ref().is_some_and(|panel| panel.truncated);
+        let actions = call
+            .value
+            .as_ref()
+            .map(|panel| panel.actions.clone())
+            .unwrap_or_default();
         let lines = call.value.map(|panel| panel.lines).unwrap_or_default();
         // Reuse the scroll position for the same panel so live refreshes do
         // not jump back to the top; a newly opened panel starts at the top.
@@ -846,6 +851,7 @@ impl LubanApp {
             width,
             truncated,
             lines,
+            actions,
             error: error.take(),
             watch,
             scroll,
@@ -863,6 +869,7 @@ impl LubanApp {
         };
         let title = panel.title.clone();
         let lines = panel.lines.clone();
+        let actions = panel.actions.clone();
         let empty = lines.is_empty();
         let error = panel.error.clone();
         let has_error = error.is_some();
@@ -887,6 +894,29 @@ impl LubanApp {
             .into_iter()
             .map(|line| Self::plugin_panel_line(line, &code_font_family, &base_font, cx))
             .collect();
+        let weak_action = cx.weak_entity();
+        let action_buttons = actions.into_iter().enumerate().map(move |(index, action)| {
+            let weak = weak_action.clone();
+            let command = action.command;
+            Button::new(("plugin-panel-action", index))
+                .label(action.label)
+                .ghost()
+                .compact()
+                .on_click(move |_, window, cx| {
+                    let command = command.clone();
+                    let _ = weak.update(cx, |this, cx| {
+                        if !this.run_command(&command, window, cx) {
+                            this.set_status(
+                                tr_args(
+                                    "status.command_failed",
+                                    &[("command", command.clone())],
+                                ),
+                                cx,
+                            );
+                        }
+                    });
+                })
+        });
         let content = div()
             .flex()
             .flex_col()
@@ -912,6 +942,7 @@ impl LubanApp {
                             .flex_shrink_0()
                             .items_center()
                             .gap_2()
+                            .children(action_buttons)
                             .child(
                                 Button::new("plugin-panel-refresh")
                                     .label(tr("plugins.refresh"))

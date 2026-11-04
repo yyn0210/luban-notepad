@@ -214,6 +214,8 @@ struct PluginPanelState {
     /// remembered/manifest width until the panel is resized.
     width: f32,
     lines: Vec<luban_plugin::runtime::PanelLine>,
+    /// Optional flat action bar rendered next to the panel title.
+    actions: Vec<luban_plugin::runtime::PanelAction>,
     error: Option<String>,
     truncated: bool,
     /// Token identifying the watcher task allowed to refresh this panel.
@@ -7967,6 +7969,7 @@ mod plugin_panel_tests {
             placement: luban_plugin::manifest::PanelPlacement::Right,
             width,
             lines: Vec::new(),
+            actions: Vec::new(),
             error: None,
             truncated: false,
             watch: 1,

@@ -26,6 +26,9 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PANEL_LINES: usize = 5_000;
 const MAX_PANEL_LINE_BYTES: usize = 4 * 1024;
 const MAX_PANEL_SPANS: usize = 512;
+const MAX_PANEL_ACTIONS: usize = 8;
+const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
+const MAX_PANEL_ACTION_COMMAND_BYTES: usize = 128;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
 
@@ -95,6 +98,14 @@ pub struct PanelContent {
     pub title: Option<String>,
     pub lines: Vec<PanelLine>,
     pub truncated: bool,
+    /// Optional flat action bar rendered in the panel header.
+    pub actions: Vec<PanelAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelAction {
+    pub label: String,
+    pub command: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -747,6 +758,9 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
     luban.set("syntax", syntax)?;
 
     let panel = lua.create_table()?;
+    // Version 2 adds { actions = { { label, command }, ... } } to panel
+    // content, rendered as a flat action bar in the panel header.
+    panel.set("version", 2)?;
     let panel_state = state.clone();
     panel.set(
         "open",
@@ -1092,9 +1106,11 @@ fn parse_panel(value: Value) -> Result<PanelContent, String> {
                     .to_string(),
             )],
             truncated: false,
+            actions: Vec::new(),
         }),
         Value::Table(table) => {
             let title: Option<String> = table.get("title").ok().flatten();
+            let actions = parse_panel_actions(table.get("actions").unwrap_or(Value::Nil))?;
             let lines_value: Value = table.get("lines").unwrap_or(Value::Nil);
             let lines = if matches!(lines_value, Value::Nil) {
                 parse_panel_lines(Value::Table(table))?
@@ -1105,10 +1121,41 @@ fn parse_panel(value: Value) -> Result<PanelContent, String> {
                 title,
                 lines: lines.0,
                 truncated: lines.1,
+                actions,
             })
         }
         _ => Err("panel function must return a string, an array, or { title, lines }".to_string()),
     }
+}
+
+fn parse_panel_actions(value: Value) -> Result<Vec<PanelAction>, String> {
+    let Value::Table(table) = value else {
+        return Ok(Vec::new());
+    };
+    let mut actions = Vec::new();
+    for value in table.sequence_values::<Value>() {
+        let value = value.map_err(|error| format!("cannot read panel action: {error}"))?;
+        if actions.len() >= MAX_PANEL_ACTIONS {
+            return Err(format!("panel has more than {MAX_PANEL_ACTIONS} actions"));
+        }
+        let Value::Table(action) = value else {
+            return Err("panel actions must be tables".to_string());
+        };
+        let label: String = action
+            .get("label")
+            .map_err(|error| format!("panel action label: {error}"))?;
+        let command: String = action
+            .get("command")
+            .map_err(|error| format!("panel action command: {error}"))?;
+        if label.is_empty() || label.len() > MAX_PANEL_ACTION_LABEL_BYTES {
+            return Err("panel action label is empty or too long".to_string());
+        }
+        if command.is_empty() || command.len() > MAX_PANEL_ACTION_COMMAND_BYTES {
+            return Err("panel action command is empty or too long".to_string());
+        }
+        actions.push(PanelAction { label, command });
+    }
+    Ok(actions)
 }
 
 fn parse_panel_lines(value: Value) -> Result<(Vec<PanelLine>, bool), String> {
@@ -1454,9 +1501,19 @@ mod tests {
         let manifest = write_plugin(
             dir.path(),
             r#"return {
-                run = function(ctx) luban.notify(luban.json.encode({ a = 1, b = "x", c = { true } })) end,
+                run = function(ctx)
+                    assert(luban.panel.version == 2, "panel API version")
+                    luban.notify(luban.json.encode({ a = 1, b = "x", c = { true } }))
+                end,
                 list = function(ctx)
-                    return { title = "Demo", lines = { "one", { text = "two", command = "test.run" } } }
+                    return {
+                        title = "Demo",
+                        lines = { "one", { text = "two", command = "test.run" } },
+                        actions = {
+                            { label = "Refresh", command = "test.run" },
+                            { label = "Info", command = "test.info" },
+                        },
+                    }
                 end
             }"#,
         );
@@ -1469,6 +1526,9 @@ mod tests {
         assert_eq!(panel.title.as_deref(), Some("Demo"));
         assert_eq!(panel.lines.len(), 2);
         assert_eq!(panel.lines[1].command.as_deref(), Some("test.run"));
+        assert_eq!(panel.actions.len(), 2);
+        assert_eq!(panel.actions[0].label, "Refresh");
+        assert_eq!(panel.actions[1].command, "test.info");
     }
 
     #[test]
