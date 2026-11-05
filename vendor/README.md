@@ -1,6 +1,6 @@
 # vendor/gpui-pre-linux
 
-`gpui-pre-linux` 0.3.9 的本地副本，叠加一个最小 X11 补丁。
+`gpui-pre-linux` 0.3.9 的本地副本，叠加最小 X11 补丁。
 
 ## 为什么 vendored
 
@@ -16,9 +16,18 @@
 应用侧任何映射后的改写本质上是竞态，无法确定性修复；
 唯一确定性的方案是让 gpui 的 X11 后端在映射前写入无边框 hint。
 
+第二处补丁涉及最大化：`PlatformWindow::zoom` 上游只发送
+`_NET_WM_STATE` 的 `Toggle`。KWin 会把映射时宽度恰好等于工作区宽度的窗口
+预先标记为 `_NET_WM_STATE_MAXIMIZED_HORZ`（已用 1px 差值的窗口验证），
+此时 `Toggle` 会把窗口管理器已置位的横向状态反转掉、只打开纵向，
+窗口变成“只铺满高度、不铺满宽度”。本应用恢复上次会话时经常打开这种全宽窗口，
+因此最大化按钮会失效。补丁改为按期望状态显式 `Add`/`Remove` 两个方向。
+
 ## 补丁内容
 
-仅修改 `src/linux/x11/window.rs` 的 `PlatformWindow::request_decorations`：
+仅修改 `src/linux/x11/window.rs`：
+
+### 1. `PlatformWindow::request_decorations`
 
 - X11 上收到 `WindowDecorations::Client` 时解释为**“应用自绘 chrome”**：
   - 立即写入 `_MOTIF_WM_HINTS = [2, 0, 0, 0, 0]`（flags=decorations,
@@ -30,6 +39,14 @@
   - 写入失败时不改报告值（保持上游“失败不改状态”的行为）。
 - `request_decorations(Server)` 语义不变（窗口管理器装饰）。
 - 不触碰 Wayland 后端与其他任何模块。
+
+### 2. `PlatformWindow::zoom`
+
+- 窗口已同时最大化横向和纵向时发送 `Remove`（还原），否则发送 `Add`
+  （最大化），两个方向一起设置，不再依赖窗口管理器当前状态做 `Toggle`。
+- 幂等：即使 `_NET_WM_STATE` 的事件还没被应用处理（本地状态过期），
+  `Add` 也不会把已经置位的方向反转掉。
+- `toggle_fullscreen` 等其余调用点保持上游行为。
 
 `crates/luban-app/src/window_registry.rs` 相应地把 X11 手动装饰窗口的
 装饰请求改为 `Client`；`crates/luban-app/src/main.rs` 保留映射后的
@@ -56,7 +73,10 @@
    （`~/.cargo/registry/src/<hash>/gpui-pre-linux-<新版本>/`）。
 3. 重新套用上面的补丁：在新的
    `src/linux/x11/window.rs` 的 `request_decorations` 开头加入 Client 分支
-   （写入 `[2, 0, 0, 0, 0]` 并保持 `state.decorations = Server`）。
+   （写入 `[2, 0, 0, 0, 0]` 并保持 `state.decorations = Server`），
+   并把 `zoom` 的 `Toggle` 改为按 `state.maximized_vertical/horizontal`
+   发送 `Add`/`Remove`（需要恢复 `WmHintPropertyState` 的 `Remove`/`Add` 变体）。
    注意核对新版是否仍为“映射前调用 `request_decorations`”的顺序；
-   如果上游已改为映射前写入无边框 hint，可直接删除补丁与 vendored 目录。
+   如果上游已改为映射前写入无边框 hint、或 `zoom` 已显式设置状态，
+   可删除对应补丁；两者都不再需要时删除 vendored 目录。
 4. 更新本 README 的校验和与版本号。

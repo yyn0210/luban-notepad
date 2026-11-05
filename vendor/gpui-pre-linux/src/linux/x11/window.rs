@@ -912,8 +912,8 @@ impl Drop for X11Window {
 }
 
 enum WmHintPropertyState {
-    // Remove = 0,
-    // Add = 1,
+    Remove = 0,
+    Add = 1,
     Toggle = 2,
 }
 
@@ -1673,11 +1673,30 @@ impl PlatformWindow for X11Window {
 
     fn zoom(&self) {
         let state = self.0.state.borrow();
+
+        // LUBAN PATCH (maximize-toggle): a window manager may already report
+        // one maximized direction without the other — KWin marks a window
+        // that maps at the full work-area width as `_NET_WM_STATE_MAXIMIZED_HORZ`.
+        // Toggling both atoms then clears the direction the window manager set
+        // and sets only the other, so the window fills the height but not the
+        // width (or the reverse). Drive both atoms to the desired state
+        // instead: add both when the window is not maximized in both
+        // directions, remove both when it is.
+        let maximized = state.maximized_vertical && state.maximized_horizontal;
+        let vertical = state.atoms._NET_WM_STATE_MAXIMIZED_VERT;
+        let horizontal = state.atoms._NET_WM_STATE_MAXIMIZED_HORZ;
+        let hint_state = if maximized {
+            WmHintPropertyState::Remove
+        } else {
+            WmHintPropertyState::Add
+        };
+        drop(state);
+
         self.set_wm_hints(
             || "X11 SendEvent to maximize a window failed.",
-            WmHintPropertyState::Toggle,
-            state.atoms._NET_WM_STATE_MAXIMIZED_VERT,
-            state.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+            hint_state,
+            vertical,
+            horizontal,
         )
         .log_err();
     }
