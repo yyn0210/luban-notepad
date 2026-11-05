@@ -286,6 +286,19 @@ pub struct X11WindowState {
     hovered: bool,
     force_render_after_recovery: bool,
     fullscreen: bool,
+    /// Whether `map_window` has run. Window managers ignore `_NET_WM_STATE`
+    /// requests for unmapped windows, so `zoom`/`toggle_fullscreen` requests
+    /// that arrive before this is set are deferred until mapping.
+    mapped: bool,
+    /// Desired maximized state requested before the window was mapped.
+    pending_zoom: Option<bool>,
+    /// Fullscreen was requested before the window was mapped.
+    pending_fullscreen: bool,
+    /// Root-position and size to restore after the application unmaximizes.
+    restore_bounds: Option<(i16, i16, u16, u16)>,
+    /// A `Remove` maximize request is in flight; apply `restore_bounds` once
+    /// the window manager confirms that neither direction is maximized.
+    pending_restore: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
@@ -845,6 +858,11 @@ impl X11WindowState {
                 hovered: false,
                 force_render_after_recovery: false,
                 fullscreen: false,
+                mapped: false,
+                pending_zoom: None,
+                pending_fullscreen: false,
+                restore_bounds: None,
+                pending_restore: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
                 hidden: false,
@@ -991,6 +1009,44 @@ impl X11Window {
         )?;
         xcb_flush(&self.0.xcb);
         Ok(())
+    }
+
+    /// Send the window manager an explicit maximize or unmaximize request for
+    /// both directions.
+    fn apply_zoom(&self, maximized: bool) {
+        let (vertical, horizontal) = {
+            let state = self.0.state.borrow();
+            (
+                state.atoms._NET_WM_STATE_MAXIMIZED_VERT,
+                state.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+            )
+        };
+        self.set_wm_hints(
+            || "X11 SendEvent to maximize a window failed.",
+            if maximized {
+                WmHintPropertyState::Add
+            } else {
+                WmHintPropertyState::Remove
+            },
+            vertical,
+            horizontal,
+        )
+        .log_err();
+    }
+
+    /// The window's position relative to the root window and its size, in
+    /// physical pixels.
+    fn window_root_geometry(&self) -> anyhow::Result<(i16, i16, u16, u16)> {
+        let geometry = get_reply(
+            || "X11 GetGeometry failed.",
+            self.0.xcb.get_geometry(self.0.x_window),
+        )?;
+        let root = self.0.state.borrow().x_root_window;
+        let translated = get_reply(
+            || "X11 TranslateCoordinates failed.",
+            self.0.xcb.translate_coordinates(self.0.x_window, root, 0, 0),
+        )?;
+        Ok((translated.dst_x, translated.dst_y, geometry.width, geometry.height))
     }
 
     fn get_root_position(
@@ -1145,6 +1201,32 @@ impl X11WindowStatePtr {
         // the client, and focus is the conventional means for the user to zero it.
         if state.active && !was_active {
             set_wm_hints_urgency(&self.xcb, self.x_window, false);
+        }
+
+        // LUBAN PATCH (restore-bounds): the window manager has confirmed the
+        // unmaximize the application requested, so resize the window back to
+        // the geometry it had before maximizing. KWin otherwise restores its
+        // own normal geometry, which is 2/3 of the screen width for a window
+        // it auto-marked as horizontally maximized when it was mapped.
+        if !state.fullscreen
+            && !state.maximized_vertical
+            && !state.maximized_horizontal
+            && std::mem::take(&mut state.pending_restore)
+            && let Some((x, y, width, height)) = state.restore_bounds.take()
+        {
+            check_reply(
+                || "X11 ConfigureWindow restoring the window bounds failed.",
+                self.xcb.configure_window(
+                    self.x_window,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(i32::from(x))
+                        .y(i32::from(y))
+                        .width(u32::from(width))
+                        .height(u32::from(height)),
+                ),
+            )
+            .log_err();
+            xcb_flush(&self.xcb);
         }
 
         Ok(())
@@ -1619,6 +1701,25 @@ impl PlatformWindow for X11Window {
             || "X11 MapWindow failed.",
             self.0.xcb.map_window(self.0.x_window),
         )?;
+
+        // LUBAN PATCH: `Window::new` requests maximization and fullscreen
+        // before mapping, but window managers ignore `_NET_WM_STATE` for
+        // unmapped windows. Apply those requests now that the MapWindow
+        // request is queued ahead of them on this connection.
+        let (pending_zoom, pending_fullscreen) = {
+            let mut state = self.0.state.borrow_mut();
+            state.mapped = true;
+            (
+                state.pending_zoom.take(),
+                std::mem::take(&mut state.pending_fullscreen),
+            )
+        };
+        if pending_fullscreen {
+            self.toggle_fullscreen();
+        }
+        if let Some(maximized) = pending_zoom {
+            self.apply_zoom(maximized);
+        }
         Ok(())
     }
 
@@ -1672,7 +1773,7 @@ impl PlatformWindow for X11Window {
     }
 
     fn zoom(&self) {
-        let state = self.0.state.borrow();
+        let mut state = self.0.state.borrow_mut();
 
         // LUBAN PATCH (maximize-toggle): a window manager may already report
         // one maximized direction without the other — KWin marks a window
@@ -1683,30 +1784,49 @@ impl PlatformWindow for X11Window {
         // instead: add both when the window is not maximized in both
         // directions, remove both when it is.
         let maximized = state.maximized_vertical && state.maximized_horizontal;
-        let vertical = state.atoms._NET_WM_STATE_MAXIMIZED_VERT;
-        let horizontal = state.atoms._NET_WM_STATE_MAXIMIZED_HORZ;
-        let hint_state = if maximized {
-            WmHintPropertyState::Remove
-        } else {
-            WmHintPropertyState::Add
-        };
+        if !state.mapped {
+            // LUBAN PATCH: `Window::new` requests maximization before the
+            // window is mapped, and window managers ignore `_NET_WM_STATE`
+            // for unmapped windows; `map_window` applies the request.
+            state.pending_zoom = Some(!maximized);
+            return;
+        }
         drop(state);
 
-        self.set_wm_hints(
-            || "X11 SendEvent to maximize a window failed.",
-            hint_state,
-            vertical,
-            horizontal,
-        )
-        .log_err();
+        if maximized {
+            // LUBAN PATCH (restore-bounds): remember that the next time the
+            // window manager reports an unmaximized window it should be
+            // resized to `restore_bounds` — without the marker a window the
+            // user drags out of a maximized state would be moved back.
+            self.0.state.borrow_mut().pending_restore = true;
+        } else {
+            // Remember the geometry before maximizing: otherwise KWin
+            // restores its own normal geometry, which for a window it
+            // auto-marked as horizontally maximized at map time is 2/3 of the
+            // screen width rather than the size the window actually had.
+            if let Ok(bounds) = self.window_root_geometry() {
+                self.0.state.borrow_mut().restore_bounds = Some(bounds);
+            }
+            self.0.state.borrow_mut().pending_restore = false;
+        }
+
+        self.apply_zoom(!maximized);
     }
 
     fn toggle_fullscreen(&self) {
-        let state = self.0.state.borrow();
+        {
+            let mut state = self.0.state.borrow_mut();
+            if !state.mapped {
+                // LUBAN PATCH: apply the request after the window is mapped.
+                state.pending_fullscreen = true;
+                return;
+            }
+        }
+        let fullscreen = self.0.state.borrow().atoms._NET_WM_STATE_FULLSCREEN;
         self.set_wm_hints(
             || "X11 SendEvent to fullscreen a window failed.",
             WmHintPropertyState::Toggle,
-            state.atoms._NET_WM_STATE_FULLSCREEN,
+            fullscreen,
             xproto::AtomEnum::NONE.into(),
         )
         .log_err();

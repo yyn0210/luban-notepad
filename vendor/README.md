@@ -23,6 +23,18 @@
 窗口变成“只铺满高度、不铺满宽度”。本应用恢复上次会话时经常打开这种全宽窗口，
 因此最大化按钮会失效。补丁改为按期望状态显式 `Add`/`Remove` 两个方向。
 
+同一补丁还处理 KWin 的另外两个行为：
+
+- **还原几何**：KWin 对上述“映射时自动横向最大化”的窗口记录的常规几何是
+  屏幕宽度的 2/3，直接 `Remove` 会把窗口缩到 2/3 宽。补丁在最大化前记录窗口
+  在根窗口坐标系中的实际位置与大小，等窗口管理器确认取消最大化后，再用
+  `ConfigureWindow` 恢复该几何。用户从最大化状态直接拖动窗口时（KWin 自己
+  取消最大化）不会触发恢复，避免与拖动位置打架。
+- **映射前请求**：`Window::new` 在 `map_window` 之前就调用 `zoom`（会话以
+  最大化状态恢复）和 `toggle_fullscreen`（`WindowBounds::Fullscreen`），
+  而窗口管理器会忽略未映射窗口的 `_NET_WM_STATE` 消息，导致启动时窗口
+  没有最大化。补丁把映射前的请求暂存到 `map_window` 之后再发送。
+
 ## 补丁内容
 
 仅修改 `src/linux/x11/window.rs`：
@@ -40,13 +52,17 @@
 - `request_decorations(Server)` 语义不变（窗口管理器装饰）。
 - 不触碰 Wayland 后端与其他任何模块。
 
-### 2. `PlatformWindow::zoom`
+### 2. `PlatformWindow::zoom` / `toggle_fullscreen` / `map_window`
 
 - 窗口已同时最大化横向和纵向时发送 `Remove`（还原），否则发送 `Add`
   （最大化），两个方向一起设置，不再依赖窗口管理器当前状态做 `Toggle`。
 - 幂等：即使 `_NET_WM_STATE` 的事件还没被应用处理（本地状态过期），
   `Add` 也不会把已经置位的方向反转掉。
-- `toggle_fullscreen` 等其余调用点保持上游行为。
+- 最大化前记录根窗口坐标与尺寸；应用主动取消最大化后，在
+  `set_wm_properties` 确认两个方向都已取消时用 `ConfigureWindow` 恢复。
+- `zoom`/`toggle_fullscreen` 在窗口映射前只记录请求，`map_window` 之后再发送。
+- `X11WindowState` 新增 `mapped`、`pending_zoom`、`pending_fullscreen`、
+  `restore_bounds`、`pending_restore` 五个字段。
 
 `crates/luban-app/src/window_registry.rs` 相应地把 X11 手动装饰窗口的
 装饰请求改为 `Client`；`crates/luban-app/src/main.rs` 保留映射后的
@@ -76,7 +92,12 @@
    （写入 `[2, 0, 0, 0, 0]` 并保持 `state.decorations = Server`），
    并把 `zoom` 的 `Toggle` 改为按 `state.maximized_vertical/horizontal`
    发送 `Add`/`Remove`（需要恢复 `WmHintPropertyState` 的 `Remove`/`Add` 变体）。
+   最大化补丁还需要：`X11WindowState` 的 `mapped`/`pending_zoom`/
+   `pending_fullscreen`/`restore_bounds`/`pending_restore` 字段、`map_window`
+   末尾发送暂存请求、`zoom` 发 `Remove` 前记录 `window_root_geometry`、
+   `set_wm_properties` 在确认取消最大化后按记录恢复几何。
    注意核对新版是否仍为“映射前调用 `request_decorations`”的顺序；
-   如果上游已改为映射前写入无边框 hint、或 `zoom` 已显式设置状态，
-   可删除对应补丁；两者都不再需要时删除 vendored 目录。
+   如果上游已改为映射前写入无边框 hint、或 `zoom` 已显式设置状态、
+   或上游已把映射前的状态请求延迟到 map 之后，可删除对应补丁；
+   都不再需要时删除 vendored 目录。
 4. 更新本 README 的校验和与版本号。
