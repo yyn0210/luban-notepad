@@ -146,11 +146,16 @@ pub fn window_options(
             title: Some("Luban Notepad".into()),
             ..TitleBar::title_bar_options()
         }),
-        window_decorations: Some(if manual_chrome {
-            WindowDecorations::Server
-        } else {
-            WindowDecorations::Client
-        }),
+        // All platforms request `Client` decorations. On X11 with manual
+        // chrome, the vendored gpui-pre-linux patch interprets that as "the
+        // app draws its own chrome": it writes the borderless
+        // `_MOTIF_WM_HINTS` *before* the window is mapped, so the window
+        // manager never draws a native titlebar (it used to flash for ~150ms
+        // until we rewrote the hint after mapping), and the platform still
+        // reports `Server` decorations so gpui-component adds no client-side
+        // shadow margin and the appearance is unchanged. Wayland/Windows/
+        // macOS handle `Client` natively as before.
+        window_decorations: Some(WindowDecorations::Client),
         window_background: if cfg!(target_os = "linux") && !manual_chrome {
             WindowBackgroundAppearance::Transparent
         } else {

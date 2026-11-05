@@ -163,9 +163,13 @@ fn parse_args() -> ParsedArgs {
 ///
 /// On X11, gpui-component's root view reserves a 20px transparent margin for a
 /// client-side shadow. Only a compositor can blend that margin; without one it
-/// is painted black. The window is therefore created with server decorations
-/// (no shadow margin) and its titlebar is removed through `_MOTIF_WM_HINTS`
-/// after creation. Wayland always composites, so it keeps client decorations.
+/// is painted black. The window therefore uses the vendored gpui-pre-linux
+/// patch semantics: the window is opened with a `Client` decorations request,
+/// which the patched X11 backend interprets as "the application draws its own
+/// chrome" — it writes the borderless `_MOTIF_WM_HINTS` *before* the window is
+/// mapped (so no native titlebar ever appears) while still reporting server
+/// decorations (so no shadow margin is reserved). Wayland always composites,
+/// so it keeps plain client decorations.
 fn manual_window_chrome() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -177,9 +181,12 @@ fn manual_window_chrome() -> bool {
     }
 }
 
-/// Remove the window-manager titlebar and border from the undecorated X11
-/// window, leaving the client area to the application-drawn titlebar. Returns
-/// whether the hint had to be written.
+/// Re-apply the borderless `_MOTIF_WM_HINTS` (`[2, 0, 0, 0, 0]`) on the X11
+/// window, leaving the client area to the application-drawn titlebar. The
+/// vendored gpui-pre-linux patch already writes this hint before the window is
+/// mapped, so this normally finds the property unchanged and writes nothing;
+/// it is kept as a fallback for window-manager restarts and unusual recovery
+/// paths. Returns whether the hint had to be written.
 #[cfg(target_os = "linux")]
 fn apply_borderless_hint(window: &Window) -> anyhow::Result<bool> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -220,8 +227,11 @@ fn apply_borderless_hint(window: &Window) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Remove the window-manager titlebar and keep it removed while the window
-/// manager finishes managing the freshly mapped window.
+/// Re-apply the borderless hint right after the window opens and keep it
+/// applied while the window manager settles. With the vendored gpui-pre-linux
+/// patch the hint is already in place before mapping, so this is a pure
+/// fallback (e.g. after a window-manager restart) and does not participate in
+/// the first-show timing.
 #[cfg(target_os = "linux")]
 pub(crate) fn remove_window_decorations(handle: AnyWindowHandle, cx: &mut App) {
     let _ = handle.update(cx, |_, window, _| match apply_borderless_hint(window) {
