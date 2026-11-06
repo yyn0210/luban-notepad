@@ -77,6 +77,15 @@
 作为窗口管理器重启等场景的兜底——补丁生效时它发现属性已是目标值，
 不做任何写入。
 
+### 3. `send_moveresize` 的 `_NET_WM_MOVERESIZE` 参数
+
+`PlatformWindow::start_window_move` / `start_window_resize` 通过
+`_NET_WM_MOVERESIZE` 把拖动交给窗口管理器，但上游把 `data.l[3]`（触发按钮）
+和 `data.l[4]`（来源）都写成 0，EWMH 中的含义是“键盘触发”。KWin 等窗口管理器
+因此认为它不是指针拖动，拖动期间改用非主题的兜底光标。补丁改为左键 `1` 和
+直接用户操作 `1`，拖动全程显示窗口管理器主题的调整大小光标。
+`scripts/window-resize-check.sh` 会验证四边/四角的光标样式以及拖动行为。
+
 ## 与上游版本的关系
 
 - vendored 源码与 `Cargo.lock` 锁定的 registry 版本 0.3.9 完全一致，

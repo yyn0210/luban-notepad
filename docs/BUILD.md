@@ -218,6 +218,22 @@ scripts/gui-integration.sh --require-display
 - `LUBAN_GUI_DISPLAY` 复用指定显示；默认总是启动私有 Xvfb，避免影响当前桌面。
 - `LUBAN_GUI_ARTIFACTS` 指定失败截图与日志目录；CI 在失败时上传该目录。
 
+### 窗口调整大小与光标检查（Xvfb + KWin）
+
+```bash
+sudo apt-get install -y xvfb xdotool kwin-x11
+scripts/window-resize-check.sh --require-display
+```
+
+手动装饰的 X11 窗口由应用自己提供调整热区。脚本在私有 Xvfb + KWin 中拖动
+四边和四角，断言窗口几何按方向变化；用 XFixes 读取悬停时的光标图像，断言
+四边/四角的调整光标彼此对应（左右相同、上下相同、两组对角线各自相同）且都
+不同于编辑区光标；再验证最大化后边缘拖动不改变窗口、还原后恢复原几何。
+需要 `kwin_x11`、`libXfixes` 和 `python3`（仅标准库 ctypes），缺少时默认跳过。
+
+- `LUBAN_BIN` 指定应用二进制，默认 `$CARGO_TARGET_DIR/debug/luban-notepad`。
+- `LUBAN_RESIZE_ARTIFACTS` 指定失败时复制应用日志的目录。
+
 ### 性能预算（夜间）
 
 ```bash

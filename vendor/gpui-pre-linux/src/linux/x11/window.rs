@@ -1085,8 +1085,14 @@ impl X11Window {
                 pointer.root_x as u32,
                 pointer.root_y as u32,
                 flag,
-                0, // Left mouse button
-                0,
+                // LUBAN PATCH (moveresize-button): EWMH defines data.l[3] as
+                // the mouse button that started the operation and data.l[4] as
+                // the source indication. Upstream sent 0/0, which means
+                // "initiated by the keyboard", so a window manager may not show
+                // its pointer-resize cursor. Both drags start with a primary
+                // button press.
+                1, // Left mouse button
+                1, // Direct user action
             ],
         );
         check_reply(
