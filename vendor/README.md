@@ -52,6 +52,13 @@
 - `request_decorations(Server)` 语义不变（窗口管理器装饰）。
 - 不触碰 Wayland 后端与其他任何模块。
 
+边框被完全移除后，KWin 也不再给这个窗口提供不可见的调整边框，鼠标拖动
+边缘无法改变窗口大小。应用侧因此在
+`crates/luban-app/src/app/mod.rs` 的 `client_decorated_frame` 里绘制四边
+（5px）和四角（8px）的透明调整热区，悬停时显示调整方向光标，按下后通过
+`_NET_WM_MOVERESIZE` 交给窗口管理器拖动调整；最大化时两者都不显示，全屏
+时只保留 1px 边框、不显示热区。
+
 ### 2. `PlatformWindow::zoom` / `toggle_fullscreen` / `map_window`
 
 - 窗口已同时最大化横向和纵向时发送 `Remove`（还原），否则发送 `Add`

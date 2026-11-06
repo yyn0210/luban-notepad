@@ -7560,6 +7560,7 @@ impl Render for LubanApp {
                 root.into_any_element(),
                 cx.theme().colors.border,
                 window.is_maximized(),
+                window.is_fullscreen(),
             );
         }
 
@@ -7567,23 +7568,128 @@ impl Render for LubanApp {
     }
 }
 
-/// Wrap a manually decorated Linux window in a hairline border. The window
-/// manager keeps its invisible resize border around the undecorated client, so
-/// the application only contributes the visible edge; a maximized window needs
-/// neither.
+/// Width of the invisible strip along every window edge that starts a resize.
 #[cfg(target_os = "linux")]
-fn client_decorated_frame(root: AnyElement, border: Hsla, maximized: bool) -> AnyElement {
+const CLIENT_RESIZE_BAND: Pixels = px(5.0);
+/// Side length of the corner resize hotspots; larger than the edge bands so
+/// diagonal resizing does not require pixel-perfect aim.
+#[cfg(target_os = "linux")]
+const CLIENT_RESIZE_CORNER: Pixels = px(8.0);
+
+/// Wrap a manually decorated Linux window in a hairline border and add the
+/// resize edges the window manager does not provide.
+///
+/// `_MOTIF_WM_HINTS` with `decorations = 0` makes KWin drop the native frame
+/// entirely, including the invisible resize border it puts around decorated
+/// windows, so dragging an edge does nothing on its own. The appended strips
+/// start a window-manager resize through `_NET_WM_MOVERESIZE`, the same path
+/// client-side decorations used before the hint was written pre-map. A
+/// maximized window gets neither the border nor the strips; a fullscreen
+/// window keeps the border but no strips, since a window manager ignores a
+/// resize request while fullscreen.
+#[cfg(target_os = "linux")]
+fn client_decorated_frame(
+    root: AnyElement,
+    border: Hsla,
+    maximized: bool,
+    fullscreen: bool,
+) -> AnyElement {
     if maximized {
         return root;
     }
 
-    div()
-        .size_full()
-        .overflow_hidden()
-        .border_1()
-        .border_color(border)
-        .child(root)
-        .into_any_element()
+    let mut frame = div().relative().size_full().overflow_hidden().child(
+        div()
+            .size_full()
+            .overflow_hidden()
+            .border_1()
+            .border_color(border)
+            .child(root),
+    );
+    if !fullscreen {
+        for edge in [
+            ResizeEdge::Top,
+            ResizeEdge::Bottom,
+            ResizeEdge::Left,
+            ResizeEdge::Right,
+            ResizeEdge::TopLeft,
+            ResizeEdge::TopRight,
+            ResizeEdge::BottomLeft,
+            ResizeEdge::BottomRight,
+        ] {
+            frame = frame.child(client_resize_handle(edge));
+        }
+    }
+    frame.into_any_element()
+}
+
+/// One invisible edge or corner that asks the window manager to resize the
+/// borderless window. Corners are added after the edges, so they win the
+/// overlap and resize on both axes.
+#[cfg(target_os = "linux")]
+fn client_resize_handle(edge: ResizeEdge) -> AnyElement {
+    let hit = div().absolute().bg(transparent_black()).on_mouse_down(
+        MouseButton::Left,
+        move |_, window, cx| {
+            if !window.is_resizable() {
+                return;
+            }
+            window.start_window_resize(edge);
+            cx.stop_propagation();
+        },
+    );
+
+    match edge {
+        ResizeEdge::Top => hit
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(CLIENT_RESIZE_BAND)
+            .cursor(CursorStyle::ResizeUpDown),
+        ResizeEdge::Bottom => hit
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(CLIENT_RESIZE_BAND)
+            .cursor(CursorStyle::ResizeUpDown),
+        ResizeEdge::Left => hit
+            .left_0()
+            .top_0()
+            .bottom_0()
+            .w(CLIENT_RESIZE_BAND)
+            .cursor(CursorStyle::ResizeLeftRight),
+        ResizeEdge::Right => hit
+            .right_0()
+            .top_0()
+            .bottom_0()
+            .w(CLIENT_RESIZE_BAND)
+            .cursor(CursorStyle::ResizeLeftRight),
+        ResizeEdge::TopLeft => hit
+            .top_0()
+            .left_0()
+            .w(CLIENT_RESIZE_CORNER)
+            .h(CLIENT_RESIZE_CORNER)
+            .cursor(CursorStyle::ResizeUpLeftDownRight),
+        ResizeEdge::TopRight => hit
+            .top_0()
+            .right_0()
+            .w(CLIENT_RESIZE_CORNER)
+            .h(CLIENT_RESIZE_CORNER)
+            .cursor(CursorStyle::ResizeUpRightDownLeft),
+        ResizeEdge::BottomLeft => hit
+            .bottom_0()
+            .left_0()
+            .w(CLIENT_RESIZE_CORNER)
+            .h(CLIENT_RESIZE_CORNER)
+            .cursor(CursorStyle::ResizeUpRightDownLeft),
+        ResizeEdge::BottomRight => hit
+            .bottom_0()
+            .right_0()
+            .w(CLIENT_RESIZE_CORNER)
+            .h(CLIENT_RESIZE_CORNER)
+            .cursor(CursorStyle::ResizeUpLeftDownRight),
+    }
+    .into_any_element()
 }
 
 /// One config directory for every `#[gpui::test]` in this binary:
