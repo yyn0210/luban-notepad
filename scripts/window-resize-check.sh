@@ -3,10 +3,12 @@
 #
 # The manually decorated window removes the window manager frame
 # (`_MOTIF_WM_HINTS` decorations=0), so the application draws its own invisible
-# resize strips. This script runs a private Xvfb + KWin session, drags every
-# edge and corner with xdotool and verifies both the resulting geometry and the
-# cursor XFixes reports while the pointer hovers each strip. It also checks
-# that a maximized window ignores edge drags and restores to its exact bounds.
+# resize strips and applies the drag itself. This script runs a private
+# Xvfb + KWin session, drags every edge and corner with xdotool and verifies the
+# resulting geometry and that the cursor stays the same resize cursor that was
+# shown while hovering (the window manager's single-sided edge cursor must not
+# take over during the drag). It also checks that a maximized window ignores
+# edge drags and restores to its exact bounds.
 #
 # Usage:
 #   scripts/window-resize-check.sh [--require-display]
@@ -30,7 +32,7 @@ for arg in "$@"; do
   case "$arg" in
     --require-display) REQUIRE_DISPLAY=1 ;;
     -h|--help)
-      sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -167,6 +169,7 @@ geometry() {
   eval "$(xdotool getwindowgeometry --shell "$WID")"
 }
 
+DRAG_CURSOR=""
 drag() {
   local sx=$1 sy=$2 dx=$3 dy=$4 step
   xdotool mousemove "$sx" "$sy"
@@ -177,6 +180,11 @@ drag() {
     xdotool mousemove $((sx + dx * step / 6)) $((sy + dy * step / 6))
     sleep 0.06
   done
+  # Sample the cursor while the button is still held: the application resizes
+  # the window itself, so the press-time resize cursor must stay visible for
+  # the whole drag instead of switching to the window manager's edge cursor.
+  sleep 0.25
+  DRAG_CURSOR="$(cursor_sig)"
   xdotool mouseup 1
   sleep 0.5
 }
@@ -293,10 +301,12 @@ before_w=$WIDTH
 drag $((X + WIDTH - 2)) $((Y + HEIGHT / 2)) 90 0
 geometry
 [ "$WIDTH" -gt "$before_w" ] || fail "dragging the right edge did not widen the window"
+assert_equal "the right-edge drag cursor" "$DRAG_CURSOR" "$right"
 echo "window-resize-check: right edge ${before_w} -> $WIDTH"
 
 before_h=$HEIGHT
 drag $((X + WIDTH / 2)) $((Y + HEIGHT - 2)) 0 70
+assert_equal "the bottom-edge drag cursor" "$DRAG_CURSOR" "$bottom"
 geometry
 [ "$HEIGHT" -gt "$before_h" ] || fail "dragging the bottom edge did not grow the window"
 echo "window-resize-check: bottom edge ${before_h} -> $HEIGHT"
@@ -304,6 +314,7 @@ echo "window-resize-check: bottom edge ${before_h} -> $HEIGHT"
 before_x=$X
 before_w=$WIDTH
 drag $((X + 2)) $((Y + HEIGHT / 2)) -60 0
+assert_equal "the left-edge drag cursor" "$DRAG_CURSOR" "$left"
 geometry
 [ "$X" -lt "$before_x" ] || fail "dragging the left edge did not move the window left"
 [ "$WIDTH" -gt "$before_w" ] || fail "dragging the left edge did not widen the window"
@@ -314,6 +325,7 @@ before_y=$Y
 before_w=$WIDTH
 before_h=$HEIGHT
 drag $((X + 2)) $((Y + 2)) 50 40
+assert_equal "the top-left corner drag cursor" "$DRAG_CURSOR" "$top_left"
 geometry
 [ "$X" -gt "$before_x" ] || fail "dragging the top-left corner did not move the window right"
 [ "$Y" -gt "$before_y" ] || fail "dragging the top-left corner did not move the window down"

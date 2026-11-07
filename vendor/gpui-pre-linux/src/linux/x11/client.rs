@@ -1034,7 +1034,7 @@ impl X11Client {
                 }
             }
             Event::ConfigureNotify(event) => {
-                let bounds = Bounds {
+                let bounds: Bounds<i32> = Bounds {
                     origin: Point {
                         x: event.x.into(),
                         y: event.y.into(),
@@ -1307,6 +1307,7 @@ impl X11Client {
             }
             Event::XinputButtonRelease(event) => {
                 let window = self.get_window(event.event)?;
+                window.finish_client_resize();
                 let mut state = self.0.borrow_mut();
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1332,6 +1333,16 @@ impl X11Client {
             }
             Event::XinputMotion(event) => {
                 let window = self.get_window(event.event)?;
+                // LUBAN PATCH (client-resize): the button press gives this
+                // client an implicit pointer grab, so these events keep coming
+                // while the application resizes the window itself.
+                if window.is_client_resizing() {
+                    // XI2 motion coordinates are FP1616: convert to pixels.
+                    let to_px = |value: i32| (value as f64 / f64::from(u16::MAX)).round() as i16;
+                    window
+                        .client_resize_motion(to_px(event.root_x), to_px(event.root_y))
+                        .log_err();
+                }
                 let mut state = self.0.borrow_mut();
                 state.restore_cursor_after_hide();
                 if window.is_blocked() {

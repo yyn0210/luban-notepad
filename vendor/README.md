@@ -37,7 +37,8 @@
 
 ## 补丁内容
 
-仅修改 `src/linux/x11/window.rs`：
+修改 `src/linux/x11/window.rs`，并在 `src/linux/x11/client.rs` 中接入应用侧
+拖动的 XInput2 事件（第 3 条）：
 
 ### 1. `PlatformWindow::request_decorations`
 
@@ -55,9 +56,9 @@
 边框被完全移除后，KWin 也不再给这个窗口提供不可见的调整边框，鼠标拖动
 边缘无法改变窗口大小。应用侧因此在
 `crates/luban-app/src/app/mod.rs` 的 `client_decorated_frame` 里绘制四边
-（5px）和四角（8px）的透明调整热区，悬停时显示调整方向光标，按下后通过
-`_NET_WM_MOVERESIZE` 交给窗口管理器拖动调整；最大化时两者都不显示，全屏
-时只保留 1px 边框、不显示热区。
+（5px）和四角（8px）的透明调整热区，悬停时显示调整方向光标，按下后由应用
+自己跟踪拖动（见第 3 条）；最大化时两者都不显示，全屏时只保留 1px 边框、
+不显示热区。
 
 ### 2. `PlatformWindow::zoom` / `toggle_fullscreen` / `map_window`
 
@@ -77,14 +78,33 @@
 作为窗口管理器重启等场景的兜底——补丁生效时它发现属性已是目标值，
 不做任何写入。
 
-### 3. `send_moveresize` 的 `_NET_WM_MOVERESIZE` 参数
+### 3. `start_window_resize` 由应用自己跟踪拖动
 
-`PlatformWindow::start_window_move` / `start_window_resize` 通过
-`_NET_WM_MOVERESIZE` 把拖动交给窗口管理器，但上游把 `data.l[3]`（触发按钮）
-和 `data.l[4]`（来源）都写成 0，EWMH 中的含义是“键盘触发”。KWin 等窗口管理器
-因此认为它不是指针拖动，拖动期间改用非主题的兜底光标。补丁改为左键 `1` 和
-直接用户操作 `1`，拖动全程显示窗口管理器主题的调整大小光标。
-`scripts/window-resize-check.sh` 会验证四边/四角的光标样式以及拖动行为。
+`PlatformWindow::start_window_resize` 原本把整个调整手势交给窗口管理器
+（`_NET_WM_MOVERESIZE`）。窗口管理器在拖动期间持有指针并绘制它自己的边缘
+光标：KWin 会显示 `right_side`/`e-resize` 一类的**单向**光标，在 Deepin 默认
+的 `bloom` 主题里看起来只是一个箭头，于是悬停时应用绘制的双向调整光标在按下
+的瞬间消失。
+
+补丁改为：
+
+- `start_window_resize` 记录按下位置和窗口的根窗口几何，不再发送
+  `_NET_WM_MOVERESIZE`；指针事件来自按键本身给客户端的隐式抓取
+  （XInput2 `XinputMotion`/`XinputButtonRelease`），所以应用不需要额外抓取
+  指针。
+- 每次移动把新的绝对几何（含左/上边缘带来的位置变化）通过
+  `_NET_MOVERESIZE_WINDOW`（gravity=StaticGravity，flags 指定 x/y/宽/高，
+  source=应用）交给窗口管理器——客户端窗口被窗口管理器重新挂载到框架窗口
+  里，直接 `ConfigureWindow` 只会移动框架内的客户端，不会移动屏幕上的窗口。
+- 按下、移动、松开全程不改变光标：悬停时应用设置的双向/对角调整光标保持
+  到拖动结束；窗口边缘跟随指针，热区始终在指针下方。
+- 查询指针或几何失败时回退到原来的 `_NET_WM_MOVERESIZE` 路径。
+
+`send_moveresize` 的 `_NET_WM_MOVERESIZE` 参数补丁保留（回退路径和
+`start_window_move` 仍使用它）：`data.l[3]` 触发按钮写左键 `1`、`data.l[4]`
+来源写直接用户操作 `1`，避免窗口管理器把拖动当成键盘触发而使用兜底光标。
+`scripts/window-resize-check.sh` 会同时验证四边/四角的几何变化和“拖动期间
+光标与悬停光标一致”。
 
 ## 与上游版本的关系
 
@@ -112,6 +132,13 @@
    `pending_fullscreen`/`restore_bounds`/`pending_restore` 字段、`map_window`
    末尾发送暂存请求、`zoom` 发 `Remove` 前记录 `window_root_geometry`、
    `set_wm_properties` 在确认取消最大化后按记录恢复几何。
+   应用侧拖动补丁需要：`X11WindowState` 的 `client_resize` 字段、
+   `start_window_resize` 记录几何并跳过 `_NET_WM_MOVERESIZE`、
+   `X11WindowStatePtr::client_resize_motion`（按拖动边计算几何并发送
+   `_NET_MOVERESIZE_WINDOW`，需要 `XcbAtoms` 增加该原子）、
+   `X11WindowStatePtr::finish_client_resize`，以及 `client.rs` 中
+   `XinputMotion`/`XinputButtonRelease` 分支（XI2 坐标是 FP1616，需除以
+   65535 换成像素）。
    注意核对新版是否仍为“映射前调用 `request_decorations`”的顺序；
    如果上游已改为映射前写入无边框 hint、或 `zoom` 已显式设置状态、
    或上游已把映射前的状态请求延迟到 map 之后，可删除对应补丁；
