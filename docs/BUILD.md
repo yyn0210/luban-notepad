@@ -229,8 +229,10 @@ scripts/window-resize-check.sh --require-display
 四边和四角，断言窗口几何按方向变化；用 XFixes 读取悬停时的光标图像，断言
 四边/四角的调整光标彼此对应（左右相同、上下相同、两组对角线各自相同）且都
 不同于编辑区光标；再断言拖动期间（按键仍按住时）的光标与悬停光标完全一致，
-并验证最大化后边缘拖动不改变窗口、还原后恢复原几何。需要 `kwin_x11`、
-`libXfixes` 和 `python3`（仅标准库 ctypes），缺少时默认跳过。
+快速按下并拖动以按下位置为锚点，按住时按下/松开其他鼠标键不中断拖动，缩到
+最小尺寸时对边保持不动，并验证最大化后边缘拖动不改变窗口、还原后恢复原
+几何。需要 `kwin_x11`、`libXfixes` 和 `python3`（仅标准库 ctypes），缺少时
+默认跳过。
 
 - `LUBAN_BIN` 指定应用二进制，默认 `$CARGO_TARGET_DIR/debug/luban-notepad`。
 - `LUBAN_RESIZE_ARTIFACTS` 指定失败时复制应用日志的目录。

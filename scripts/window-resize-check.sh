@@ -7,8 +7,10 @@
 # Xvfb + KWin session, drags every edge and corner with xdotool and verifies the
 # resulting geometry and that the cursor stays the same resize cursor that was
 # shown while hovering (the window manager's single-sided edge cursor must not
-# take over during the drag). It also checks that a maximized window ignores
-# edge drags and restores to its exact bounds.
+# take over during the drag). It also checks that a fast press-and-drag anchors
+# at the press position, that a maximized window ignores edge drags and
+# restores to its exact bounds, and that shrinking past the minimum size keeps
+# the opposite edge pinned.
 #
 # Usage:
 #   scripts/window-resize-check.sh [--require-display]
@@ -32,7 +34,8 @@ for arg in "$@"; do
   case "$arg" in
     --require-display) REQUIRE_DISPLAY=1 ;;
     -h|--help)
-      sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' \
+        "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -295,6 +298,19 @@ assert_equal "the top-left and bottom-right resize cursors" "$top_left" "$bottom
 assert_equal "the top-right and bottom-left resize cursors" "$top_right" "$bottom_left"
 echo "window-resize-check: cursor styles ok"
 
+# --- the drag anchors at the exact press, not at a later pointer query -----
+# Press and move in one xdotool invocation so the motion is already queued
+# when the application handles the press. Anchoring via QueryPointer would
+# observe the moved position and lose the whole delta.
+geometry
+before_w=$WIDTH
+xdotool mousemove $((X + WIDTH - 2)) $((Y + HEIGHT / 2)) sleep 0.3 \
+  mousedown 1 mousemove_relative -- 20 0 sleep 0.3 mouseup 1
+sleep 0.5
+geometry
+assert_eq_num "the fast press-and-drag width" "$WIDTH" "$((before_w + 20))"
+echo "window-resize-check: fast press-and-drag ${before_w} -> $WIDTH"
+
 # --- edge and corner drags -------------------------------------------------
 geometry
 before_w=$WIDTH
@@ -333,6 +349,33 @@ geometry
 [ "$HEIGHT" -lt "$before_h" ] || fail "dragging the top-left corner did not shorten the window"
 echo "window-resize-check: top-left corner $before_x,$before_y ${before_w}x${before_h} -> $X,$Y ${WIDTH}x${HEIGHT}"
 
+# --- a second button must not end the drag ---------------------------------
+geometry
+before_w=$WIDTH
+edge_x=$((X + WIDTH - 2))
+[ "$edge_x" -lt "$SCREEN_W" ] || edge_x=$((SCREEN_W - 1))
+edge_y=$((Y + HEIGHT / 2))
+xdotool mousemove "$edge_x" "$edge_y"
+sleep 0.3
+xdotool mousedown 1
+sleep 0.2
+xdotool mousemove $((edge_x - 40)) "$edge_y"
+sleep 0.3
+# Press and release the right button while the primary button is still down:
+# the implicit grab lasts until every button is released, so the drag must
+# survive this and apply the remaining motion.
+xdotool mousedown 3
+sleep 0.15
+xdotool mouseup 3
+sleep 0.15
+xdotool mousemove $((edge_x - 100)) "$edge_y"
+sleep 0.3
+xdotool mouseup 1
+sleep 0.5
+geometry
+assert_eq_num "the width after the second-button drag" "$WIDTH" "$((before_w - 100))"
+echo "window-resize-check: second button does not end the drag ${before_w} -> $WIDTH"
+
 # --- maximize suppresses edge resizing, restore returns the bounds --------
 geometry
 restore_x=$X restore_y=$Y restore_w=$WIDTH restore_h=$HEIGHT
@@ -362,5 +405,21 @@ echo "window-resize-check: restored to ${restore_w}x${restore_h}"
 center=$(cursor_at $((X + WIDTH / 2)) $((Y + HEIGHT / 2)))
 right=$(cursor_at $((X + WIDTH - 2)) $((Y + HEIGHT / 2)))
 assert_changed "the resize cursor after restoring" "$center" "$right"
+
+# --- minimum size clamps ---------------------------------------------------
+# Drag the left edge past the right edge: the width clamps at the minimum and
+# the right edge must stay where it was. The same for the top edge.
+geometry
+right_edge=$((X + WIDTH))
+bottom_edge=$((Y + HEIGHT))
+drag $((X + 2)) $((Y + HEIGHT / 2)) "$SCREEN_W" 0
+geometry
+assert_eq_num "the minimum window width" "$WIDTH" 160
+assert_eq_num "the right edge after the width clamp" $((X + WIDTH)) "$right_edge"
+drag $((X + WIDTH / 2)) $((Y + 2)) 0 "$SCREEN_H"
+geometry
+assert_eq_num "the minimum window height" "$HEIGHT" 100
+assert_eq_num "the bottom edge after the height clamp" $((Y + HEIGHT)) "$bottom_edge"
+echo "window-resize-check: minimum size clamps ok"
 
 echo "window-resize-check: ok"

@@ -88,17 +88,30 @@
 
 补丁改为：
 
-- `start_window_resize` 记录按下位置和窗口的根窗口几何，不再发送
+- XInput2 的 `XinputButtonPress` 把按下的根窗口坐标（FP1616 转像素）记录到
+  `X11WindowState::press_position`；`start_window_resize` 以它为拖动锚点，
+  不再用 `QueryPointer` 查询——查询是一次往返，快速按下并拖动时已经能看到
+  指针移动，起始位移会丢失。没有按下记录时仍回退到查询。
+- `start_window_resize` 记录窗口的根窗口几何后不再发送
   `_NET_WM_MOVERESIZE`；指针事件来自按键本身给客户端的隐式抓取
   （XInput2 `XinputMotion`/`XinputButtonRelease`），所以应用不需要额外抓取
   指针。
+- 按下时把该边的调整光标直接写到窗口（`pin_window_cursor`），并在拖动期间
+  忽略应用的光标样式请求：悬停命中测试与拖动使用同一批移动事件，几何由
+  窗口管理器异步应用，快速拖动时光标可能短暂落在编辑区上，不忽略就会在
+  拖动中途变回文本光标。
 - 每次移动把新的绝对几何（含左/上边缘带来的位置变化）通过
   `_NET_MOVERESIZE_WINDOW`（gravity=StaticGravity，flags 指定 x/y/宽/高，
   source=应用）交给窗口管理器——客户端窗口被窗口管理器重新挂载到框架窗口
   里，直接 `ConfigureWindow` 只会移动框架内的客户端，不会移动屏幕上的窗口。
-- 按下、移动、松开全程不改变光标：悬停时应用设置的双向/对角调整光标保持
-  到拖动结束；窗口边缘跟随指针，热区始终在指针下方。
-- 查询指针或几何失败时回退到原来的 `_NET_WM_MOVERESIZE` 路径。
+  拖动左/上边缘缩小到最小尺寸（160×100 物理像素）时固定对边。
+- 松开时只有**最后一个**按住的鼠标键抬起才结束拖动：按住期间再按下并松开
+  其他键（例如右键）时隐式抓取仍在，拖动继续。移动事件的按键掩码为空说明
+  抓取已被其他客户端（例如菜单）夺走，此时直接结束拖动，避免之后无按键的
+  移动继续改窗口大小。
+- 最大化/全屏窗口直接忽略（窗口管理器本来就不响应）。启动时检查根窗口的
+  `_NET_SUPPORTED` 是否声明了 `_NET_MOVERESIZE_WINDOW`；未声明、或查询
+  指针/几何失败时回退到原来的 `_NET_WM_MOVERESIZE` 路径。
 
 `send_moveresize` 的 `_NET_WM_MOVERESIZE` 参数补丁保留（回退路径和
 `start_window_move` 仍使用它）：`data.l[3]` 触发按钮写左键 `1`、`data.l[4]`
@@ -132,13 +145,16 @@
    `pending_fullscreen`/`restore_bounds`/`pending_restore` 字段、`map_window`
    末尾发送暂存请求、`zoom` 发 `Remove` 前记录 `window_root_geometry`、
    `set_wm_properties` 在确认取消最大化后按记录恢复几何。
-   应用侧拖动补丁需要：`X11WindowState` 的 `client_resize` 字段、
-   `start_window_resize` 记录几何并跳过 `_NET_WM_MOVERESIZE`、
-   `X11WindowStatePtr::client_resize_motion`（按拖动边计算几何并发送
-   `_NET_MOVERESIZE_WINDOW`，需要 `XcbAtoms` 增加该原子）、
-   `X11WindowStatePtr::finish_client_resize`，以及 `client.rs` 中
-   `XinputMotion`/`XinputButtonRelease` 分支（XI2 坐标是 FP1616，需除以
-   65535 换成像素）。
+   应用侧拖动补丁需要：`X11WindowState` 的 `client_resize` 与 `press_position`
+   字段、`remember_press_position`、`start_window_resize` 记录几何并跳过
+   `_NET_WM_MOVERESIZE`、`X11WindowStatePtr::client_resize_motion`（按拖动边
+   计算几何并发送 `_NET_MOVERESIZE_WINDOW`，需要 `XcbAtoms` 增加该原子）、
+   `finish_client_resize`、`resize_edge_cursor`、`pin_window_cursor`、
+   `atom_supported`（检查 `_NET_SUPPORTED`），以及 `client.rs` 中
+   `XinputButtonPress` 记录按下坐标、`XinputMotion`/`XinputButtonRelease`
+   分支（XI2 坐标是 FP1616，需除以 65535 换成像素；松开只在最后一个按键
+   抬起时结束，无按键的移动结束失效的拖动）和 `set_cursor_style` 在拖动期间
+   跳过光标切换。
    注意核对新版是否仍为“映射前调用 `request_decorations`”的顺序；
    如果上游已改为映射前写入无边框 hint、或 `zoom` 已显式设置状态、
    或上游已把映射前的状态请求延迟到 map 之后，可删除对应补丁；

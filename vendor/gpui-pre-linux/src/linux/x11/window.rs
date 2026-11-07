@@ -3,12 +3,12 @@ use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
 use gpui::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
-    px,
+    AnyWindowHandle, Bounds, CursorStyle, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs,
+    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge,
+    ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
+    popup::PopupNotSupportedError, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -33,6 +33,7 @@ use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
+use super::client::atom_supported;
 use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
 
 x11rb::atom_manager! {
@@ -134,6 +135,78 @@ struct ClientResize {
     origin_y: i16,
     width: u16,
     height: u16,
+}
+
+/// Root geometry produced by dragging `resize` by `(dx, dy)` physical pixels.
+///
+/// The result is `(x, y, width, height)`. Dragging the left or top edge moves
+/// the origin and keeps the opposite edge pinned; the size never shrinks below
+/// the minimum. Keeping this separate from the X11 calls puts the sign and
+/// clamp handling for all eight directions in one place.
+fn client_resize_geometry(resize: &ClientResize, dx: i32, dy: i32) -> (i32, i32, i32, i32) {
+    let mut x = i32::from(resize.origin_x);
+    let mut y = i32::from(resize.origin_y);
+    let mut width = i32::from(resize.width);
+    let mut height = i32::from(resize.height);
+
+    let left = matches!(
+        resize.edge,
+        ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
+    );
+    let right = matches!(
+        resize.edge,
+        ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight
+    );
+    let top = matches!(
+        resize.edge,
+        ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight
+    );
+    let bottom = matches!(
+        resize.edge,
+        ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight
+    );
+
+    if left {
+        x += dx;
+        width -= dx;
+    } else if right {
+        width += dx;
+    }
+    if top {
+        y += dy;
+        height -= dy;
+    } else if bottom {
+        height += dy;
+    }
+
+    let min_width = i32::from(MIN_CLIENT_RESIZE_WIDTH);
+    let min_height = i32::from(MIN_CLIENT_RESIZE_HEIGHT);
+    if width < min_width {
+        // Keep the opposite (right) edge where it was.
+        if left {
+            x -= min_width - width;
+        }
+        width = min_width;
+    }
+    if height < min_height {
+        // Keep the opposite (bottom) edge where it was.
+        if top {
+            y -= min_height - height;
+        }
+        height = min_height;
+    }
+
+    (x, y, width, height)
+}
+
+/// Cursor for `edge`, matching what the resize strip shows while hovered.
+fn resize_edge_cursor(edge: ResizeEdge) -> CursorStyle {
+    match edge {
+        ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+        ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+    }
 }
 
 #[derive(Debug)]
@@ -326,6 +399,12 @@ pub struct X11WindowState {
     pending_restore: bool,
     /// Active resize drag handled by the application (see [`ClientResize`]).
     client_resize: Option<ClientResize>,
+    /// Root position of the last button press, in physical pixels.
+    ///
+    /// A client-side resize starts while its press is being dispatched and
+    /// anchors its deltas here. Querying the pointer instead would add a round
+    /// trip that can already observe motion from a fast press-and-drag.
+    press_position: Option<(i16, i16)>,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
@@ -891,6 +970,7 @@ impl X11WindowState {
                 restore_bounds: None,
                 pending_restore: false,
                 client_resize: None,
+                press_position: None,
                 maximized_vertical: false,
                 maximized_horizontal: false,
                 hidden: false,
@@ -1139,12 +1219,43 @@ impl X11Window {
 
     /// Starts an application-side resize drag for `edge`.
     fn start_client_resize(&self, edge: ResizeEdge) -> anyhow::Result<()> {
-        let x_root_window = self.0.state.borrow().x_root_window;
+        let x_root_window = {
+            let state = self.0.state.borrow();
+            // Window managers ignore a resize request for a maximized or
+            // fullscreen window, so do the same instead of accumulating a drag
+            // that can never apply its geometry.
+            if state.fullscreen || (state.maximized_vertical && state.maximized_horizontal) {
+                return Ok(());
+            }
+            // `_NET_MOVERESIZE_WINDOW` is how the application applies absolute
+            // geometry without handing the pointer to the window manager. If
+            // the window manager does not advertise it, report the failure so
+            // `start_window_resize` can use the `_NET_WM_MOVERESIZE` path.
+            if !atom_supported(
+                &self.0.xcb,
+                &state.atoms,
+                state.x_root_window,
+                state.atoms._NET_MOVERESIZE_WINDOW,
+            ) {
+                anyhow::bail!("the window manager does not advertise _NET_MOVERESIZE_WINDOW");
+            }
+            state.x_root_window
+        };
 
-        let pointer = get_reply(
-            || "X11 QueryPointer before client-side resize failed.",
-            self.0.xcb.query_pointer(self.0.x_window),
-        )?;
+        // The application calls this while dispatching the button press, so
+        // the recorded press is the exact anchor. Fall back to a query for
+        // callers that start the drag some other way.
+        let press_position = self.0.state.borrow_mut().press_position.take();
+        let (press_x, press_y) = match press_position {
+            Some(position) => position,
+            None => {
+                let pointer = get_reply(
+                    || "X11 QueryPointer before client-side resize failed.",
+                    self.0.xcb.query_pointer(self.0.x_window),
+                )?;
+                (pointer.root_x, pointer.root_y)
+            }
+        };
         let geometry = get_reply(
             || "X11 GetGeometry before client-side resize failed.",
             self.0.xcb.get_geometry(self.0.x_window),
@@ -1158,13 +1269,23 @@ impl X11Window {
 
         self.0.state.borrow_mut().client_resize = Some(ClientResize {
             edge,
-            press_x: pointer.root_x,
-            press_y: pointer.root_y,
+            press_x,
+            press_y,
             origin_x: translated.dst_x,
             origin_y: translated.dst_y,
             width: geometry.width,
             height: geometry.height,
         });
+
+        // Pin the cursor the drag started with. Hover hit-testing keeps running
+        // on the motion events that drive the resize and would otherwise
+        // replace it whenever the asynchronous geometry update lags behind a
+        // fast drag; the client ignores app cursor requests while
+        // `client_resize` is set.
+        let client = self.0.state.borrow().client.clone();
+        if let Some(client) = client.get_client() {
+            client.pin_window_cursor(self.0.x_window, resize_edge_cursor(edge));
+        }
 
         xcb_flush(&self.0.xcb);
         Ok(())
@@ -1172,6 +1293,11 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    /// Records where the most recent button press landed on the root window.
+    pub(crate) fn remember_press_position(&self, root_x: i16, root_y: i16) {
+        self.state.borrow_mut().press_position = Some((root_x, root_y));
+    }
+
     /// Whether an application-side resize drag is in progress.
     pub(crate) fn is_client_resizing(&self) -> bool {
         self.state.borrow().client_resize.is_some()
@@ -1186,56 +1312,7 @@ impl X11WindowStatePtr {
 
         let dx = i32::from(root_x - resize.press_x);
         let dy = i32::from(root_y - resize.press_y);
-        let mut x = i32::from(resize.origin_x);
-        let mut y = i32::from(resize.origin_y);
-        let mut width = i32::from(resize.width);
-        let mut height = i32::from(resize.height);
-
-        let left = matches!(
-            resize.edge,
-            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
-        );
-        let right = matches!(
-            resize.edge,
-            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight
-        );
-        let top = matches!(
-            resize.edge,
-            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight
-        );
-        let bottom = matches!(
-            resize.edge,
-            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight
-        );
-
-        if left {
-            x += dx;
-            width -= dx;
-        } else if right {
-            width += dx;
-        }
-        if top {
-            y += dy;
-            height -= dy;
-        } else if bottom {
-            height += dy;
-        }
-
-        let min_width = i32::from(MIN_CLIENT_RESIZE_WIDTH);
-        let min_height = i32::from(MIN_CLIENT_RESIZE_HEIGHT);
-        if width < min_width {
-            if left {
-                x -= min_width - width;
-            }
-            width = min_width;
-        }
-        if height < min_height {
-            if top {
-                y -= min_height - height;
-            }
-            height = min_height;
-        }
-
+        let (x, y, width, height) = client_resize_geometry(&resize, dx, dy);
         // The client window is reparented into a window-manager frame, so a raw
         // ConfigureWindow would move it inside that frame instead of moving the
         // window on screen. `_NET_MOVERESIZE_WINDOW` applies an absolute
@@ -1260,15 +1337,19 @@ impl X11WindowStatePtr {
                 height as u32,
             ],
         );
-        check_reply(
-            || "X11 _NET_MOVERESIZE_WINDOW during client-side resize failed.",
-            self.xcb.send_event(
+        // This runs for every pointer motion. Queue the client message and
+        // flush instead of checking the request: `check_reply` would wait for
+        // the server on every motion and serialize the drag with it. The root
+        // window and the supported atom were validated when the drag started,
+        // so a protocol error here is not actionable.
+        self.xcb
+            .send_event(
                 false,
                 x_root_window,
                 xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
                 message,
-            ),
-        )?;
+            )
+            .map_err(handle_connection_error)?;
         xcb_flush(&self.xcb);
         Ok(())
     }

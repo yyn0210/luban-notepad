@@ -1230,6 +1230,15 @@ impl X11Client {
             }
             Event::XinputButtonPress(event) => {
                 let window = self.get_window(event.event)?;
+                // LUBAN PATCH (client-resize): remember the exact press
+                // position before dispatching the event. A resize started by
+                // this press anchors its deltas here instead of querying the
+                // pointer, which is a round trip that can already observe
+                // motion from a fast press-and-drag.
+                window.remember_press_position(
+                    fp1616_to_px(event.root_x),
+                    fp1616_to_px(event.root_y),
+                );
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_xinput_info(event.mods);
@@ -1307,7 +1316,19 @@ impl X11Client {
             }
             Event::XinputButtonRelease(event) => {
                 let window = self.get_window(event.event)?;
-                window.finish_client_resize();
+                // LUBAN PATCH (client-resize): only the release of the last
+                // held button ends the drag. A second button can be pressed
+                // and released while the initiating button is still down; the
+                // implicit pointer grab, and with it the drag, lasts until
+                // every button is up. `button_mask` reports the state around
+                // this event, so masking out the released button leaves the
+                // buttons that are still held.
+                let released = 1u32
+                    .checked_shl(event.detail.saturating_sub(1))
+                    .unwrap_or(0);
+                if event.button_mask.first().copied().unwrap_or(0) & !released == 0 {
+                    window.finish_client_resize();
+                }
                 let mut state = self.0.borrow_mut();
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1337,15 +1358,25 @@ impl X11Client {
                 // client an implicit pointer grab, so these events keep coming
                 // while the application resizes the window itself.
                 if window.is_client_resizing() {
-                    // XI2 motion coordinates are FP1616: convert to pixels.
-                    let to_px = |value: i32| (value as f64 / f64::from(u16::MAX)).round() as i16;
-                    window
-                        .client_resize_motion(to_px(event.root_x), to_px(event.root_y))
-                        .log_err();
+                    if event.button_mask.first().copied().unwrap_or(0) == 0 {
+                        // No button is held: the implicit grab ended without a
+                        // release reaching us (another client took the pointer,
+                        // for example a menu). Stop before this motion resizes
+                        // the window with no button down.
+                        window.finish_client_resize();
+                    } else {
+                        window
+                            .client_resize_motion(
+                                fp1616_to_px(event.root_x),
+                                fp1616_to_px(event.root_y),
+                            )
+                            .log_err();
+                    }
                 }
+                let is_client_resizing = window.is_client_resizing();
                 let mut state = self.0.borrow_mut();
                 state.restore_cursor_after_hide();
-                if window.is_blocked() {
+                if window.is_blocked() && !is_client_resizing {
                     // We want to set the cursor to the default arrow
                     // when the window is blocked
                     let style = CursorStyle::Arrow;
@@ -1767,6 +1798,19 @@ impl X11Client {
         let Some(focused_window) = state.mouse_focused_window else {
             return;
         };
+
+        // LUBAN PATCH (client-resize): while the application drives a resize
+        // drag, hover hit-testing must not replace the cursor pinned at press
+        // time. The geometry request reaches the window manager asynchronously,
+        // so a fast drag can put the pointer over the editor for a frame.
+        if state
+            .windows
+            .get(&focused_window)
+            .is_some_and(|window| window.window.is_client_resizing())
+        {
+            return;
+        }
+
         let current_style = state
             .cursor_styles
             .get(&focused_window)
@@ -1798,6 +1842,38 @@ impl X11Client {
             || "Failed to set cursor style",
             state.xcb_connection.change_window_attributes(
                 focused_window,
+                &ChangeWindowAttributesAux {
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+            ),
+        )
+        .log_err();
+        state.xcb_connection.flush().log_err();
+    }
+
+    /// Applies `style` to `x_window` and records it as the window's cursor.
+    ///
+    /// Unlike [`Self::set_cursor_style`], this ignores the blocked-window and
+    /// no-change checks: it pins the resize cursor when an application-side
+    /// resize starts, and that cursor must stay until the drag ends.
+    pub(crate) fn pin_window_cursor(&self, x_window: xproto::Window, style: CursorStyle) {
+        let mut state = self.0.borrow_mut();
+        state.cursor_styles.insert(x_window, style);
+
+        // Don't clobber the invisible cursor; restore reads back from `cursor_styles`.
+        if state.cursor_hidden_window == Some(x_window) {
+            return;
+        }
+
+        let Some(cursor) = state.get_cursor_icon(style) else {
+            return;
+        };
+
+        check_reply(
+            || "Failed to pin the window cursor",
+            state.xcb_connection.change_window_attributes(
+                x_window,
                 &ChangeWindowAttributesAux {
                     cursor: Some(cursor),
                     ..Default::default()
@@ -2356,6 +2432,21 @@ fn check_gtk_frame_extents_supported(
     atoms: &XcbAtoms,
     root: xproto::Window,
 ) -> bool {
+    atom_supported(xcb_connection, atoms, root, atoms._GTK_FRAME_EXTENTS)
+}
+
+/// Whether the window manager lists `atom` in the root window's
+/// `_NET_SUPPORTED` property.
+///
+/// Protocol paths that are only useful when the running window manager
+/// implements them (`_GTK_FRAME_EXTENTS`, `_NET_MOVERESIZE_WINDOW`) check this
+/// instead of relying on the atom merely existing.
+pub(crate) fn atom_supported(
+    xcb_connection: &XCBConnection,
+    atoms: &XcbAtoms,
+    root: xproto::Window,
+    atom: u32,
+) -> bool {
     let Some(supported_atoms) = get_reply(
         || "Failed to get _NET_SUPPORTED",
         xcb_connection.get_property(
@@ -2371,13 +2462,16 @@ fn check_gtk_frame_extents_supported(
         return false;
     };
 
-    let supported_atom_ids: Vec<u32> = supported_atoms
+    supported_atoms
         .value
         .chunks_exact(4)
         .filter_map(|chunk| chunk.try_into().ok().map(u32::from_ne_bytes))
-        .collect();
+        .any(|supported| supported == atom)
+}
 
-    supported_atom_ids.contains(&atoms._GTK_FRAME_EXTENTS)
+/// Converts an XI2 FP1616 coordinate to whole pixels.
+fn fp1616_to_px(value: i32) -> i16 {
+    (value as f64 / f64::from(u16::MAX)).round() as i16
 }
 
 fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {
