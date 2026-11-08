@@ -294,6 +294,7 @@ impl LubanApp {
         for id in &closed_ids {
             self.cancel_diff_for_tab(*id);
         }
+        let active_before = self.tabs.get(self.active).map(|tab| tab.id);
         self.tabs.clear();
         self.active = 0;
         self.active_group = 0;
@@ -304,6 +305,12 @@ impl LubanApp {
             self.resolve_wait_for_tab(id, cx);
         }
         self.new_file(window, cx);
+        // Close All lands on a fresh untitled document — same active-document
+        // change the last-tab close reports (identity guard mirrors
+        // close_tab_at_inner).
+        if self.tabs.get(self.active).map(|tab| tab.id) != active_before {
+            self.emit_active_document_changed(cx);
+        }
     }
 
     pub fn request_exit(&mut self, window: &mut Window, cx: &mut Context<Self>) {

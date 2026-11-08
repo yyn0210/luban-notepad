@@ -88,7 +88,16 @@ impl LubanApp {
             }
             // Menu, keybinding and CLI paths launch commands without args;
             // panel clicks carry args through run_command_with_args instead.
-            let ok = self.run_plugin_command(&plugin_id, &entry, id, None, 0, window, cx);
+            let ok = self.run_plugin_command(
+                &plugin_id,
+                &entry,
+                id,
+                None,
+                0,
+                luban_plugin::runtime::CallContextKind::User,
+                window,
+                cx,
+            );
             if ok {
                 if let Some(before) = recording_before {
                     // Plugin commands are recorded even when they only update

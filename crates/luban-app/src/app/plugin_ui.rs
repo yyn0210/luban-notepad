@@ -87,6 +87,13 @@ impl LubanApp {
         })
     }
 
+    /// Run one plugin command. `context_kind` is the context the command runs
+    /// in: `User` for user-initiated runs (palette, menu, keybinding, CLI,
+    /// panel click), or the requesting call's own kind when a plugin requested
+    /// this command via `HostAction::RunCommand` — context inheritance down
+    /// the chain, so a nested command from `on_edit` inherits the read-only
+    /// Edit contract and one from an event inherits Event (spec §6's cascade
+    /// philosophy applied to the chain, not just direct calls).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_plugin_command(
         &mut self,
@@ -95,6 +102,7 @@ impl LubanApp {
         command_id: &str,
         args: Option<serde_json::Value>,
         command_depth: u8,
+        context_kind: luban_plugin::runtime::CallContextKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -113,7 +121,7 @@ impl LubanApp {
             settings,
             allowed_roots: self.plugin_allowed_roots(),
             command_depth,
-            context_kind: luban_plugin::runtime::CallContextKind::User,
+            context_kind,
         };
         let Some(call) = self
             .plugin_host
@@ -128,7 +136,7 @@ impl LubanApp {
             );
             return false;
         };
-        self.apply_plugin_call(plugin_id, call, window, cx)
+        self.apply_plugin_call(plugin_id, call, context_kind, window, cx)
     }
 
     /// True while any plugin-originated call's actions are being applied.
@@ -143,11 +151,15 @@ impl LubanApp {
     /// write-back point for every `HostAction` the runtime emits from a
     /// command, event or timer call, so depth bookkeeping and the
     /// status/error contract stay uniform. Panel renders keep their own
-    /// read-only action match.
+    /// read-only action match. `context_kind` is the kind the call ran with;
+    /// plugin-requested `command.run` actions inherit it unchanged so the
+    /// Edit contract (read-only) and the Event contract (cascade-suppressed,
+    /// mutable) travel down the whole chain.
     pub(super) fn apply_plugin_call(
         &mut self,
         plugin_id: &str,
         call: luban_plugin::runtime::RuntimeCall<()>,
+        context_kind: luban_plugin::runtime::CallContextKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -216,7 +228,14 @@ impl LubanApp {
                         }
                     }
                     luban_plugin::runtime::HostAction::RunCommand { id, args, depth } => {
-                        ok &= this.apply_run_command_action(&id, args, depth, window, cx);
+                        ok &= this.apply_run_command_action(
+                            &id,
+                            args,
+                            depth,
+                            context_kind,
+                            window,
+                            cx,
+                        );
                     }
                 }
             }
@@ -255,6 +274,7 @@ impl LubanApp {
         id: &str,
         args: Option<serde_json::Value>,
         depth: u8,
+        context_kind: luban_plugin::runtime::CallContextKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -266,6 +286,11 @@ impl LubanApp {
             }
             crate::plugin_host::RunCommandRoute::Plugin => {
                 // route_run_command classified this id as a plugin command.
+                // The nested command inherits the requesting call's context
+                // kind, so an `on_edit`-spawned command stays read-only and an
+                // event-spawned one stays cascade-suppressed — the write
+                // feedback loop (on_edit → command.run → edit → on_edit) is
+                // broken at the chain, not just at direct dispatches.
                 let command = plugin_command.expect("route promised a plugin command");
                 self.run_plugin_command(
                     &command.plugin_id,
@@ -273,6 +298,7 @@ impl LubanApp {
                     id,
                     args,
                     depth,
+                    context_kind,
                     window,
                     cx,
                 )
@@ -284,9 +310,14 @@ impl LubanApp {
                 // A built-in id routed here has no plugin command behind it
                 // (plugin-first routing above), but keep the suppression
                 // guard up while it runs. Accepted residual: macro playback
-                // replays recorded ids through `run_command` at the ambient
-                // depth, but recording is user-driven and out of plugin
-                // reach.
+                // (`command.run('macro.play-last')`) replays user-recorded ids
+                // through `run_command` at the ambient depth AND with the
+                // ambient User document context, so an `on_edit` handler could
+                // replay user-recorded edits. Harming this requires a
+                // user-recorded, non-idempotent macro and recording is
+                // user-driven and out of plugin reach, so the residual is
+                // accepted rather than threading the kind through the
+                // built-in executor.
                 self.raise_event_depth_during(|this| this.run_command(id, window, cx))
             }
             crate::plugin_host::RunCommandRoute::NotFound => {
@@ -313,7 +344,16 @@ impl LubanApp {
             }
             return self.run_command(id, window, cx);
         };
-        self.run_plugin_command(&command.plugin_id, &command.entry, id, args, 0, window, cx)
+        self.run_plugin_command(
+            &command.plugin_id,
+            &command.entry,
+            id,
+            args,
+            0,
+            luban_plugin::runtime::CallContextKind::User,
+            window,
+            cx,
+        )
     }
 
     /// Move the active document's cursor to a 1-based line/column. Mirrors

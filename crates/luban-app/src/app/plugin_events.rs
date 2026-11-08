@@ -27,8 +27,13 @@
 //! contract (`plugin_document_snapshot`) never exposes huge, partial-range,
 //! large-file, non-text or read-only documents, so those events would carry no
 //! payload; `open_path_at`'s already-open goto jump; split-group focus
-//! switches; diff-completion activation; session/tab restore; new untitled
-//! documents. Plugins that need those transitions can watch `on_edit`.
+//! switches; drag-tab-into-group activation (`move_tab_by_id`); navigation
+//! history activation (`apply_navigation_entry`); diff-completion activation;
+//! session/tab restore; new untitled documents (except via last-tab close and
+//! Close All). Plugins that need those transitions can watch `on_edit`.
+//!
+//! Events are only queued while at least one active plugin listens for the
+//! event's name, so the common no-plugins session pays nothing for emissions.
 //!
 //! # Pump start
 //!
@@ -38,7 +43,10 @@
 //! active, and `plugin_pump_started` is only set when the spawn actually
 //! happens, so a reload that installs the first runtime (re)tries. The
 //! windowless `reload_plugins_now` (background store completions) cannot
-//! spawn the pump; the next windowed reload or restart does.
+//! spawn the pump; the next windowed reload or restart does. A pump whose
+//! last runtime disappears parks itself: the tick task breaks and resets the
+//! flag, so an app without plugins costs zero ticks and the next windowed
+//! reload restarts the pump.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -123,6 +131,17 @@ pub(super) enum PluginEvent {
     ActiveDocumentChanged(Option<luban_plugin::runtime::DocumentSnapshot>),
 }
 
+impl PluginEvent {
+    /// Manifest event name this payload dispatches as.
+    fn event_name(&self) -> &'static str {
+        match self {
+            PluginEvent::DocumentOpened(_) => "on_document_open",
+            PluginEvent::DocumentSaved(_) => "on_document_save",
+            PluginEvent::ActiveDocumentChanged(_) => "on_active_document_changed",
+        }
+    }
+}
+
 pub(super) const PUMP_TICK: Duration = Duration::from_millis(50);
 pub(super) const MAX_DISPATCHES_PER_TICK: usize = 8;
 pub(super) const EDIT_STABLE_AFTER: Duration = Duration::from_millis(150);
@@ -139,11 +158,23 @@ impl LubanApp {
 
     /// Queue one app event for the pump. Suppressed while a plugin-originated
     /// call's actions are being applied (spec §6): a plugin's write-backs must
-    /// not cascade back into the plugin that caused them.
+    /// not cascade back into the plugin that caused them. The suppression
+    /// check runs first; second, the event is dropped when no active plugin
+    /// listens for its name — emission would otherwise clone a full document
+    /// snapshot per event for nobody.
     pub(super) fn plugin_emit(&mut self, event: PluginEvent) {
         if self.plugin_in_event_context() {
             return;
         }
+        if self.plugin_host.listeners_of(event.event_name()).is_empty() {
+            return;
+        }
+        self.plugin_enqueue(event);
+    }
+
+    /// Cap-and-push one event into the queue without any gating (the
+    /// gate-free mechanics behind [`Self::plugin_emit`]).
+    fn plugin_enqueue(&mut self, event: PluginEvent) {
         if self.plugin_event_queue.len() >= MAX_QUEUED_PLUGIN_EVENTS {
             self.plugin_event_queue.pop_front();
             log::debug!("plugin event queue full; dropped the oldest event");
@@ -191,11 +222,13 @@ impl LubanApp {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(PUMP_TICK).await;
-                if this
+                // Err: the app is gone. Ok(false): the pump parked itself (no
+                // runtimes and nothing queued) — the next windowed reload with
+                // a runtime restarts it. Either way the task is done.
+                if !this
                     .update_in(cx, |app, window, cx| app.plugin_pump_tick(window, cx))
-                    .is_err()
+                    .is_ok_and(|keep| keep)
                 {
-                    // The app is gone; stop the pump.
                     break;
                 }
             }
@@ -206,17 +239,30 @@ impl LubanApp {
     /// One pump tick: drain queued events within the dispatch budget, then the
     /// (coalesced) `on_edit` debounce, then due timers, then quarantine
     /// enforcement — the failure counters were recorded inside the dispatches
-    /// above, so a failure during this tick counts.
-    fn plugin_pump_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = Instant::now();
+    /// above, so a failure during this tick counts. Returns false to make the
+    /// pump task park (no active runtime and nothing queued), true to keep
+    /// ticking.
+    fn plugin_pump_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let active_ids = self.plugin_host.active_plugin_ids();
+        if active_ids.is_empty() && self.plugin_event_queue.is_empty() {
+            // Park: without a runtime nothing can be dispatched, queued or
+            // timed (timers live in runtimes). Reset the flag so the next
+            // windowed reload with a runtime spawns the pump again.
+            self.plugin_pump_started = false;
+            return false;
+        }
         let mut budget = MAX_DISPATCHES_PER_TICK;
         self.dispatch_queued_plugin_events(&mut budget, window, cx);
+        // Re-capture the clock: a heavy dispatch stage must not shrink the
+        // effective stability window of this tick's debounce decision.
+        let now = Instant::now();
         let generation = self.plugin_edit_generation();
         if self.plugin_edit_debouncer.poll(generation, now) {
             self.dispatch_plugin_edit(&mut budget, window, cx);
         }
-        self.fire_due_plugin_timers(&mut budget, now, window, cx);
-        self.enforce_plugin_quarantine(window, cx);
+        self.fire_due_plugin_timers(&active_ids, &mut budget, now, window, cx);
+        self.enforce_plugin_quarantine(&active_ids, window, cx);
+        true
     }
 
     /// Dispatch queued events until the budget runs out. An event whose
@@ -233,19 +279,11 @@ impl LubanApp {
             let Some(mut queued) = self.plugin_event_queue.pop_front() else {
                 break;
             };
-            let (name, snapshot): (
-                &'static str,
-                Option<luban_plugin::runtime::DocumentSnapshot>,
-            ) = match &queued.event {
-                PluginEvent::DocumentOpened(snapshot) => {
-                    ("on_document_open", Some(snapshot.clone()))
-                }
-                PluginEvent::DocumentSaved(snapshot) => {
-                    ("on_document_save", Some(snapshot.clone()))
-                }
-                PluginEvent::ActiveDocumentChanged(snapshot) => {
-                    ("on_active_document_changed", snapshot.clone())
-                }
+            let name = queued.event.event_name();
+            let snapshot: Option<luban_plugin::runtime::DocumentSnapshot> = match &queued.event {
+                PluginEvent::DocumentOpened(snapshot) => Some(snapshot.clone()),
+                PluginEvent::DocumentSaved(snapshot) => Some(snapshot.clone()),
+                PluginEvent::ActiveDocumentChanged(snapshot) => snapshot.clone(),
             };
             let listeners = self.plugin_host.listeners_of(name);
             let total = listeners.len();
@@ -263,7 +301,13 @@ impl LubanApp {
                     continue;
                 };
                 self.raise_event_depth_during(|app| {
-                    app.apply_plugin_call(plugin_id, call, window, cx)
+                    app.apply_plugin_call(
+                        plugin_id,
+                        call,
+                        luban_plugin::runtime::CallContextKind::Event,
+                        window,
+                        cx,
+                    )
                 });
                 *budget -= 1;
                 delivered += 1;
@@ -289,28 +333,25 @@ impl LubanApp {
         for plugin_id in self.plugin_host.listeners_of(NAME) {
             // on_edit is about the document being edited right now: build the
             // snapshot fresh at dispatch time. The Edit context kind makes the
-            // runtime enforce document read-only (spec §6).
-            let input = luban_plugin::runtime::CallInput {
-                plugin: luban_plugin::runtime::PluginIdentity {
-                    id: plugin_id.clone(),
-                    version: self
-                        .plugin_host
-                        .manifest(&plugin_id)
-                        .map(|manifest| manifest.version.clone())
-                        .unwrap_or_default(),
-                    data_dir: self.plugin_host.root.join(&plugin_id).join("data"),
-                },
-                document: self.plugin_document_snapshot(cx),
-                settings: self.plugin_host.settings_for(&plugin_id),
-                allowed_roots: self.plugin_allowed_roots(),
-                command_depth: 0,
-                context_kind: luban_plugin::runtime::CallContextKind::Edit,
-            };
+            // runtime enforce document read-only (spec §6), and nested
+            // `command.run` actions inherit it so a handler cannot mutate the
+            // document through a chained command either.
+            let input = self.plugin_fresh_input(
+                &plugin_id,
+                cx,
+                luban_plugin::runtime::CallContextKind::Edit,
+            );
             let Some(call) = self.plugin_host.dispatch_event(&plugin_id, NAME, input) else {
                 continue;
             };
             self.raise_event_depth_during(|app| {
-                app.apply_plugin_call(&plugin_id, call, window, cx)
+                app.apply_plugin_call(
+                    &plugin_id,
+                    call,
+                    luban_plugin::runtime::CallContextKind::Edit,
+                    window,
+                    cx,
+                )
             });
             *budget = budget.saturating_sub(1);
         }
@@ -318,16 +359,18 @@ impl LubanApp {
 
     /// Fire every timer that is due, within the remaining budget. Timers left
     /// over wait for the next tick — `due_timer_ids` recomputes, so nothing is
-    /// lost.
+    /// lost. `active_ids` is the tick's snapshot; a stale id whose runtime
+    /// vanished mid-tick degrades to an empty timer list.
     fn fire_due_plugin_timers(
         &mut self,
+        active_ids: &[String],
         budget: &mut usize,
         now: Instant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for plugin_id in self.plugin_host.active_plugin_ids() {
-            let ids = self.plugin_host.due_timer_ids(&plugin_id, now);
+        for plugin_id in active_ids {
+            let ids = self.plugin_host.due_timer_ids(plugin_id, now);
             if ids.is_empty() {
                 continue;
             }
@@ -335,8 +378,12 @@ impl LubanApp {
                 if *budget == 0 {
                     return;
                 }
-                let input = self.plugin_timer_input(&plugin_id, cx);
-                match self.plugin_host.fire_timer(&plugin_id, &id, input) {
+                let input = self.plugin_fresh_input(
+                    plugin_id,
+                    cx,
+                    luban_plugin::runtime::CallContextKind::Event,
+                );
+                match self.plugin_host.fire_timer(plugin_id, &id, input) {
                     // None: no runtime (vanished mid-batch). Some(Err):
                     // unknown timer id, vanished mid-batch — a benign skip,
                     // no failure counted.
@@ -345,7 +392,13 @@ impl LubanApp {
                     }
                     Some(Ok(call)) => {
                         self.raise_event_depth_during(|app| {
-                            app.apply_plugin_call(&plugin_id, call, window, cx)
+                            app.apply_plugin_call(
+                                plugin_id,
+                                call,
+                                luban_plugin::runtime::CallContextKind::Event,
+                                window,
+                                cx,
+                            )
                         });
                         *budget -= 1;
                     }
@@ -359,13 +412,18 @@ impl LubanApp {
     /// reached the quarantine threshold. Mirrors the Plugins-manager disable
     /// flow: update `disabled_plugins`, keep the global snapshot in sync,
     /// persist and reload. Runs after this tick's dispatches so a failure that
-    /// just happened counts.
-    fn enforce_plugin_quarantine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let due: Vec<String> = self
-            .plugin_host
-            .active_plugin_ids()
-            .into_iter()
+    /// just happened counts. `active_ids` is the tick's snapshot (captured
+    /// before the dispatch stages).
+    fn enforce_plugin_quarantine(
+        &mut self,
+        active_ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let due: Vec<String> = active_ids
+            .iter()
             .filter(|id| self.plugin_host.quarantine_due(id))
+            .cloned()
             .collect();
         if due.is_empty() {
             return;
@@ -430,12 +488,15 @@ impl LubanApp {
         }
     }
 
-    /// Build the dispatch input for one plugin's timer: fresh active-document
-    /// snapshot, Event context (timers are not read-only, unlike `on_edit`).
-    fn plugin_timer_input(
+    /// Build the dispatch input for one plugin from the document state right
+    /// now (fresh active-document snapshot, active-document allowed roots).
+    /// Used by the `on_edit` stage (`context_kind` Edit — read-only) and the
+    /// timer stage (`context_kind` Event).
+    fn plugin_fresh_input(
         &self,
         plugin_id: &str,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
+        context_kind: luban_plugin::runtime::CallContextKind,
     ) -> luban_plugin::runtime::CallInput {
         luban_plugin::runtime::CallInput {
             plugin: luban_plugin::runtime::PluginIdentity {
@@ -451,7 +512,7 @@ impl LubanApp {
             settings: self.plugin_host.settings_for(plugin_id),
             allowed_roots: self.plugin_allowed_roots(),
             command_depth: 0,
-            context_kind: luban_plugin::runtime::CallContextKind::Event,
+            context_kind,
         }
     }
 }
@@ -593,10 +654,14 @@ mod pump_tests {
         }
     }
 
-    /// `plugin_emit` queues outside a plugin event context and is suppressed
-    /// while one is active (spec §6 cascade suppression).
+    /// `plugin_emit` drops events when no active plugin listens for the
+    /// event's name (the gate keeps full-text snapshot clones off the queue
+    /// when nobody is listening), and the suppression check runs before the
+    /// gate. With `safe_mode` there are no runtimes, so no listener can be
+    /// injected headlessly — queue-side behavior under real listeners is
+    /// exercised by the Task 16 smoke tests.
     #[gpui::test]
-    fn plugin_emit_suppressed_in_event_context(cx: &mut gpui::TestAppContext) {
+    fn plugin_emit_gates_on_listeners(cx: &mut gpui::TestAppContext) {
         let _guard = test_lock();
         test_config_dir();
         cx.update(gpui_kit::init);
@@ -606,23 +671,26 @@ mod pump_tests {
                 // safe_mode loaded no runtimes, so the pump has not started;
                 // it starts lazily on the first windowed reload with one.
                 assert!(!app.plugin_pump_started);
-                // Outside an event context events queue up.
+                // No listener for any of the three event names: dropped.
                 app.plugin_emit(PluginEvent::DocumentOpened(snapshot("a")));
-                assert_eq!(app.plugin_event_queue.len(), 1);
-                // Inside one, emission is suppressed entirely.
-                app.plugin_event_depth = 1;
                 app.plugin_emit(PluginEvent::DocumentSaved(snapshot("a")));
-                assert_eq!(app.plugin_event_queue.len(), 1);
-                app.plugin_event_depth = 0;
                 app.plugin_emit(PluginEvent::ActiveDocumentChanged(None));
-                assert_eq!(app.plugin_event_queue.len(), 2);
+                assert!(app.plugin_event_queue.is_empty());
+                // Inside an event context emission is suppressed outright
+                // (checked before the listeners gate — same outcome here).
+                app.plugin_event_depth = 1;
+                app.plugin_emit(PluginEvent::DocumentOpened(snapshot("a")));
+                assert!(app.plugin_event_queue.is_empty());
+                app.plugin_event_depth = 0;
+                assert!(!app.plugin_in_event_context());
             });
         });
     }
 
     /// The queue caps itself by dropping the oldest event, so a session
     /// without a running pump cannot grow the queue without bound (every
-    /// queued open/save carries a full document snapshot).
+    /// queued open/save carries a full document snapshot). Driven through the
+    /// gate-free enqueue to observe the mechanics directly.
     #[gpui::test]
     fn plugin_event_queue_caps_and_drops_the_oldest(cx: &mut gpui::TestAppContext) {
         let _guard = test_lock();
@@ -632,10 +700,10 @@ mod pump_tests {
         cx.update(|_window, cx| {
             app.update(cx, |app, _cx| {
                 for index in 0..MAX_QUEUED_PLUGIN_EVENTS {
-                    app.plugin_emit(PluginEvent::DocumentOpened(snapshot(&format!("f{index}"))));
+                    app.plugin_enqueue(PluginEvent::DocumentOpened(snapshot(&format!("f{index}"))));
                 }
                 assert_eq!(app.plugin_event_queue.len(), MAX_QUEUED_PLUGIN_EVENTS);
-                app.plugin_emit(PluginEvent::DocumentSaved(snapshot("new")));
+                app.plugin_enqueue(PluginEvent::DocumentSaved(snapshot("new")));
                 assert_eq!(app.plugin_event_queue.len(), MAX_QUEUED_PLUGIN_EVENTS);
                 // The oldest event was dropped; the newest is at the back.
                 let back = app.plugin_event_queue.back().unwrap();
@@ -647,6 +715,45 @@ mod pump_tests {
                     }
                     other => panic!("unexpected front event: {other:?}"),
                 }
+            });
+        });
+    }
+
+    /// A plugin-requested `command.run` targeting a built-in still runs from an
+    /// Edit ambient: the inherited kind constrains plugin document APIs (the
+    /// runtime rejects them — see luban-plugin's
+    /// `document_mutations_are_read_only_in_edit_context`), not the built-in
+    /// executor. The built-in/macro residual is documented on
+    /// `apply_run_command_action`. Exercises the refactored
+    /// `apply_plugin_call` signature end-to-end within headless reach.
+    #[gpui::test]
+    fn nested_run_command_from_edit_context_still_runs_builtins(cx: &mut gpui::TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let before = app.tabs.len();
+                let call = luban_plugin::runtime::RuntimeCall {
+                    output: luban_plugin::runtime::RuntimeOutput {
+                        actions: vec![luban_plugin::runtime::HostAction::RunCommand {
+                            id: "file.new".to_string(),
+                            args: None,
+                            depth: 0,
+                        }],
+                    },
+                    value: Some(()),
+                    error: None,
+                };
+                assert!(app.apply_plugin_call(
+                    "test-plugin",
+                    call,
+                    luban_plugin::runtime::CallContextKind::Edit,
+                    window,
+                    cx,
+                ));
+                assert_eq!(app.tabs.len(), before + 1);
             });
         });
     }
