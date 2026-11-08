@@ -880,7 +880,7 @@ mod tests {
             &[],
             r#"local M = {}
             function M.activate(ctx)
-                luban.timer.after("t1", 100, function(ctx) M.fired = (M.fired or 0) + 1 end)
+                luban.timer.after("t1", 10000, function(ctx) M.fired = (M.fired or 0) + 1 end)
             end
             function M.run(ctx) luban.notify(tostring(M.fired or 0)) end
             return M"#,
@@ -888,10 +888,12 @@ mod tests {
         let mut host = host_from(dir.path());
         let input = host_input(&host, "timer");
         let now = Instant::now();
-        // The activation registered the one-shot timer "t1" with a 100 ms delay.
+        // The activation registered the one-shot timer "t1" with a 10 s delay:
+        // far beyond any activation→now skew, so the not-due assertion cannot
+        // race the clock.
         assert!(host.due_timer_ids("timer", now).is_empty());
         assert_eq!(
-            host.due_timer_ids("timer", now + Duration::from_millis(1000)),
+            host.due_timer_ids("timer", now + Duration::from_millis(10_000)),
             ["t1".to_string()]
         );
         // A plugin without a runtime reports no timers and dispatches nothing.
@@ -913,7 +915,7 @@ mod tests {
         // The one-shot timer is gone after firing. An unknown id is a benign
         // Err for the caller (no failure recorded), not a panic.
         assert!(host
-            .due_timer_ids("timer", now + Duration::from_millis(2000))
+            .due_timer_ids("timer", now + Duration::from_millis(11_000))
             .is_empty());
         assert!(host
             .fire_timer("timer", "t1", input.clone())

@@ -660,6 +660,10 @@ impl PluginRuntime {
     /// handler does not stop the remaining ones — the first failure is
     /// surfaced and the whole dispatch counts as one quarantine step.
     ///
+    /// A dispatch with zero registered handlers is a no-op the plugin never
+    /// observes: it returns success without recording an outcome, so it
+    /// neither bumps nor resets the quarantine counter.
+    ///
     /// The handler list is a snapshot taken before the dispatch starts:
     /// handlers registered during the dispatch — including by the handlers
     /// themselves — do not fire in it, and handlers removed during it still
@@ -674,9 +678,12 @@ impl PluginRuntime {
             .cloned()
             .unwrap_or_default();
         if handlers.is_empty() {
-            // A no-op dispatch is still a successful dispatch: it resets the
-            // consecutive-failure counter like any other success.
-            self.record_outcome(true);
+            // A dispatch with zero registered handlers is a no-op the plugin
+            // never observes: it returns success but records no outcome, so
+            // it can neither bump nor reset the quarantine counter. With the
+            // host dispatching by manifest declaration, a plugin that declares
+            // an event but never registers a handler would otherwise be made
+            // unquarantinable by every such dispatch.
             return RuntimeCall {
                 output: RuntimeOutput::default(),
                 value: Some(()),
@@ -3861,7 +3868,7 @@ mod tests {
     }
 
     #[test]
-    fn events_dispatch_with_no_handlers_resets_failures() {
+    fn events_dispatch_with_no_handlers_records_no_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = write_events_plugin(
             dir.path(),
@@ -3880,13 +3887,14 @@ mod tests {
         let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
         assert!(!call.is_ok());
         assert_eq!(runtime.consecutive_failures(), 1);
-        // A dispatch with no registered handlers is a successful (no-op)
-        // dispatch and resets the consecutive-failure counter like any other
-        // success.
+        // A dispatch with no registered handlers is a no-op the plugin never
+        // observes: it succeeds but records no outcome, so the seeded failure
+        // must survive it (otherwise manifest-declared events without
+        // handlers would keep the plugin from ever quarantining).
         let call = runtime.dispatch_event("on_document_open", input(&manifest, dir.path()));
         assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
         assert!(call.output.actions.is_empty());
-        assert_eq!(runtime.consecutive_failures(), 0);
+        assert_eq!(runtime.consecutive_failures(), 1);
     }
 
     // ---- timers (spec §9) ----
