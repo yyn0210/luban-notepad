@@ -1762,6 +1762,13 @@ git add -A && git commit -m "release: plugins 2.0.0 for host api_version 2"
   5. `MAX_COMMAND_DEPTH` 升为 pub（Task 11 执行器跨 crate 使用）。
   6. Task 11 注意事项：连续 `SetDocumentText` 动作可合并（last-wins 语义不变），
      执行器可做收敛以限制单分发 Rust 内存放大。
+  7. Task 10 修订：级联抑制升级为**上下文继承**——`command.run` 嵌套调用继承
+     当前分发的 context_kind（Event/Edit/User），on_edit 链上的嵌套命令同样只读，
+     从根上切断 `on_edit → command.run → 改文档 → on_edit` 反馈环；formatter-on-save
+     （Event 继承 Event）仍合法。泵空闲（无插件且队列空）自停泊；事件发射按
+     listeners 预检；close_all_now 补充 ActiveDocumentChanged。
+  8. 延期后续项（记 ROADMAP/优化清单）：DocumentSnapshot.text 改 `Arc<str>`
+     （消除事件负载整段克隆）；面板点击重投递逻辑的单元测试抽取。
 - **已知风险**：Task 4 的 `mlua::Function` 存储依赖既有 `error_handler` 字段先例，
   若编译器报生命周期错误，按 `plugin: Table` 同款处理（值持 Rc 句柄）；Task 10
   泵 spawn 点需 `window`，从 `reload_plugins(window, cx)`（有 window）与
