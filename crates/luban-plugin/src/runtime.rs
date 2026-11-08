@@ -31,6 +31,8 @@ const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
 const MAX_PANEL_ACTION_COMMAND_BYTES: usize = 128;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
+/// Maximum length for plugin-supplied resource ids (panels, commands).
+const MAX_ID_BYTES: usize = 128;
 // Bounds for the v2 call context and host action surface; the still-unused
 // ones are consumed by upcoming v2 API tasks (event dispatch, timers, panel
 // command args).
@@ -737,7 +739,7 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
     json.set(
         "encode",
         lua.create_function(move |lua, value: Value| {
-            let value = lua_to_json(&value).map_err(mlua::Error::RuntimeError)?;
+            let value = lua_to_json(&value, 0).map_err(mlua::Error::RuntimeError)?;
             let text = serde_json::to_string(&value)
                 .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
             Ok(Value::String(lua.create_string(&text)?))
@@ -829,8 +831,13 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         "set",
         lua.create_function(move |_, (key, value): (String, Value)| {
             let mut state = set_setting_state.borrow_mut();
-            let json = lua_to_json(&value).map_err(mlua::Error::RuntimeError)?;
+            let json = lua_to_json(&value, 0).map_err(mlua::Error::RuntimeError)?;
             validate_setting(&state, &key, json.clone()).map_err(mlua::Error::RuntimeError)?;
+            // Optimistic same-dispatch readback: the host applies SetSetting
+            // only after the call returns, but spec §5 promises that a
+            // read-after-write sees the new value immediately. The host apply
+            // self-corrects any divergence on the next dispatch.
+            state.settings.insert(key.clone(), json.clone());
             state
                 .actions
                 .push(HostAction::SetSetting { key, value: json });
@@ -851,7 +858,7 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
                 )));
             }
             state.actions.push(HostAction::SetStatus { id, text });
-            Ok(Value::Boolean(true))
+            Ok(())
         })?,
     )?;
     luban.set("status", status)?;
@@ -883,23 +890,19 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
     panel.set(
         "open",
         lua.create_function(move |_, id: String| {
-            if id.is_empty() || id.len() > 128 {
-                return Err(mlua::Error::RuntimeError("invalid panel id".into()));
-            }
+            validate_resource_id(&id, "panel")?;
             panel_state
                 .borrow_mut()
                 .actions
                 .push(HostAction::OpenPanel { id });
-            Ok(Value::Boolean(true))
+            Ok(())
         })?,
     )?;
     let refresh_state = state.clone();
     panel.set(
         "refresh",
         lua.create_function(move |_, id: String| {
-            if id.is_empty() || id.len() > 128 {
-                return Err(mlua::Error::RuntimeError("invalid panel id".into()));
-            }
+            validate_resource_id(&id, "panel")?;
             refresh_state
                 .borrow_mut()
                 .actions
@@ -953,7 +956,7 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
                 resolve_allowed_path(&state, &path, true).map_err(mlua::Error::RuntimeError)?;
             luban_core::atomic_write::write_atomic(&path, text.as_bytes())
                 .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
-            Ok(Value::Boolean(true))
+            Ok(())
         })?,
     )?;
     luban.set("fs", fs)?;
@@ -977,12 +980,10 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
     command.set(
         "run",
         lua.create_function(move |_, (id, args): (String, Option<Value>)| {
-            if id.is_empty() || id.len() > 128 {
-                return Err(mlua::Error::RuntimeError("invalid command id".into()));
-            }
+            validate_resource_id(&id, "command")?;
             let mut state = run_state.borrow_mut();
             let args = match args {
-                Some(value) => Some(lua_to_json(&value).map_err(mlua::Error::RuntimeError)?),
+                Some(value) => Some(lua_to_json(&value, 0).map_err(mlua::Error::RuntimeError)?),
                 None => None,
             };
             let depth = state.command_depth.saturating_add(1);
@@ -1039,6 +1040,14 @@ fn validate_setting(state: &CallState, key: &str, value: JsonValue) -> Result<()
         .ok_or_else(|| format!("setting '{key}' is not declared"))?;
     if !crate::manifest::setting_value_is_valid(schema, &value) {
         return Err(format!("invalid value for setting '{key}'"));
+    }
+    Ok(())
+}
+
+/// Validate a plugin-supplied resource id (panel or command).
+fn validate_resource_id(id: &str, what: &str) -> mlua::Result<()> {
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
+        return Err(mlua::Error::RuntimeError(format!("invalid {what} id")));
     }
     Ok(())
 }
@@ -1195,7 +1204,15 @@ fn resolve_allowed_path(state: &CallState, path: &str, write: bool) -> Result<Pa
     Ok(resolved)
 }
 
-fn lua_to_json(value: &Value) -> Result<JsonValue, String> {
+/// Recursion limit for Lua→JSON conversion; mirrors serde_json's own nesting
+/// limit. `Table::pairs` executes no VM instructions, so the instruction hook
+/// and the Lua memory limit cannot stop a cyclic table — only this guard can.
+const MAX_JSON_DEPTH: usize = 128;
+
+fn lua_to_json(value: &Value, depth: usize) -> Result<JsonValue, String> {
+    if depth > MAX_JSON_DEPTH {
+        return Err("value nesting is too deep".to_string());
+    }
     match value {
         Value::Nil => Ok(JsonValue::Null),
         Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
@@ -1207,16 +1224,16 @@ fn lua_to_json(value: &Value) -> Result<JsonValue, String> {
             .to_str()
             .map(|text| JsonValue::String(text.to_string()))
             .map_err(|error| format!("string is not valid UTF-8: {error}")),
-        Value::Table(table) => table_to_json(table),
+        Value::Table(table) => table_to_json(table, depth),
         _ => Err("value cannot be encoded as JSON".to_string()),
     }
 }
 
-fn table_to_json(table: &Table) -> Result<JsonValue, String> {
+fn table_to_json(table: &Table, depth: usize) -> Result<JsonValue, String> {
     let mut entries = Vec::new();
     for pair in table.clone().pairs::<Value, Value>() {
         let (key, value) = pair.map_err(|error| format!("cannot read Lua table: {error}"))?;
-        entries.push((key, lua_to_json(&value)?));
+        entries.push((key, lua_to_json(&value, depth + 1)?));
     }
     if entries.is_empty() {
         return Ok(JsonValue::Object(Map::new()));
@@ -1702,7 +1719,7 @@ mod tests {
             dir.path(),
             r#"return {
                 run = function(ctx)
-                    assert(luban.fs.write(ctx.plugin.data_dir .. "/state.txt", "hello"))
+                    luban.fs.write(ctx.plugin.data_dir .. "/state.txt", "hello")
                     assert(luban.fs.read(ctx.plugin.data_dir .. "/state.txt") == "hello")
                 end,
                 escape = function(ctx)
@@ -1908,7 +1925,7 @@ mod tests {
             dir.path(),
             r#"return {
                 run = function(ctx)
-                    assert(luban.panel.open("test.panel"))
+                    luban.panel.open("test.panel")
                 end
             }"#,
         );
@@ -2336,6 +2353,107 @@ mod tests {
             vec![HostAction::Notify(
                 dir.path().join("data").to_string_lossy().into()
             )]
+        );
+    }
+
+    #[test]
+    fn json_encode_rejects_cyclic_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        // `Table::pairs` runs no VM instructions, so without a depth guard a
+        // self-referential table would recurse on the Rust stack until the
+        // host process aborts.
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    local t = {}
+                    t.self = t
+                    luban.json.encode(t)
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("nesting is too deep"), "{error}");
+    }
+
+    #[test]
+    fn settings_set_is_visible_to_get_in_the_same_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                probe = function(ctx)
+                    luban.settings.set("uppercase", true)
+                    luban.notify(tostring(luban.settings.get("uppercase")))
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "probe",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(output.actions.len(), 2);
+        assert_eq!(
+            output.actions[0],
+            HostAction::SetSetting {
+                key: "uppercase".into(),
+                value: serde_json::Value::Bool(true),
+            }
+        );
+        // Read-after-write sees the new value before the host applies the
+        // action.
+        assert_eq!(output.actions[1], HostAction::Notify("true".into()));
+    }
+
+    #[test]
+    fn document_set_text_reports_selection_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                keep = function(ctx) luban.document.set_text("hello") end,
+                select = function(ctx) luban.document.set_text("hello", 2, 4) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        // Without offsets the current selection (input: 1..2) is kept.
+        let output = run_command(
+            &mut runtime,
+            "keep",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::SetDocumentText {
+                text: "hello".into(),
+                selection: Some((1, 2)),
+            }]
+        );
+        let output = run_command(
+            &mut runtime,
+            "select",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::SetDocumentText {
+                text: "hello".into(),
+                selection: Some((2, 4)),
+            }]
         );
     }
 }
