@@ -4,6 +4,36 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+### 新增
+
+- 插件系统 v2（破坏性升级，清单 `api_version` 升为 2，v1 插件拒载并提示更新）：
+  事件系统（清单 `events` 声明准入、`luban.events.on/off`、文档打开/保存/活动
+  切换/编辑去抖 4 个事件、`on_edit` 只读规则、级联抑制升级为上下文继承——
+  `command.run` 链同样只读或不再发射事件）、定时器（`luban.timer.after/every/
+  cancel`，每插件 ≤16 个、最小 50ms 钳制、负值拒绝）、沙箱 `require` 多文件
+  模块（模块名仅 `[a-z0-9._]`、拒绝 `..`/绝对路径/逃逸插件目录含符号链接、
+  模块缓存 = VM 存活期、循环依赖检测）、面板交互升级（行命令/头部操作统一
+  `{ id, args }` 表、args 传给命令入口且 4 KiB 超限丢弃、点击不清面板并保留
+  滚动、`luban.panel.refresh`）、settings 写回（`luban.settings.set` 按声明
+  schema 校验、立即持久化、同分发读后写可见）、`luban.document.set_cursor`
+  与 `luban.command.run`（args 传递、链深 ≤4、plugin-first 解析）、连续 10 次
+  分发失败自动停用（状态栏通知，插件管理器可恢复）、版本治理（`api_version`
+  为破坏性主版本，`luban.version` 为加性特性等级）。
+- 插件管理器审批弹窗展示清单声明的 events（“此插件会监听：…”）。
+- `docs/PLUGINS.md` 重写为 v2 参考（含错误约定、事件/定时器/require/面板/
+  settings 写回/command.run 与 v1 迁移对照）；`docs/ROADMAP.md` 记录延期项。
+
+### 变更
+
+- Lua API 面按命名空间重组并改用 fail-fast 错误约定：文档操作收拢为
+  `luban.document.get/set_text/insert/set_cursor`，移除扁平
+  `get_document`/`set_document_text`/`insert_text`/`replace_selection` 与
+  `(nil, err)` 双值返回（mutator 成功返回 `nil`，校验类错误 `error()` 抛出，
+  资源类超限静默丢弃）；面板 `command` 从字符串形态改为 `{ id, args }` 表；
+  `luban.panel.version` 废弃移除。
+- 官方 markdown / JSON Preview 插件将随发布重写为 2.0.0（v2 原生，删除全部
+  feature-detect 降级路径）；插件仓库与商店条目更新由发布任务补充。
+
 ## [1.0.0-preview.16] — 2026-11-08
 
 ### 改进与修复

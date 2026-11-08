@@ -1,8 +1,10 @@
 # 插件开发
 
-Luban Notepad 1.0 的插件由一个 JSON 清单和一个沙箱化 Lua 文件组成。插件不能
-链接 Rust 代码，也不能直接访问 `io`、`os`、`package`、`debug`、`require` 或
-网络/子进程；所有能力都通过宿主提供的 `luban` API 暴露。
+Luban Notepad 的插件由一个 JSON 清单、一个沙箱化 Lua 入口和若干可选的 Lua
+模块组成。插件不能链接 Rust 代码，也不能直接访问 `io`、`os`、`package`、
+`debug` 或网络/子进程；所有能力都通过宿主提供的 `luban` API 暴露。本文描述
+`api_version: 2` 的插件系统（事件驱动、命名空间化 API）；从 v1 迁移见文末
+对照表。
 
 ## 插件目录
 
@@ -12,6 +14,7 @@ Luban Notepad 1.0 的插件由一个 JSON 清单和一个沙箱化 Lua 文件组
   <plugin-id>/
     plugin.json
     main.lua
+    lib/…                # require 加载的模块，可选
     data/                # 插件数据目录，首次写入时创建
 ```
 
@@ -25,11 +28,12 @@ Luban Notepad 1.0 的插件由一个 JSON 清单和一个沙箱化 Lua 文件组
   "id": "com.example.hello",
   "name": "Hello",
   "version": "1.0.0",
-  "api_version": 1,
+  "api_version": 2,
   "main": "main.lua",
   "description": "Example plugin",
   "author": "Example",
   "permissions": ["filesystem"],
+  "events": ["on_edit", "on_document_save"],
   "dependencies": [
     { "id": "com.example.base", "version": ">=1.0.0, <2.0.0" }
   ],
@@ -77,19 +81,26 @@ Luban Notepad 1.0 的插件由一个 JSON 清单和一个沙箱化 Lua 文件组
     ],
     "panels": [
       { "id": "hello.list", "title": "Hello", "entry": "list", "placement": "right" }
-    ]  }
+    ]
+  }
 }
 ```
 
 字段说明：
 
 - `id`：全局唯一，匹配 `[a-z0-9][a-z0-9._-]*`，推荐反向域名风格。
-- `version`：SemVer；`api_version` 必须不大于宿主支持的主版本（当前为 1）。
+- `version`：SemVer。
+- `api_version`：必须等于 `2`。宿主只加载相等值：v1 清单拒绝加载并明确提示
+  更新到 v2 宿主版本；大于 2 的值同样拒绝（前瞻性校验）。
+- `events`：声明式事件准入清单。运行时 `luban.events.on` 只允许注册这里声明过
+  的事件；未知事件名拒绝加载。审批界面会展示“此插件会监听：…”。可用事件见
+  下文“事件”一节。
 - `main`：相对插件目录的 `.lua` 文件，不能逃逸插件目录，最大 2 MiB。
 - `dependencies`：按 `id` + SemVer 范围解析；缺失、不兼容或依赖环会禁用插件。
 - `permissions`：`filesystem` 可用；`network`、`process` 可声明但本版本不提供
   对应 API。未知权限会被忽略并记录警告。
 - `activate` / `deactivate`：插件表中的函数名，可选。
+- `contributes`：命令、菜单、状态栏、设置、面板贡献点，结构与 v1 相同。
 
 ## Lua 入口
 
@@ -98,73 +109,190 @@ Luban Notepad 1.0 的插件由一个 JSON 清单和一个沙箱化 Lua 文件组
 ```lua
 local M = {}
 
-function M.activate(ctx)
-  luban.log("info", "hello activated for " .. ctx.plugin.id)
+-- Runs once per activation. Rehydrate everything a VM rebuild wiped:
+-- event handlers, timers, caches.
+function M.activate(context)
+  luban.log("info", "hello activated for " .. context.plugin.id)
+  luban.events.on("on_edit", M.on_edit)
+  luban.timer.after("hello.welcome", 200, function(context)
+    luban.notify("Hello ready")
+  end)
 end
 
-function M.greet(ctx)
-  local document = assert(luban.get_document())
-  luban.insert_text("Hello" .. luban.settings.get("punctuation") .. "\n")
+function M.on_edit(context)
+  local document = context.document
+  if document == nil then
+    return
+  end
+  luban.status.set("hello.status", document.line .. ":" .. document.column)
 end
 
-function M.list(ctx)
+-- Command entries receive the panel-click args as the second parameter.
+function M.greet(context, args)
+  local name = (args and args.name) or "world"
+  luban.document.insert("Hello, " .. name .. "!\n")
+end
+
+function M.list(context)
   return {
     title = "Hello",
     lines = {
-      { text = "Greet", command = "hello.greet" },
+      { text = "Greet", command = { id = "hello.greet", args = { name = "panel" } } },
       "Read-only line",
     },
   }
 end
 
-function M.deactivate(ctx)
+function M.deactivate(context)
 end
 
 return M
 ```
 
-沙箱只开放基础库、`string`、`table`、`math` 和 `utf8`。每次回调最多执行
-50,000,000 条 Lua 指令（约每 10,000 条检查一次），Lua 内存上限为 64 MiB；
-超过限制会终止回调并在状态栏显示错误。回调通过 `xpcall` 执行，错误信息包含
-Lua 栈回溯和出错位置；完整错误写入应用日志，状态栏保留至多 2 KiB 并在
-截断时标注原始长度。
+入口签名：
+
+- 命令入口 `entry(context, args)`：`args` 是面板行/头部动作携带的参数表；没有
+  参数时为 `nil`。注意 `args = {}`（空表）与 `nil` 不同。
+- 事件处理器、定时器回调、面板入口与 `activate`/`deactivate` 都以
+  `(context, nil)` 调用：第二参数固定为 `nil`，多余的形参被忽略，单参数入口
+  保持可用。事件载荷（文档快照表）通过 `context.document` 传递。
+
+`context` 表字段：
+
+- `context.plugin`：`{ id, version, data_dir }`。
+- `context.command`：当前命令 ID（仅命令入口有）。
+- `context.document`：文档快照表 `{ path, text, language, line, column,
+  selection_start, selection_end, modified }`，无活动文档时为 `nil`。
+- `context.settings`：当前插件设置值。
+
+生命周期：`main.lua` 在每次激活时加载一次。VM 状态（全局变量、事件处理器、
+定时器、`require` 模块缓存）在同一个插件计划构建内跨分发保留；重新加载、
+启用/禁用、安装/更新或应用重启都会重建 VM 并清零全部状态——插件必须在
+`activate()` 里重水合：注册事件处理器、重建定时器、恢复缓存。
+
+沙箱只开放基础库、`string`、`table`、`math` 和 `utf8`（`require` 是宿主提供的
+受控实现，见下文）。每次分发最多执行 50,000,000 条 Lua 指令（约每 10,000 条
+检查一次），Lua 内存上限为 64 MiB；超过限制会终止当前分发并计入连续失败隔离。
+分发通过 `xpcall` 执行，错误信息包含 Lua 栈回溯和出错位置；完整错误写入应用
+日志，状态栏保留至多 2 KiB 并在截断时标注原始长度。
 
 ## 宿主 API
 
-| API | 说明 |
+| API | 语义 |
 | --- | --- |
+| `luban.version` | 宿主特性等级 = 2；加性演进只升这个值，见“版本治理”。 |
 | `luban.log(level, message)` | `debug`/`info`/`warn`/`error` 写入应用日志。 |
-| `luban.notify(message)` | 非模态状态消息。 |
-| `luban.json.encode(value)` | Lua 值转 JSON 字符串。 |
-| `luban.json.decode(text)` | JSON 字符串转 Lua 值；JSON `null` 转为 `nil`。 |
-| `luban.get_document()` | 返回 `{ path, text, language, line, column, selection_start, selection_end, modified }`，或 `nil, error`。 |
-| `luban.set_document_text(text, start?, end?)` | 替换全文并按字符偏移设置选区。 |
-| `luban.insert_text(text)` | 在光标/选区处插入或替换。 |
-| `luban.replace_selection(text)` | 替换选区。 |
-| `luban.settings.get(key)` | 读取插件设置。 |
+| `luban.notify(message)` | 状态栏非模态提示；每分发最多 8 条、单条 1 KiB，超限静默丢弃并记录告警日志。 |
+| `luban.json.encode(t)` / `luban.json.decode(s)` | Lua 值 ↔ JSON 字符串；失败抛错。encode 拒绝超过 128 层嵌套与循环表；JSON `null` 解码为 `nil`。 |
+| `luban.document.get()` | 文档快照表（同 `context.document`）；无文档返回 `nil`。 |
+| `luban.document.set_text(text, sel_start?, sel_end?)` | 全文替换并按字符偏移设置选区；两个偏移必须同时给或同时省。 |
+| `luban.document.insert(text)` | 在光标/选区处插入（选区被替换），光标移到插入文本之后。 |
+| `luban.document.set_cursor(line, col)` | 1-based 光标定位，宿主钳制到文档边界。 |
+| `luban.settings.get(key)` / `luban.settings.set(key, value)` | `get` 读取当前值；`set` 仅限已声明键，类型/范围校验，立即持久化且同一分发内读后写可见。 |
 | `luban.status.set(id, text)` | 更新已声明的状态栏项。 |
-| `luban.panel.open(id)` | 打开或刷新本插件声明过的面板；旧宿主没有此 API。 |
-| `luban.panel.version` | 面板 API 版本；支持面板操作栏的宿主为 `2`，旧宿主为 `nil`。 |
-| `luban.syntax.highlight(text, language)` | 用当前语法主题高亮文本，返回 `{ text, role }` 数组；单次上限 64 KiB；旧宿主没有此 API。 |
-| `luban.fs.read(path)` | 读取文本文件（需要 `filesystem` 权限）。 |
-| `luban.fs.write(path, text)` | 原子写入文件（需要 `filesystem` 权限）。 |
-| `luban.data_dir()` | 返回并创建插件数据目录。 |
+| `luban.syntax.highlight(text, lang)` | 用当前语法主题高亮，返回 `{ text, role }` 数组；单次上限 64 KiB。 |
+| `luban.fs.read(path)` / `luban.fs.write(path, text)` | 需要 `filesystem` 权限并受允许根目录限制；读上限 64 MiB，写为原子写。 |
+| `luban.data_dir()` | 返回并创建插件数据目录路径。 |
+| `luban.panel.open(id)` / `luban.panel.refresh(id)` | `open` 打开自己声明的面板（已打开则保留滚动位置）；`refresh` 仅在面板已打开时重渲染，关闭状态是静默 no-op。 |
+| `luban.command.run(id, args?)` | 运行任意命令；`args` 传给目标插件命令入口；链深最多 4，见“command.run”。 |
+| `luban.events.on(name, fn)` / `luban.events.off(name)` | `fn` 为函数值；`on` 仅限清单 `events` 声明过的事件，每插件最多 32 个处理器；`off` 移除该事件全部处理器。 |
+| `luban.timer.after(id, ms, fn)` / `luban.timer.every(id, ms, fn)` / `luban.timer.cancel(id)` | 单次/循环定时器，见“定时器”。 |
 
 文档 API 只对普通、可编辑全文的文本文档有效。大文件、磁盘引擎、部分范围、
-非文本文档和只读差异标签返回 `nil, "unsupported document"`，不会修改内容。
+非文本文档和只读差异标签抛出 "unsupported document" 错误，不会修改内容。
 写入走现有保存/撤销/外部修改保护路径；插件不能绕过保存流程直接写当前文件，
 除非显式使用 `luban.fs.write`。
 
 `luban.fs` 的允许范围：所有已打开工作区根、当前活动文档所在目录（没有工作区
-时）和插件自己的数据目录。路径在写入前规范化；超出范围的路径返回
-`nil, "path outside allowed roots"`。单文件读取上限 64 MiB。
+时）和插件自己的数据目录。路径在写入前规范化；超出范围的路径抛出
+"path outside allowed roots" 错误。
+
+## 错误约定
+
+v2 用三类约定取代 v1 的 `(nil, err)` 双值返回：
+
+- **校验类错误 fail-fast**：参数非法（`set_text` 只给一个偏移、`set_cursor`
+  传 0 等）、未声明键（`status.set`/`settings.set` 的未知 ID/键、`events.on`
+  注册未声明事件）、超出编程性上限（定时器超过 16 个、事件处理器超过 32 个、
+  `command.run` 深度超过 4）、在 `on_edit` 上下文写文档——一律 `error()` 抛出。
+  宿主经 pcall + traceback 捕获并计入连续失败隔离。
+- **资源类超限静默丢弃**：notify 洪泛、面板 args 超过 4 KiB、面板行数/行宽帽
+  ——丢弃超出部分并记录告警日志，不中断插件，命令照常执行。
+- **变更类函数返回 nil**：mutator（`document.set_text`/`insert`/`set_cursor`、
+  `status.set`、`panel.open`/`refresh`、`fs.write`、`settings.set`、
+  `command.run`、事件与定时器注册）成功只返回 `nil`；getter 返回值；失败抛错。
+
+插件代码里 `pcall` 捕获到的宿主错误对象是 userdata（消息在 `__tostring`
+之后），显示经 `tostring` 转换。错误文本不是 API 契约：不要对宿主错误消息做
+模式匹配，按“是否抛错”分支即可；插件自己 `error("message")` 抛出的字符串
+错误仍然是字符串。
+
+## 事件
+
+| 事件 | 触发时机 | 载荷（`context.document`） |
+| --- | --- | --- |
+| `on_document_open` | 文档标签打开 | 文档快照表 |
+| `on_document_save` | 保存完成 | 文档快照表 |
+| `on_active_document_changed` | 活动 tab 切换/关闭 | 文档快照表或 `nil` |
+| `on_edit` | 编辑停止约 150ms 后（去抖，与面板 `refresh: "edit"` 同源） | 文档快照表 |
+
+- 注册：`luban.events.on(name, fn)`，`fn` 为函数值（不是函数名字符串）；只能
+  注册清单 `events` 声明过的事件；每插件处理器总数不超过 32。同一事件的多个
+  处理器按注册顺序运行，共享同一次分发的指令预算；单个处理器失败不会阻止其余
+  处理器，整次分发计为一次失败。`luban.events.off(name)` 移除该事件的全部
+  处理器。
+- **只读规则**：`on_edit` 上下文中 `luban.document.set_text` / `insert` 抛出
+  只读错误——从根上掐断“编辑 → 事件 → 编辑”风暴；其余 API 不受限。
+- **级联抑制与上下文继承**：事件/定时器上下文内产生的一切动作不再发射事件；
+  `luban.command.run` 链继承当前分发的上下文——`on_edit` 链上的嵌套命令同样
+  只读，`on_save` 等事件链可编辑但不再触发事件（formatter-on-save 合法），
+  反馈环不可能出现。
+- **预算**：事件泵每 50ms 走一帧，每帧最多 8 次分发（事件与到期定时器共享）；
+  每次分发与命令一样有 50M 指令 + 64 MiB 预算。
+
+## 定时器
+
+```lua
+luban.timer.after(id, ms, fn)   -- one-shot
+luban.timer.every(id, ms, fn)   -- repeating
+luban.timer.cancel(id)          -- remove; unknown ids are a no-op
+```
+
+- 每插件最多 16 个活动定时器；重复 id 覆盖旧条目。
+- 最小间隔 50ms，低于钳制到 50ms；负值抛错；超大间隔可以注册但永不触发，
+  仍占一个槽位直到 `cancel` 或 VM 重建。
+- 回调签名 `fn(context)`：以 `(context, nil)` 调用，多余参数忽略。定时器始终
+  在事件上下文运行——文档/命令动作可用，但不发射事件（级联抑制）。
+- 到期定时器与事件共用同一条分发队列（每帧最多 8 次分发），同等指令预算、
+  错误隔离与级联抑制。
+- VM 重建后定时器清零；在 `activate()` 里重建，与事件注册同模式。
+
+## 多文件 require
+
+沙箱内的 `require("lib.parser")` 加载并执行 `<plugin-dir>/lib/parser.lua`：
+
+- 模块名只能包含 `[a-z0-9._]`，按点分隔、每段非空、总长最多 256 字节；含
+  `..` 段、绝对路径或逃逸插件目录的名字全部拒绝。作为纵深防御，解析出的
+  父目录与文件本身都做符号链接检查，目标必须在插件目录内。
+- 模块与 `main.lua` 在同一个 Lua 状态里：同一沙箱、共享 globals；`package`
+  库仍然不可见。模块缓存存活期 = VM 存活期；模块代码在发起 require 的分发里
+  执行，计入该次分发的指令预算。
+- 清单与打包零改动：zip 里多带 `.lua` 文件即可。
+
+注意事项：
+
+- `require('main')` 会把 `main.lua` 当模块再次求值——顶层副作用跑两遍。
+- 返回 `nil` 的模块按 `nil` 缓存（标准 Lua 的 require 返回 `true`）：副作用
+  模块应显式返回一个表或 `true`。
+- 循环依赖抛出 "circular dependency" 错误。
 
 ## 贡献点
 
 ### 命令
 
 命令 ID 必须全局唯一，不能与内置命令或其他插件命令冲突；冲突的命令会被跳过
-并记录错误。`entry` 是插件表中的函数名。`when` 可选：
+并记录错误。`entry` 是插件表中的函数名，以 `entry(context, args)` 调用。
+`when` 可选：
 
 - `always`（默认）
 - `document`：有活动文档时才可用。
@@ -185,82 +313,111 @@ Lua 栈回溯和出错位置；完整错误写入应用日志，状态栏保留�
 
 支持 `boolean`、`string`、`number` 和 `enum`。设置值全局保存（不随工作区分开）
 在 `settings.json` 的 `plugin_settings[<plugin-id>]` 下；缺失或非法值回退默认值。
-插件在回调的 `ctx.settings` 和 `luban.settings.get` 中读取当前值。
+插件在 `context.settings` 和 `luban.settings.get` 中读取当前值；写回用
+`luban.settings.set`，语义见“settings 写回”。
 
-### 面板
+## 面板
 
-`panels` 由宿主渲染为模型态浮层（右缘或下缘）。面板清单支持两个可选字段：
+面板由清单 `contributes.panels` 声明，宿主渲染为模型态浮层（右缘或下缘）。
+清单支持两个可选字段：`width`（右侧面板宽度，280–1200，缺省 380，宿主会再按
+窗口宽度收敛）和 `refresh`（`manual` 缺省，或 `edit`——面板打开期间跟随活动
+文档的编辑和标签切换自动重算，编辑停止约 150ms 后刷新，面板关闭即停止）。
 
-```json
+面板入口 `entry(context)` 返回字符串、字符串数组（每项一行）或
+`{ title = "...", lines = [ ... ], actions = [ ... ] }`。行可以是字符串或：
+
+```lua
 {
-  "id": "hello.list",
-  "title": "Hello",
-  "entry": "list",
-  "placement": "right",
-  "width": 640,
-  "refresh": "edit"
+  text = "纯文本回退",              -- 必填
+  style = "text",                  -- text|muted|h1..h6|code|quote|list|table|rule
+  indent = 0,                      -- 0..8
+  spans = {                        -- 可选；拼接后必须等于 text
+    { text = "粗体", style = "bold" },
+    { text = "fn", role = "keyword" },
+  },
+  command = { id = "json.fold.toggle", args = { path = "$.a[0]" } },
 }
 ```
 
-- `width`：右侧面板宽度，280–1200，缺省 380；宿主会再按窗口宽度收敛。
-- `refresh`：`manual`（缺省）或 `edit`。`edit` 表示面板打开期间跟随活动文档的
-  编辑和标签切换自动重算，编辑停止约 150ms 后刷新；面板关闭即停止。
+`command` 统一为 `{ id, args }` 表（字符串形态已移除）：`id` 是要执行的命令，
+`args` 是 JSON 兼容的 Lua 表，宿主作为目标命令入口的第二参数传入。规则：
 
-`entry` 返回：
+- `args` 序列化后超过 4 KiB 时丢弃 args 并记录告警日志，命令仍执行——处理器
+  必须容忍 `nil` args。
+- `args = {}` 传空表，与省略 `args`（得到 `nil`）不同。
+- 点击带 `command` 的行执行命令；**点击行命令与头部动作都不清面板、滚动位置
+  保留**。面板不会阻止编辑、保存或标签切换。
 
-- 字符串数组：每项一行。
-- `{ title = "...", lines = [ ... ] }`，行可以是字符串或：
-  ```lua
-  {
-    text = "纯文本回退",              -- 必填
-    style = "text",                  -- text|muted|h1..h6|code|quote|list|table|rule
-    indent = 0,                      -- 0..8
-    spans = {                        -- 可选；拼接后必须等于 text
-      { text = "粗体", style = "bold" },
-      { text = "fn", role = "keyword" },
-    },
-    command = "hello.greet",
-  }
-  ```
-- 可选 `actions`：在面板标题旁显示一排扁平操作按钮，不占用正文行：
-  ```lua
-  return {
-    title = "解析结果",
-    lines = { ... },
-    actions = {
-      { label = "折叠", command = "json.fold.toggle-all" },
-      { label = "元数据", command = "json.metadata" },
-    },
-  }
-  ```
-  最多 8 个操作，`label` 不超过 64 字节，`command` 不超过 128 字节。宿主通过
-  `luban.panel.version >= 2` 表示支持；旧宿主忽略该字段。点击操作与点击带
-  `command` 的面板行不同，不会先关闭面板。
-- span 的 `style` 是空格分隔的标志：`bold`、`italic`、`underline`、`strike`、
-  `code`、`link`、`muted`；`role` 使用 `luban.syntax.highlight` 返回的语义角色，宿主用当前
-  语法主题着色。spans 总字节不超过 4 KiB，且拼接必须等于 `text`，否则整行按
-  `text` 渲染。
-- 旧宿主忽略 `width`、`refresh`、`style`、`indent`、`spans` 和 `role`，只显示
-  `text`，因此插件应始终提供完整可读的纯文本回退。
+可选 `actions`：在面板标题旁显示一排扁平操作按钮，不占用正文行：
 
-面板最多显示 5,000 行，超过时截断并提示。点击带 `command` 的行执行命令。
-面板不会阻止编辑、保存或标签切换。
+```lua
+return {
+  title = "解析结果",
+  lines = { ... },
+  actions = {
+    { label = "折叠", command = { id = "json.fold.toggle-all" } },
+    { label = "元数据", command = { id = "json.metadata" } },
+  },
+}
+```
 
-> API 版本 1 只接受 `menus[].menu = "plugins"`。宿主把“插件”菜单按插件分组：
-> 一级只显示插件名称（清单 `name`），展开后先列出这里声明的命令，再列出该插件
-> 的面板。未声明的命令仍可从命令面板、快捷键或面板行执行；没有菜单命令也没有
-> 面板的插件不会出现在菜单中。面板标题与同一子菜单中已显示命令的标签同名时
-> （忽略大小写、空格和标点），只显示命令，不重复显示该面板。
+最多 8 个操作，`label` 不超过 64 字节，`command` 同样是 `{ id, args }` 表。
+
+span 的 `style` 是空格分隔的标志：`bold`、`italic`、`underline`、`strike`、
+`code`、`link`、`muted`；`role` 使用 `luban.syntax.highlight` 返回的语义角色，
+宿主用当前语法主题着色。spans 总字节不超过 4 KiB，且拼接必须等于 `text`，
+否则整行按 `text` 渲染。
+
+容量帽：最多 5,000 行、单行 4 KiB、512 个 spans、8 个操作，超出时截断或拒绝
+并提示。
+
+“插件”菜单按插件分组：一级只显示插件名称（清单 `name`），展开后先列出
+`contributes.menus` 中声明的命令，再列出该插件的面板。菜单只接受
+`menus[].menu = "plugins"`。未声明的命令仍可从命令面板、快捷键或面板行执行；
+没有菜单命令也没有面板的插件不会出现在菜单中。面板标题与同一子菜单中已显示
+命令的标签同名时（忽略大小写、空格和标点），只显示命令，不重复显示该面板。
+
+## settings 写回
+
+`luban.settings.set(key, value)`：
+
+- 仅限清单 `contributes.settings` 声明过的键；未知键抛错。
+- 值按声明 schema 校验类型与范围（`string` 的 `max_length`、`number` 的
+  `min`/`max`/`step`、`enum` 的 `values`），非法值抛错。
+- 校验通过后立即持久化到 `settings.json` 的 `plugin_settings[<plugin-id>]`，
+  首选项里的插件设置控件同步更新；同一分发内 `set` 之后的 `get` 立即返回
+  新值（读后写可见）。
+
+## command.run
+
+`luban.command.run(id, args?)` 运行任意命令（内置或插件命令）：
+
+- `args`（可选表）转换为 JSON 后传给目标插件命令入口的 `entry(context, args)`；
+  内置命令忽略 args 并记录告警日志。
+- 深度限制：用户、CLI（`--command`）或面板点击发起的命令是深度 0，链上每跳
+  +1，最多 4 层；超出抛错。解析顺序 plugin-first，与用户路径一致：插件命令
+  可以遮蔽同 ID 的内置命令，被遮蔽的内置命令不会绕过深度帽。
+- 在事件/定时器上下文中发起时，整条链继承该上下文（只读与级联抑制规则见
+  “事件”一节）。
 
 ## 权限与批准
 
-安装或更新插件时，管理器展示声明的权限并要求批准。批准结果（权限集合的
-SHA-256 哈希）保存在 `<config-dir>/plugins/.installed.json`。权限集合变化后，
-插件会变成“需要批准权限”并停止加载，直到用户重新批准。手动复制到
-`plugins/` 的插件同样需要批准。
+安装或更新插件时，管理器展示声明的权限并要求批准；同时展示清单 `events`
+（“此插件会监听：…”）。批准结果（权限集合的 SHA-256 哈希）保存在
+`<config-dir>/plugins/.installed.json`。权限集合变化后，插件会变成“需要批准
+权限”并停止加载，直到用户重新批准。手动复制到 `plugins/` 的插件同样需要批准。
 
-安全模式（`--safe-mode` 或设置中的“启用插件”关闭）不加载任何插件，也不执行
-`activate`；用户语法、主题和片段仍然加载。
+## 隔离与安全
+
+- 沙箱库集不变：基础库、`string`、`table`、`math`、`utf8`；不提供 `io`、
+  `os`、`package`、`debug` 与动态代码加载。每次分发 50M 指令 + 每 VM
+  64 MiB 内存。
+- **连续失败隔离**：任一插件连续 10 次分发失败（命令/事件/定时器合计，任一
+  成功即清零）→ 自动停用 + 一次状态栏通知，写入禁用列表持久化；在插件管理器
+  重新启用即可恢复（计数清零）。
+- 安全模式（`--safe-mode` 或设置中的“启用插件”关闭）不加载任何插件，也不执行
+  `activate`；用户语法、主题和片段仍然加载。
+- `api_version: 1` 的插件拒绝加载并提示更新到 v2 宿主版本。
 
 ## 插件管理器
 
@@ -300,13 +457,45 @@ SHA-256 哈希）保存在 `<config-dir>/plugins/.installed.json`。权限集合
 目录格式、目标平台、缓存位置、发布流程和故障排查见
 [docs/PLUGIN_STORE.md](PLUGIN_STORE.md)。
 
+## 版本治理
+
+- `api_version`：破坏性主版本。宿主只加载相等值；Lua API 面的不兼容变更必须
+  升它。
+- `luban.version`：加性特性等级（当前为 2）。新增 API、事件或贡献点只升它，
+  老宿主可安全忽略更高的值，插件探测后自行降级。
+- 插件探测加性能力：
+
+```lua
+if (luban.version or 1) >= 2 then
+  -- use the newer additive capability
+end
+```
+
+## 从 v1 迁移
+
+| v1 | v2 |
+| --- | --- |
+| `"api_version": 1` | `"api_version": 2`；宿主拒载 1 并提示更新。 |
+| `luban.get_document()` | `luban.document.get()` |
+| `luban.set_document_text(text, start?, end?)` | `luban.document.set_text(text, sel_start?, sel_end?)` |
+| `luban.insert_text(text)` | `luban.document.insert(text)` |
+| `luban.replace_selection(text)` | 移除；用 `set_text` / `insert` 表达。 |
+| `(nil, "error")` 双值返回 | 校验类 `error()` 抛错；mutator 成功返回 `nil`。 |
+| `command = "hello.greet"`（面板行/操作） | `command = { id = "hello.greet", args = {...} }`。 |
+| `luban.panel.version` feature-detect | 移除；v2 宿主均支持 actions/宽度/自动刷新。 |
+| 无事件/定时器/require | 清单声明 `events`；在 `activate()` 里注册处理器与定时器；`require` 拆模块。 |
+
+迁移时同步删除全部 feature-detect 与旧宿主降级分支：v2 宿主保证本文描述的
+全部 API 存在，加性能力用 `(luban.version or 1) >= 2` 探测。
+
 ## 限制
 
 - 不支持 WASM 插件、网络请求或子进程。
-- 插件是单文件 Lua；不提供 `require`/多文件模块。
+- 事件源目前只有文档生命周期（打开/保存/活动切换/编辑去抖）；文件监听、
+  剪贴板等新事件源已延期，见 `docs/ROADMAP.md`。
 - 不提供任意 GPUI 视图注入；面板是宿主渲染的富文本行浮层（标题、span、代码、
   引用、表格等），不能嵌入自定义控件或 HTML。
-- 面板里的链接不可点击；需要交互的行只能绑定已声明的插件命令。
+- 面板里的链接不可点击；需要交互的行只能绑定带 args 的命令。
 - 插件命令在 UI 线程同步执行；长时间计算受指令上限保护，但会阻塞界面直到
   回调返回。
 - 插件设置是全局设置，不随工作区切换。

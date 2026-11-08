@@ -44,10 +44,10 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 
 | 模块 | 职责 |
 | --- | --- |
-| `manifest` | `plugin.json` 解析/校验、API 版本、依赖范围、贡献点和设置 schema、权限声明。 |
+| `manifest` | `plugin.json` 解析/校验、API 版本、事件声明、依赖范围、贡献点和设置 schema、权限声明。 |
 | `permissions` | 权限集合规范化、批准哈希（SHA-256）。 |
 | `registry` | 插件发现、重复 ID/非法清单隔离、依赖拓扑/环、启用/批准/安全模式状态。 |
-| `runtime` | 每个插件独立的 Lua 5.4 状态：沙箱标准库、指令/内存上限、`luban` 宿主 API、文档/状态/文件操作收集为 `HostAction`。 |
+| `runtime` | 每个插件独立的常驻 Lua 5.4 状态：沙箱标准库、指令/内存上限、`luban` 宿主 API、沙箱 `require`、事件注册表与定时器表；文档/状态/设置/光标/面板/命令操作收集为 `HostAction`。 |
 | `install` | 本地目录/zip/Git 安装、原子替换、更新、卸载、安装记录 `.installed.json`、路径穿越/符号链接防护；商店使用带预期 ID/版本的 zip 安装入口，并在替换时保留 `data/`。 |
 | `settings` | 插件设置默认值、校验和回退。 |
 | `store` | 商店目录模型与校验：目标平台、产物、版本、本地化、SemVer 可更新判断、当前 OS/CPU 目标匹配、`universal` 回退、目录来源校验和文件 SHA-256。 |
@@ -74,6 +74,7 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 | `app::editor_view` | 单/双编辑组窗格、组容器、编辑器区域、面包屑、标尺、文档地图渲染与地图滚动。 |
 | `app::command_ui` | 命令上下文、命令执行分发、宏状态签名、键位映射重建、快捷键分发表和命令标签。 |
 | `app::plugin_ui` | 插件根目录许可与文档快照、插件命令执行、插件/包重载、差异标签、片段选择、插件面板刷新/监视/拖拽与渲染。 |
+| `app::plugin_events` | 插件事件泵：事件队列与发射抑制、50ms tick 每帧最多 8 次分发、`on_edit` 150ms 去抖、到期定时器分发和连续失败隔离（自动停用）。 |
 | `app::plugin_manager_ui` | 插件设置应用、重载/卸载、插件商店目录拉取/URL 覆盖/安装/轮询、已安装与商店页签及管理器渲染。 |
 | `app::preferences_ui` | 设置首选项覆盖层、字体选择器、插件总开关/安全模式入口和按搜索过滤后的设置分组渲染。 |
 | `app::find_replace_ui` | 查找/替换栏、查找下一个/替换一个/全部、全库替换预览/应用/撤销、在文件中查找与结果打开。 |
@@ -92,7 +93,7 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 | `preferences` | 首选项窗口状态：设置搜索、字体选择、语法主题、每语言缩进/换行、工作区/文件/视图/导入导出分组。 |
 | `syntax_theme` | 内置/用户包 `.tmTheme` 到语义高亮角色的映射、解析与应用。 |
 | `highlighter` | 基于活动 `SyntaxSet` 的 `InputHighlighterFactory`；用户 `.sublime-syntax` 因而能用于编辑器和导出。 |
-| `plugin_host` | 应用侧插件加载计划、贡献点注册、命令/面板调用、文档快照与 `HostAction` 应用。 |
+| `plugin_host` | 应用侧插件加载计划、贡献点注册、命令/面板/事件/定时器调用、文档快照与 `HostAction` 应用。 |
 | `plugin_manager` | 插件管理器输入/设置控件状态和“已安装 / 商店”页签。 |
 | `plugin_store` | 商店客户端：后台目录获取、缓存读写、HTTPS/代理与大小限制、产物下载和 SHA-256/大小校验、安装任务状态。 |
 | `snippet_ui` | 片段选择行、插入会话和 tab stop 导航。 |
@@ -106,14 +107,17 @@ Luban Notepad 有意将文档引擎与 GUI 分离。引擎可以在无界面环�
 ## 插件与用户包
 
 `luban-plugin` 不依赖 GUI：它发现并校验清单、解析依赖和权限，然后为每个启用
-插件建立一个 Lua 状态。Lua 沙箱只开放基础/字符串/表/数学/UTF-8 库；每次回调
-重置指令计数，并设置 64 MiB 内存上限。插件不能获得 `io`、`os`、`package`、
-`debug`、`require` 或动态代码加载。
+插件建立一个常驻 Lua 状态。Lua 沙箱只开放基础/字符串/表/数学/UTF-8 库；每次
+分发重置指令计数，并设置 64 MiB 内存上限。插件不能获得 `io`、`os`、`package`、
+`debug` 或动态代码加载；`require` 是宿主提供的受控实现（模块名仅 `[a-z0-9._]`，
+解析结果不得逃逸插件目录）。
 
 插件回调不直接持有应用状态。宿主在调用前构造文档快照、设置快照和允许路径，
-`luban.set_document_text`/`insert_text`/`replace_selection`/`status.set`/`notify`
-只追加 `HostAction`；回调返回后应用按顺序通过现有文档替换路径、状态栏和通知
-路径执行。这样 Lua 错误不会留下半执行的宿主写入。
+`luban.document.set_text`/`insert`/`set_cursor`、`status.set`、`settings.set`、
+`notify` 等只追加 `HostAction`；回调返回后应用按顺序通过现有文档替换路径、
+状态栏和通知路径执行。这样 Lua 错误不会留下半执行的宿主写入。事件与定时器由
+`app::plugin_events` 的泵分发（每帧最多 8 次）：事件/定时器上下文内的一切动作
+不再发射事件，`command.run` 链继承当前上下文（`on_edit` 链只读）。
 
 `luban-app/src/highlighter.rs` 实现了和 gpui-component 相同的
 `InputHighlighter` 适配器，但使用 `luban-core::user_syntax::active_set()`。
