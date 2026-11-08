@@ -12,16 +12,34 @@ impl LubanApp {
         value: serde_json::Value,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .plugin_host
-            .update_setting(plugin_id, key, value.clone())
-        {
+        if self.persist_plugin_setting(plugin_id, key, value) {
+            self.plugin_manager.error = None;
+        } else {
             self.plugin_manager.error = Some(tr_args(
                 "plugins.invalid_setting",
                 &[("plugin", plugin_id.to_string()), ("key", key.to_string())],
             ));
-            cx.notify();
-            return;
+        }
+        cx.notify();
+    }
+
+    /// Shared write-back flow for plugin settings, used by the manager UI and
+    /// by the `HostAction::SetSetting` executor: validate against the declared
+    /// schema in the host, then mirror the accepted value into the live and
+    /// global settings and persist. Returns false when the host rejected the
+    /// key (undeclared) or the value (schema-invalid); in that case neither
+    /// the host nor the settings change. Does not notify; callers refresh.
+    pub(super) fn persist_plugin_setting(
+        &mut self,
+        plugin_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> bool {
+        if !self
+            .plugin_host
+            .update_setting(plugin_id, key, value.clone())
+        {
+            return false;
         }
         self.settings
             .plugin_settings
@@ -30,8 +48,7 @@ impl LubanApp {
             .insert(key.to_string(), value);
         self.global_settings.plugin_settings = self.settings.plugin_settings.clone();
         self.commit_settings();
-        self.plugin_manager.error = None;
-        cx.notify();
+        true
     }
 
     pub(super) fn plugin_action_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -989,7 +989,18 @@ impl PluginRuntime {
                 // `None`, i.e. Lua nil, so v1 single-parameter entries keep
                 // working (Lua ignores trailing arguments).
                 let args_value = match args {
-                    Some(json) => json_to_lua(&self.lua, &json).unwrap_or(Value::Nil),
+                    Some(json) => match json_to_lua(&self.lua, &json) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            // Parity with the panel-args 4KiB drop policy:
+                            // the command still runs, without args.
+                            log::warn!(
+                                "command '{}' args dropped: {error}",
+                                command_id.unwrap_or("unknown")
+                            );
+                            Value::Nil
+                        }
+                    },
                     None => Value::Nil,
                 };
                 match call_with_traceback(
@@ -1088,7 +1099,7 @@ fn format_plugin_error(id: &str, entry: &str, error: &mlua::Error) -> String {
 /// the message handler is a Rust function backed by `Lua::traceback`. `args`
 /// becomes the trailing arguments of the call: `(context, args)` for command
 /// entries (args nil when the host passes none) and `(context, nil)` for
-/// panel, event and timer handlers.
+/// panel, event, timer, activate and deactivate handlers.
 fn call_with_traceback(
     lua: &Lua,
     function: &mlua::Function,
@@ -2072,6 +2083,9 @@ fn parse_panel_line(line: &Table) -> Result<PanelLine, String> {
     if text.len() > MAX_PANEL_LINE_BYTES {
         return Err("panel line is too long".to_string());
     }
+    // A read failure from a Table field (memory-pressure-only) is conflated
+    // with a missing command: the line renders plain instead of failing the
+    // whole panel. Cosmetic; matches the bare-string tolerance above.
     let command = parse_panel_command(line.get::<Value>("command").unwrap_or(Value::Nil))?;
     let style = line
         .get::<Option<String>>("style")

@@ -495,6 +495,11 @@ pub struct LubanApp {
     plugin_panel_drag: Option<PluginPanelDrag>,
     /// Monotonic token handed to the single live plugin-panel watcher.
     plugin_panel_watch: u64,
+    /// How many plugin-originated call applications are in progress. While
+    /// this is above zero, document mutations belong to a plugin call's own
+    /// side effects; the event pump skips emission so plugin actions cannot
+    /// cascade back into the plugin that caused them.
+    plugin_event_depth: u32,
     ipc_queue: Option<
         std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<crate::ipc::IpcCommand>>>,
     >,
@@ -902,6 +907,7 @@ impl LubanApp {
             plugin_panel: None,
             plugin_panel_drag: None,
             plugin_panel_watch: 0,
+            plugin_event_depth: 0,
             ipc_queue: options.ipc_queue,
             pending_waits: Vec::new(),
             wait: options.wait,

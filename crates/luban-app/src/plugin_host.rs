@@ -77,6 +77,32 @@ pub struct PluginHost {
     runtimes: BTreeMap<String, PluginRuntime>,
 }
 
+/// Where a plugin-requested command run (`HostAction::RunCommand`) routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunCommandRoute {
+    /// `depth > MAX_COMMAND_DEPTH`: the cascade is rejected.
+    DepthExceeded,
+    /// A built-in command; args, if any, are ignored.
+    BuiltIn,
+    /// Not built-in: the host resolves a live plugin command or reports the
+    /// command as not found.
+    HostCommand,
+}
+
+/// Pure routing decision for a plugin-requested command run, consumed by the
+/// app-side action executor. `depth` is the depth of the command being
+/// launched (the requesting command's `command_depth` + 1); the runtime's own
+/// `command.run` applies the same cap, so both layers agree on the limit.
+pub(crate) fn route_run_command(id: &str, depth: u8) -> RunCommandRoute {
+    if depth > luban_plugin::runtime::MAX_COMMAND_DEPTH {
+        return RunCommandRoute::DepthExceeded;
+    }
+    if crate::commands::spec(id).is_some() {
+        return RunCommandRoute::BuiltIn;
+    }
+    RunCommandRoute::HostCommand
+}
+
 impl PluginHost {
     pub fn load(settings: &Settings, safe_mode: bool) -> Self {
         let root = luban_core::settings::plugins_dir();
@@ -923,5 +949,66 @@ mod tests {
             .is_err());
         assert!(host.fire_timer("timer", "ghost", input).unwrap().is_err());
         assert_eq!(host.runtimes["timer"].consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn host_run_command_passes_args_to_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            dir.path(),
+            "argsy",
+            &[],
+            r#"return { activate = function(ctx) end, run = function(ctx, args)
+                luban.notify(tostring(args and args.n or "nil"))
+            end }"#,
+        );
+        let mut host = host_from(dir.path());
+        let input = host_input(&host, "argsy");
+        // Host-level parity with the runtime tests: the args payload the app
+        // executor hands to run_command reaches the entry as its second
+        // parameter, and `None` reaches it as nil.
+        let call = host
+            .run_command(
+                "argsy",
+                "run",
+                "test.run",
+                Some(serde_json::json!({ "n": 7 })),
+                input.clone(),
+            )
+            .expect("runtime loaded");
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(call.output.actions, vec![HostAction::Notify("7".into())]);
+        let call = host
+            .run_command("argsy", "run", "test.run", None, input)
+            .expect("runtime loaded");
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(call.output.actions, vec![HostAction::Notify("nil".into())]);
+    }
+
+    #[test]
+    fn run_command_route_rejects_depth_and_knows_builtins() {
+        // The depth of the command being launched is capped: the first chain
+        // step past MAX_COMMAND_DEPTH is rejected before any host lookup.
+        assert_eq!(
+            route_run_command("anything", luban_plugin::runtime::MAX_COMMAND_DEPTH + 1),
+            RunCommandRoute::DepthExceeded
+        );
+        assert_eq!(
+            route_run_command("anything", u8::MAX),
+            RunCommandRoute::DepthExceeded
+        );
+        // A launch at the cap itself is still allowed; the runtime enforces
+        // the same boundary for its own `command.run`.
+        assert_eq!(
+            route_run_command("ghost.command", luban_plugin::runtime::MAX_COMMAND_DEPTH),
+            RunCommandRoute::HostCommand
+        );
+        // Built-ins route before the host, plugin commands and unknown ids
+        // alike resolve there.
+        assert_eq!(route_run_command("file.save", 0), RunCommandRoute::BuiltIn);
+        assert_eq!(
+            route_run_command("unknown.command", 0),
+            RunCommandRoute::HostCommand
+        );
     }
 }

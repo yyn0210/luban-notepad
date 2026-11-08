@@ -74,12 +74,14 @@ impl LubanApp {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_plugin_command(
         &mut self,
         plugin_id: &str,
         entry: &str,
         command_id: &str,
         args: Option<serde_json::Value>,
+        command_depth: u8,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -97,8 +99,8 @@ impl LubanApp {
             document: self.plugin_document_snapshot(cx),
             settings,
             allowed_roots: self.plugin_allowed_roots(),
-            command_depth: 0,
-            context_kind: luban_plugin::runtime::CallContextKind::default(),
+            command_depth,
+            context_kind: luban_plugin::runtime::CallContextKind::User,
         };
         let Some(call) = self
             .plugin_host
@@ -113,6 +115,35 @@ impl LubanApp {
             );
             return false;
         };
+        self.apply_plugin_call(plugin_id, call, window, cx)
+    }
+
+    /// True while any plugin-originated call's actions are being applied.
+    /// The Task 10 event pump's emit sites check this before emitting their
+    /// own events, so a plugin's write-backs cannot cascade back into the
+    /// plugin that caused them; until then only the executor maintains the
+    /// counter.
+    #[allow(dead_code)]
+    pub(super) fn plugin_in_event_context(&self) -> bool {
+        self.plugin_event_depth > 0
+    }
+
+    /// Apply one plugin-originated call's actions. This is the single
+    /// write-back point for every `HostAction` the runtime emits (commands
+    /// now; events and timers via the pump later), so depth bookkeeping and
+    /// the status/error contract stay uniform.
+    fn apply_plugin_call(
+        &mut self,
+        plugin_id: &str,
+        call: luban_plugin::runtime::RuntimeCall<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Actions applied inside this call are the plugin's own event-context
+        // side effects. The pump sets its own suppression before queueing
+        // events; this guard covers nested command.run chains spawned from
+        // event contexts.
+        self.plugin_event_depth = self.plugin_event_depth.saturating_add(1);
         let mut ok = call.error.is_none();
         for action in call.output.actions {
             match action {
@@ -143,26 +174,144 @@ impl LubanApp {
                     }
                 }
                 luban_plugin::runtime::HostAction::RefreshPanel { id } => {
-                    log::debug!(
-                        "plugin '{plugin_id}' requested panel refresh '{id}' (not wired yet)"
-                    );
+                    // Only a re-render of THIS plugin's already-open panel.
+                    // A closed panel is a silent no-op: there is no target to
+                    // refresh, and `luban.panel.open` exists for opening one.
+                    let open = self
+                        .plugin_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.plugin_id == plugin_id && panel.panel_id == id);
+                    if open {
+                        self.refresh_plugin_panel(plugin_id, &id, window, cx);
+                    }
                 }
-                luban_plugin::runtime::HostAction::SetCursor { .. } => {
-                    log::debug!("plugin cursor action (not wired yet)");
+                luban_plugin::runtime::HostAction::SetCursor { line, col } => {
+                    self.set_plugin_cursor(line, col, window, cx);
                 }
-                luban_plugin::runtime::HostAction::SetSetting { key, .. } => {
-                    log::debug!("plugin setting write-back '{key}' (not wired yet)");
+                luban_plugin::runtime::HostAction::SetSetting { key, value } => {
+                    if self.persist_plugin_setting(plugin_id, &key, value) {
+                        cx.notify();
+                    } else {
+                        ok = false;
+                        self.set_status(
+                            format!(
+                                "plugin '{plugin_id}' cannot write setting '{key}': \
+                                 undeclared or invalid value"
+                            ),
+                            cx,
+                        );
+                    }
                 }
-                luban_plugin::runtime::HostAction::RunCommand { id, .. } => {
-                    log::debug!("plugin requested command run '{id}' (not wired yet)");
+                luban_plugin::runtime::HostAction::RunCommand { id, args, depth } => {
+                    ok &= self.apply_run_command_action(&id, args, depth, window, cx);
                 }
             }
         }
+        self.plugin_event_depth = self.plugin_event_depth.saturating_sub(1);
         if let Some(error) = call.error {
             ok = false;
             self.set_status(error, cx);
         }
         ok
+    }
+
+    /// Resolve and run one plugin-requested `HostAction::RunCommand`.
+    fn apply_run_command_action(
+        &mut self,
+        id: &str,
+        args: Option<serde_json::Value>,
+        depth: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match crate::plugin_host::route_run_command(id, depth) {
+            crate::plugin_host::RunCommandRoute::DepthExceeded => {
+                self.set_status(format!("command '{id}' exceeded run depth"), cx);
+                false
+            }
+            crate::plugin_host::RunCommandRoute::BuiltIn => {
+                if args.is_some() {
+                    log::warn!("built-in command '{id}' ignores args");
+                }
+                // A built-in command is not itself a plugin call, but its
+                // implementation may dispatch plugin commands; keep the
+                // suppression guard up while it runs.
+                self.plugin_event_depth = self.plugin_event_depth.saturating_add(1);
+                let ran = self.run_command(id, window, cx);
+                self.plugin_event_depth = self.plugin_event_depth.saturating_sub(1);
+                ran
+            }
+            crate::plugin_host::RunCommandRoute::HostCommand => {
+                let Some(command) = self.plugin_host.command(id).cloned() else {
+                    self.set_status(format!("command '{id}' not found"), cx);
+                    return false;
+                };
+                self.run_plugin_command(
+                    &command.plugin_id,
+                    &command.entry,
+                    id,
+                    args,
+                    depth,
+                    window,
+                    cx,
+                )
+            }
+        }
+    }
+
+    /// Run a command by id, forwarding `args` to plugin commands (panel
+    /// clicks carry them) and ignoring them for built-ins. This is the
+    /// panel-facing counterpart of [`Self::run_command`], which always runs
+    /// plugin commands without args.
+    pub(super) fn run_command_with_args(
+        &mut self,
+        id: &str,
+        args: Option<serde_json::Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(command) = self.plugin_host.command(id).cloned() else {
+            if args.is_some() {
+                log::warn!("built-in command '{id}' ignores args");
+            }
+            return self.run_command(id, window, cx);
+        };
+        self.run_plugin_command(&command.plugin_id, &command.entry, id, args, 0, window, cx)
+    }
+
+    /// Move the active document's cursor to a 1-based line/column. Mirrors
+    /// the `--goto` semantics: positions clamp to the document bounds (the
+    /// `HostAction` contract says the host clamps), the caret is a collapsed
+    /// selection, and the editor scrolls the caret into view. Huge documents
+    /// jump through the disk engine; range views cannot map a file-global
+    /// line and report that instead.
+    fn set_plugin_cursor(
+        &mut self,
+        line: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
+            return;
+        };
+        if self.tabs[index].doc.is_huge() {
+            self.huge_jump_line(line as u64, col as u64, window, cx);
+            cx.notify();
+            return;
+        }
+        if self.tabs[index].large_file || self.tabs[index].doc.partial_range().is_some() {
+            // Range views carry local line numbers only; a file-global line
+            // cannot be mapped back without scanning the prefix.
+            self.set_status(tr("status.line_outside_partial"), cx);
+            return;
+        }
+        // Same rope math as the `--goto` path: clamp the line to the last
+        // row, then the column to that row's length. `select_char_range`
+        // moves the caret, scrolls it into view and focuses the editor, like
+        // Ctrl+G.
+        let (position, _) = self.line_selection_in_tab(index, line, col, 0, cx);
+        self.select_char_range(position, position, window, cx);
     }
 
     pub fn reload_packages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -930,17 +1079,26 @@ impl LubanApp {
         let weak_action = cx.weak_entity();
         let action_buttons = actions.into_iter().enumerate().map(move |(index, action)| {
             let weak = weak_action.clone();
-            let command = action.command.id;
+            let command = action.command;
             Button::new(("plugin-panel-action", index))
                 .label(action.label)
                 .ghost()
                 .compact()
                 .on_click(move |_, window, cx| {
-                    let command = command.clone();
                     let _ = weak.update(cx, |this, cx| {
-                        if !this.run_command(&command, window, cx) {
+                        // Like a line click: the panel stays open with its
+                        // scroll position and focus does not move.
+                        if !this.run_command_with_args(
+                            &command.id,
+                            command.args.clone(),
+                            window,
+                            cx,
+                        ) {
                             this.set_status(
-                                tr_args("status.command_failed", &[("command", command.clone())]),
+                                tr_args(
+                                    "status.command_failed",
+                                    &[("command", command.id.clone())],
+                                ),
                                 cx,
                             );
                         }
@@ -1340,9 +1498,14 @@ impl LubanApp {
                 .hover(move |this| this.bg(colors.secondary))
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        this.plugin_panel = None;
-                        this.focus_editor(window, cx);
-                        if !this.run_command(&command.id, window, cx) {
+                        // v2: the panel stays open, scroll position is
+                        // preserved, editor focus is not stolen
+                        if !this.run_command_with_args(
+                            &command.id,
+                            command.args.clone(),
+                            window,
+                            cx,
+                        ) {
                             this.set_status(
                                 tr_args(
                                     "status.command_failed",
