@@ -553,7 +553,7 @@ fn validate_setting(state: &CallState, key: &str, value: JsonValue) -> Result<()
 | `luban.settings.set(key, v)` | 未声明/非法 → 抛错；push SetSetting |
 | `luban.status.set(id, text)` | 未声明 id → 抛错 |
 | `luban.syntax.highlight(text, lang)` | >64KiB → 抛错 |
-| `luban.fs.read(path)` / `write(path, text)` | 无权限/越界 → 抛错；成功返回文本/true |
+| `luban.fs.read(path)` / `write(path, text)` | 无权限/越界 → 抛错；read 成功返回文本（写类变更函数一律返回 nil，见自审记录） |
 | `luban.data_dir()` | 失败抛错 |
 | `luban.panel.open(id)` | 非法 id → 抛错 |
 | `luban.panel.refresh(id)` | 非法 id → 抛错；push RefreshPanel |
@@ -1750,6 +1750,18 @@ git add -A && git commit -m "release: plugins 2.0.0 for host api_version 2"
 - **类型一致性**：`PanelCommand{id,args}` 全文一致；`CallContextKind{User,Event,Edit}`
   一致；`call_command(entry, command_id, args, input)` 新签名在 Task 8/9/11 对齐；
   `MAX_COMMAND_DEPTH` 定义于 Task 2、使用于 Task 3/11。
+- **执行期修订记录**（实施与评审中确认）：
+  1. mlua 0.12 的 Rust 闭包错误为 WrappedFailure userdata，消息仅在 `__tostring`
+     之后——Task 3 已把 error_handler 改为在插件加载前捕获 Lua `tostring` 取串
+     （计划的"无需改动"不成立）。
+  2. 变更类函数返回值统一为 nil（"getter 返回值、mutator 变更、失败抛错"）：
+     `status.set`/`panel.open`/`fs.write` 不再返回 true。
+  3. `lua_to_json` 增加 `MAX_JSON_DEPTH=128` 深度护栏：循环表此前会在 Rust 栈上
+     无限递归直接 abort 宿主（指令 hook 与 Lua 内存帽都不覆盖 Rust 栈）。
+  4. `settings.set` 校验通过后同步更新 CallState 内的运行时值（同分发读后写可见）。
+  5. `MAX_COMMAND_DEPTH` 升为 pub（Task 11 执行器跨 crate 使用）。
+  6. Task 11 注意事项：连续 `SetDocumentText` 动作可合并（last-wins 语义不变），
+     执行器可做收敛以限制单分发 Rust 内存放大。
 - **已知风险**：Task 4 的 `mlua::Function` 存储依赖既有 `error_handler` 字段先例，
   若编译器报生命周期错误，按 `plugin: Table` 同款处理（值持 Rc 句柄）；Task 10
   泵 spawn 点需 `window`，从 `reload_plugins(window, cx)`（有 window）与
