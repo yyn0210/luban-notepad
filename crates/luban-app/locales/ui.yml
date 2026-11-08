@@ -2449,6 +2449,9 @@ plugins.disable:
 plugins.approve:
   en: "Approve permissions"
   zh-CN: "批准权限"
+plugins.approval.events:
+  en: "This plugin will listen to: %{events}"
+  zh-CN: "此插件会监听：%{events}"
 plugins.update:
   en: "Update"
   zh-CN: "更新"

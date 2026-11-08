@@ -1166,6 +1166,7 @@ impl LubanApp {
             description: String,
             state: String,
             permissions: String,
+            events: String,
             manual: bool,
             reinstall: bool,
             approved: bool,
@@ -1237,6 +1238,11 @@ impl LubanApp {
                             parts.join(", ")
                         }
                     },
+                    events: entry
+                        .manifest
+                        .as_ref()
+                        .map(|manifest| manifest.events.join(", "))
+                        .unwrap_or_default(),
                     manual,
                     reinstall,
                     approved: self.plugin_host.approved(&entry.id),
@@ -1444,6 +1450,17 @@ impl LubanApp {
                                 }
                             )),
                     )
+                    .when(!row.events.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(tr_args(
+                                    "plugins.approval.events",
+                                    &[("events", row.events)],
+                                )),
+                        )
+                    })
                     .child(actions),
             );
         }
