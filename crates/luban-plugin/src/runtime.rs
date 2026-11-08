@@ -1,13 +1,14 @@
 //! Sandboxed Lua plugin runtime.
 //!
 //! Each plugin owns one Lua state. The runtime exposes a small `luban` table and
-//! never gives plugins access to `io`, `os`, `package`, `debug`, `require` or
-//! dynamic code loading. Document and status changes are collected as actions
-//! and applied by the application after the callback returns, so a plugin error
-//! cannot leave a half-applied host action.
+//! never gives plugins access to `io`, `os`, `package`, `debug` or dynamic code
+//! loading; `require` is replaced by a sandboxed in-plugin loader that only
+//! reads modules from the plugin directory (spec §8). Document and status
+//! changes are collected as actions and applied by the application after the
+//! callback returns, so a plugin error cannot leave a half-applied host action.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -379,7 +380,6 @@ impl PluginRuntime {
             "load",
             "loadfile",
             "dofile",
-            "require",
             "collectgarbage",
             "package",
             "io",
@@ -393,6 +393,55 @@ impl PluginRuntime {
                 .set(name, Value::Nil)
                 .map_err(|error| format!("cannot sandbox Lua state: {error}"))?;
         }
+
+        // Sandboxed in-plugin require (spec §8): `require("lib.parser")` loads
+        // and evaluates `<plugin-dir>/lib/parser.lua` inside this same Lua
+        // state, so a module sees the main script's globals and the same
+        // sandbox. The `package` library stays invisible; loaded modules are
+        // cached for the VM's lifetime, and module code runs inside the
+        // dispatching call, so it consumes that dispatch's instruction budget
+        // under the same debug hook. `loading` marks modules whose chunk is
+        // currently being evaluated — the only point where a cycle can
+        // re-enter `require` — so a circular dependency raises instead of
+        // recursing to a Rust stack overflow.
+        let module_cache: Rc<RefCell<HashMap<String, Value>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let loading: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+        let plugin_dir = dir.to_path_buf();
+        let require = lua
+            .create_function(move |lua, name: String| {
+                let cached = module_cache.borrow().get(&name).cloned();
+                if let Some(value) = cached {
+                    return Ok(value);
+                }
+                if loading.borrow().contains(&name) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "circular module dependency: '{name}'"
+                    )));
+                }
+                let path =
+                    resolve_module_path(&plugin_dir, &name).map_err(mlua::Error::RuntimeError)?;
+                let source = fs::read_to_string(&path).map_err(|error| {
+                    mlua::Error::RuntimeError(format!("module '{name}': {error}"))
+                })?;
+                // Past all fallible I/O: mark the module as loading only while its
+                // chunk runs, and always drop the marker afterwards so a failed
+                // load (e.g. pcall-caught by the plugin) cannot poison later
+                // requires of the same name. No RefCell borrow is held across
+                // `eval`, so nested requires can re-enter this closure safely.
+                loading.borrow_mut().insert(name.clone());
+                let evaluated: mlua::Result<Value> =
+                    lua.load(&source).set_name(format!("@{name}.lua")).eval();
+                loading.borrow_mut().remove(&name);
+                let value =
+                    evaluated.map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+                module_cache.borrow_mut().insert(name, value.clone());
+                Ok(value)
+            })
+            .map_err(|error| format!("cannot install plugin require: {error}"))?;
+        globals
+            .set("require", require)
+            .map_err(|error| format!("cannot install plugin require: {error}"))?;
         let remaining = Rc::new(Cell::new(DEFAULT_INSTRUCTION_LIMIT));
         let limit_hit = Rc::new(Cell::new(false));
         let hook_remaining = remaining.clone();
@@ -1655,6 +1704,50 @@ fn resolve_allowed_path(state: &CallState, path: &str, write: bool) -> Result<Pa
     Ok(resolved)
 }
 
+/// Resolve a dot-separated module name to a Lua file inside the plugin
+/// directory (spec §8): `lib.parser` maps to `<plugin-dir>/lib/parser.lua`.
+/// Names may only contain `[a-z0-9._]`, every dot-separated segment must be
+/// non-empty (so `..` and absolute paths are impossible by construction) and
+/// the name itself must be 1..=256 bytes. As defense in depth against
+/// symlinked directories, the resolved file's parent must canonicalize inside
+/// the canonical plugin directory; the file itself need not exist yet — a
+/// missing module surfaces from the caller's read as `module '<name>': ...`.
+fn resolve_module_path(plugin_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() || name.len() > 256 {
+        return Err("invalid module name".into());
+    }
+    let valid = name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'_'
+    });
+    if !valid {
+        return Err(format!("module name '{name}' may only contain [a-z0-9._]"));
+    }
+    if name.split('.').any(|part| part.is_empty() || part == "..") {
+        return Err(format!(
+            "module name '{name}' must not contain empty or '..' segments"
+        ));
+    }
+    let mut path = plugin_dir.to_path_buf();
+    for part in name.split('.') {
+        path.push(part);
+    }
+    path.set_extension("lua");
+    let parent = path.parent().expect("module path always has a parent");
+    let resolved_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("module '{name}': {error}"))?;
+    let root = plugin_dir
+        .canonicalize()
+        .unwrap_or_else(|_| plugin_dir.to_path_buf());
+    if !resolved_parent.starts_with(&root) {
+        return Err(format!("module '{name}' escapes the plugin directory"));
+    }
+    Ok(resolved_parent.join(
+        path.file_name()
+            .expect("module path always has a file name"),
+    ))
+}
+
 /// Recursion limit for Lua→JSON conversion; mirrors serde_json's own nesting
 /// limit. `Table::pairs` executes no VM instructions, so the instruction hook
 /// and the Lua memory limit cannot stop a cyclic table — only this guard can.
@@ -2104,7 +2197,10 @@ mod tests {
                 run = function(ctx)
                     assert(io == nil)
                     assert(os == nil)
-                    assert(require == nil)
+                    assert(package == nil)
+                    -- require stays available in its sandboxed form: it can
+                    -- only load modules from the plugin directory (spec §8).
+                    assert(type(require) == "function")
                     assert(load == nil)
                     assert(debug == nil)
                     luban.notify("safe")
@@ -3745,5 +3841,277 @@ mod tests {
         assert!(runtime
             .due_timer_ids(Instant::now() + Duration::from_millis(1000))
             .is_empty());
+    }
+
+    // ---- sandboxed in-plugin require (spec §8) ----
+    //
+    // Modules are plain files under the plugin tempdir next to main.lua;
+    // `write_plugin` only writes plugin.json and main.lua, so extra module
+    // files are added with `fs::write` before `PluginRuntime::new`.
+
+    #[test]
+    fn require_loads_local_module() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.lua"), "return { answer = 42 }").unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.notify(tostring(require('lib').answer)) end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(output.actions, vec![HostAction::Notify("42".into())]);
+    }
+
+    #[test]
+    fn require_nested_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.lua"), "return { answer = 42 }").unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        // `sub.mod` maps to `sub/mod.lua`; the module itself requires another
+        // module (nested require through the same sandboxed loader).
+        fs::write(
+            dir.path().join("sub/mod.lua"),
+            "return require('lib').answer",
+        )
+        .unwrap();
+        // A bare single-segment name maps to `<name>.lua`, independently of a
+        // `sub/` directory also existing.
+        fs::write(dir.path().join("sub.lua"), "return 'bare'").unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    luban.notify(tostring(require('sub.mod')))
+                    luban.notify(require('sub'))
+                    -- `lib` was already loaded by `sub.mod`: the cache serves it.
+                    luban.notify(tostring(require('lib').answer))
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![
+                HostAction::Notify("42".into()),
+                HostAction::Notify("bare".into()),
+                HostAction::Notify("42".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn require_caches_per_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        // The module counts its own loads in a global; globals are shared
+        // between main.lua and modules (same Lua state).
+        fs::write(
+            dir.path().join("counted.lua"),
+            "__G_loads = (__G_loads or 0) + 1\nreturn {}",
+        )
+        .unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    require('counted')
+                    require('counted')
+                    require('counted')
+                    luban.notify(tostring(__G_loads))
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        // Three requires, but the module body ran exactly once.
+        assert_eq!(output.actions, vec![HostAction::Notify("1".into())]);
+    }
+
+    #[test]
+    fn require_rejects_escape_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                parent = function(ctx) require('../evil') end,
+                absolute = function(ctx) require('/etc/passwd') end,
+                uppercase = function(ctx) require('Lib') end,
+                empty_segment = function(ctx) require('a..b') end,
+                leading_dot = function(ctx) require('.hidden') end,
+                empty = function(ctx) require('') end,
+                too_long = function(ctx) require(string.rep('a', 300)) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        for entry in [
+            "parent",
+            "absolute",
+            "uppercase",
+            "empty_segment",
+            "leading_dot",
+            "empty",
+            "too_long",
+        ] {
+            let error = command_error(
+                &mut runtime,
+                entry,
+                "test.run",
+                input(&manifest, dir.path()),
+            );
+            assert!(
+                error.contains("module name") || error.contains("invalid module"),
+                "{entry}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_circular_dependency_raises() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("self.lua"), "return require('self')").unwrap();
+        fs::write(dir.path().join("a.lua"), "return require('b')").unwrap();
+        fs::write(dir.path().join("b.lua"), "return require('a')").unwrap();
+        fs::write(dir.path().join("lib.lua"), "return { answer = 7 }").unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                itself = function(ctx) require('self') end,
+                mutual = function(ctx) require('a') end,
+                after = function(ctx) luban.notify(tostring(require('lib').answer)) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "itself",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("circular module dependency"), "{error}");
+        let error = command_error(
+            &mut runtime,
+            "mutual",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("circular module dependency"), "{error}");
+        // The failed circular loads did not poison the loader: a normal module
+        // still loads afterwards.
+        let output = run_command(
+            &mut runtime,
+            "after",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(output.actions, vec![HostAction::Notify("7".into())]);
+    }
+
+    #[test]
+    fn require_module_shares_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        // A module sees the main script's globals (`luban`) and its notify
+        // surfaces as a host action of the dispatching call...
+        fs::write(
+            dir.path().join("sharer.lua"),
+            "luban.notify('from module')\nreturn {}",
+        )
+        .unwrap();
+        // ...and the sandbox still hides `io` inside modules.
+        fs::write(
+            dir.path().join("io_touch.lua"),
+            "local handle = io.open('x')\nreturn handle",
+        )
+        .unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) require('sharer') end,
+                touch_io = function(ctx) require('io_touch') end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::Notify("from module".into())]
+        );
+        let error = command_error(
+            &mut runtime,
+            "touch_io",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("nil value"), "{error}");
+    }
+
+    #[test]
+    fn require_missing_module_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { run = function(ctx) require('nope') end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("module 'nope'"), "{error}");
+    }
+
+    #[test]
+    fn require_budget_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("heavy.lua"),
+            "for i = 1, 10000000 do end\nreturn {}",
+        )
+        .unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { run = function(ctx) require('heavy') end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        // A 10M-iteration loop is far below the default 50M dispatch budget;
+        // shrink the budget so the same invariant — module code runs inside
+        // the dispatching call and consumes its instruction budget — is
+        // proven deterministically in milliseconds.
+        runtime.instruction_limit = 1_000_000;
+        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        assert!(!call.is_ok());
+        let error = call.error.unwrap();
+        assert!(error.contains("instruction limit exceeded"), "{error}");
     }
 }
