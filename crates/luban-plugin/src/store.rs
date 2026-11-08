@@ -287,20 +287,26 @@ impl StorePlugin {
             .map(|(_, item)| item)
     }
 
-    /// Highest version that the host API can load, regardless of platform.
+    /// Highest version whose API exactly matches the host, regardless of
+    /// platform. The manifest layer loads only `manifest::API_VERSION`, so
+    /// entries declaring an older or newer API must never be offered.
     pub fn latest_compatible(&self, host_api: u32) -> Option<&StoreVersion> {
-        self.highest_version_where(|version| version.api_version <= host_api)
+        self.highest_version_where(|version| version.api_version == host_api)
     }
 
-    /// True when every published version needs a newer host API.
+    /// True when no published version matches the host API (kept for its
+    /// existing callers; despite the name it also covers entries that are
+    /// too old).
     pub fn requires_newer_api(&self, host_api: u32) -> bool {
         !self
             .versions
             .iter()
-            .any(|version| version.api_version <= host_api)
+            .any(|version| version.api_version == host_api)
     }
 
     /// Highest API version declared across all entries, used for messages.
+    /// The `unwrap_or(1)` default describes version-less legacy entries,
+    /// which predate per-version API data and really are API 1.
     pub fn required_api_version(&self) -> u32 {
         self.versions
             .iter()
@@ -313,7 +319,7 @@ impl StorePlugin {
     pub fn install_candidate(&self, target: Target, host_api: u32) -> Option<InstallCandidate<'_>> {
         let mut best: Option<(Version, &StoreVersion, &Artifact, bool)> = None;
         for version in &self.versions {
-            if version.api_version > host_api {
+            if version.api_version != host_api {
                 continue;
             }
             let Some((artifact, exact)) = version.artifact_for(target) else {
@@ -1134,6 +1140,53 @@ mod tests {
         let parsed = parse_catalog(&catalog_json(vec![plugin])).unwrap();
         let plugin = &parsed.catalog.plugins[0];
         assert!(plugin.install_candidate(Target::LinuxX64, 2).is_none());
+        assert!(plugin.latest_compatible(2).is_none());
+        assert!(plugin.requires_newer_api(2));
+        assert_eq!(plugin.required_api_version(), 3);
+    }
+
+    /// The manifest layer loads only `API_VERSION` exactly, so a catalog
+    /// entry for an older API (e.g. a legacy v1 plugin) must not be offered
+    /// as an install candidate or update.
+    #[test]
+    fn rejects_older_api_versions() {
+        let mut plugin = plugin_json("com.example.demo", "1.0.0", vec![artifact("universal")]);
+        plugin["versions"][0]["api_version"] = serde_json::json!(1);
+        let parsed = parse_catalog(&catalog_json(vec![plugin])).unwrap();
+        let plugin = &parsed.catalog.plugins[0];
+        assert!(plugin.install_candidate(Target::LinuxX64, 2).is_none());
+        assert!(plugin.latest_compatible(2).is_none());
+        assert!(plugin.requires_newer_api(2));
+        assert_eq!(plugin.required_api_version(), 1);
+        assert_eq!(
+            plugin.update_status(Some("1.0.0"), Target::LinuxX64, 2),
+            UpdateStatus::Installed
+        );
+    }
+
+    /// A plugin publishing both an older and a newer API version offers
+    /// neither to a host in between; `required_api_version` reports the
+    /// newest declared API for the message.
+    #[test]
+    fn skips_versions_straddling_the_host_api() {
+        let mut plugin = plugin_json("com.example.demo", "3.0.0", vec![artifact("universal")]);
+        plugin["versions"] = serde_json::json!([
+            {
+                "version": "1.0.0",
+                "api_version": 1,
+                "artifacts": [artifact("universal")]
+            },
+            {
+                "version": "3.0.0",
+                "api_version": 3,
+                "artifacts": [artifact("universal")]
+            }
+        ]);
+        plugin["latest_version"] = serde_json::json!("3.0.0");
+        let parsed = parse_catalog(&catalog_json(vec![plugin])).unwrap();
+        let plugin = &parsed.catalog.plugins[0];
+        assert!(plugin.install_candidate(Target::LinuxX64, 2).is_none());
+        assert!(plugin.latest_compatible(2).is_none());
         assert!(plugin.requires_newer_api(2));
         assert_eq!(plugin.required_api_version(), 3);
     }

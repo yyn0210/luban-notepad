@@ -2640,8 +2640,8 @@ plugins.store.latest_version:
   en: "Latest version: %{version}"
   zh-CN: "最新版本：%{version}"
 plugins.store.incompatible_api:
-  en: "This plugin requires API version %{version} or newer."
-  zh-CN: "此插件需要 API 版本 %{version} 或更新。"
+  en: "This plugin requires API version %{version}, which is incompatible with this build."
+  zh-CN: "此插件需要的 API 版本 %{version} 与当前版本不兼容。"
 plugins.store.incompatible_short:
   en: "Incompatible (API %{version})"
   zh-CN: "不兼容（API %{version}）"
