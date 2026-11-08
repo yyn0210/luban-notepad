@@ -681,9 +681,9 @@ impl PluginRuntime {
 
     /// Explicit registration helper / future host use: resolve `handler_name`
     /// in the plugin table and register it as a timer, with the same rules as
-    /// `luban.timer.after/every` (interval clamp, active-timer cap, overwrite
-    /// of an existing id). Timers are not declared in the manifest, so no
-    /// event-style allow-list applies.
+    /// `luban.timer.after/every` (id validation, interval clamp, active-timer
+    /// cap, overwrite of an existing id). Timers are not declared in the
+    /// manifest, so no event-style allow-list applies.
     pub fn register_timer(
         &mut self,
         id: &str,
@@ -720,8 +720,11 @@ impl PluginRuntime {
 
     /// Fire one timer, dispatched like an event handler: same call
     /// preparation, instruction budget, `(context, nil)` argument shape and
-    /// quarantine counting (the `context_kind` comes from the `input` the
-    /// host passes).
+    /// quarantine counting. The `input`'s `context_kind` is forced to
+    /// [`CallContextKind::Event`] before dispatch (spec §6 and the §10 flood
+    /// matrix): timer dispatch always shares the Event context, so a host
+    /// call site cannot accidentally enable document/command actions from a
+    /// timer.
     ///
     /// The entry is taken out of the map before any plugin code runs (no
     /// borrow guard is live across Lua, mirroring `dispatch_event`'s handler
@@ -733,6 +736,13 @@ impl PluginRuntime {
     ///
     /// The `Err` variant is reserved for unknown ids; a failing callback is
     /// contained in `RuntimeCall::error` and counted via `record_outcome`.
+    ///
+    /// Pump contract (Task 10): `due_timer_ids` can return up to `MAX_TIMERS`
+    /// ids per tick, but the pump caps timer dispatches per tick (8) —
+    /// leftover due timers wait for the next tick. An `Err` means the id
+    /// vanished mid-batch (e.g. an earlier timer's callback cancelled it
+    /// during the same tick): the pump must treat that as a benign skip —
+    /// not a failure, no `record_failure`.
     pub fn fire_timer(&mut self, id: &str, input: CallInput) -> Result<RuntimeCall<()>, String> {
         let entry = self.timers.borrow_mut().remove(id);
         let Some(entry) = entry else {
@@ -748,6 +758,11 @@ impl PluginRuntime {
                 },
             );
         }
+        // Timer dispatch always shares the Event context (spec §6/§10); the
+        // override happens here so host call sites cannot enable user-only
+        // privileges by passing a different context_kind.
+        let mut input = input;
+        input.context_kind = CallContextKind::Event;
         let state = self.prepare_call(input);
         let context = match install_luban_table(
             &self.lua,
@@ -1211,7 +1226,7 @@ fn install_luban_table(
     panel.set(
         "open",
         lua.create_function(move |_, id: String| {
-            validate_resource_id(&id, "panel")?;
+            validate_resource_id(&id, "panel").map_err(mlua::Error::RuntimeError)?;
             panel_state
                 .borrow_mut()
                 .actions
@@ -1223,7 +1238,7 @@ fn install_luban_table(
     panel.set(
         "refresh",
         lua.create_function(move |_, id: String| {
-            validate_resource_id(&id, "panel")?;
+            validate_resource_id(&id, "panel").map_err(mlua::Error::RuntimeError)?;
             refresh_state
                 .borrow_mut()
                 .actions
@@ -1301,7 +1316,7 @@ fn install_luban_table(
     command.set(
         "run",
         lua.create_function(move |_, (id, args): (String, Option<Value>)| {
-            validate_resource_id(&id, "command")?;
+            validate_resource_id(&id, "command").map_err(mlua::Error::RuntimeError)?;
             let mut state = run_state.borrow_mut();
             let args = match args {
                 Some(value) => Some(lua_to_json(&value, 0).map_err(mlua::Error::RuntimeError)?),
@@ -1346,7 +1361,10 @@ fn install_luban_table(
     // the runtime's timer map; the host pump dispatches due timers through
     // `PluginRuntime::fire_timer`, which shares the event-dispatch path
     // (instruction budget, error containment, quarantine counting). Entries
-    // live in the runtime struct, so rebuilding the VM clears them.
+    // live in the runtime struct, so rebuilding the VM clears them. Very
+    // large intervals register fine and simply never fire (the clock is a
+    // monotonic `Instant` per boot) while occupying one of the 16 slots until
+    // the timer is cancelled or the VM is rebuilt.
     let timer = lua.create_table()?;
     timer.set("after", install_timer_fn(lua, timers.clone(), true)?)?;
     timer.set("every", install_timer_fn(lua, timers.clone(), false)?)?;
@@ -1403,10 +1421,10 @@ fn validate_setting(state: &CallState, key: &str, value: JsonValue) -> Result<()
     Ok(())
 }
 
-/// Validate a plugin-supplied resource id (panel or command).
-fn validate_resource_id(id: &str, what: &str) -> mlua::Result<()> {
+/// Validate a plugin-supplied resource id (panel, command or timer).
+fn validate_resource_id(id: &str, what: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > MAX_ID_BYTES {
-        return Err(mlua::Error::RuntimeError(format!("invalid {what} id")));
+        return Err(format!("invalid {what} id"));
     }
     Ok(())
 }
@@ -1434,10 +1452,10 @@ fn register_handler(
 }
 
 /// Shared timer registration rule for `luban.timer.after/every` and the
-/// Rust-side `PluginRuntime::register_timer` helper: intervals below
-/// `MIN_TIMER_MS` are clamped up, the active-timer count stays under the cap
-/// (overwriting an existing id is always allowed) and a duplicate id replaces
-/// the previous entry outright.
+/// Rust-side `PluginRuntime::register_timer` helper: the id passes
+/// `validate_resource_id`, intervals below `MIN_TIMER_MS` are clamped up, the
+/// active-timer count stays under the cap (overwriting an existing id is
+/// always allowed) and a duplicate id replaces the previous entry outright.
 fn register_timer_entry(
     timers: &mut BTreeMap<String, TimerEntry>,
     id: String,
@@ -1445,6 +1463,7 @@ fn register_timer_entry(
     ms: u64,
     one_shot: bool,
 ) -> Result<(), String> {
+    validate_resource_id(&id, "timer")?;
     let is_new = !timers.contains_key(&id);
     if is_new && timers.len() >= MAX_TIMERS {
         return Err(format!("too many active timers (limit {MAX_TIMERS})"));
@@ -1462,8 +1481,9 @@ fn register_timer_entry(
     Ok(())
 }
 
-/// Build `luban.timer.after` / `luban.timer.every`: validate the id and the
-/// interval, then insert a `TimerEntry` via `register_timer_entry`. Timers are
+/// Build `luban.timer.after` / `luban.timer.every`: reject a negative
+/// interval, then insert a `TimerEntry` via `register_timer_entry` (id
+/// validation, interval clamp and the active-timer cap live there). Timers are
 /// not declared in the manifest, so there is no event-style allow-list.
 fn install_timer_fn(
     lua: &Lua,
@@ -1472,7 +1492,6 @@ fn install_timer_fn(
 ) -> mlua::Result<mlua::Function> {
     lua.create_function(
         move |_, (id, ms, callback): (String, i64, mlua::Function)| {
-            validate_resource_id(&id, "timer")?;
             if ms < 0 {
                 return Err(mlua::Error::RuntimeError(
                     "timer interval must be non-negative".into(),
@@ -3616,11 +3635,11 @@ mod tests {
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
         runtime.register_timer("t", 50, "tick", true).unwrap();
-        // The pump passes the dispatch context_kind in the CallInput (Event
-        // for timers); the runtime only consumes it.
-        let mut timer_input = input(&manifest, dir.path());
-        timer_input.context_kind = CallContextKind::Event;
-        let call = runtime.fire_timer("t", timer_input).unwrap();
+        // fire_timer forces the Event context regardless of what the host
+        // passes (spec §6), so the default User input below dispatches fine.
+        let call = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap();
         assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
         // The callback sees the dispatch context's document and its notify
         // surfaces in the RuntimeCall output.
@@ -3680,5 +3699,51 @@ mod tests {
             runtime.due_timer_ids(before + Duration::from_millis(1000)),
             vec!["t0".to_string()]
         );
+    }
+
+    #[test]
+    fn timers_success_resets_quarantine_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { tick = function(ctx) luban.notify("tick") end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        // Seed one failure through the host-side bookkeeping the pump uses.
+        runtime.record_failure();
+        assert_eq!(runtime.consecutive_failures(), 1);
+        // A successful timer fire counts as a successful dispatch and resets
+        // the consecutive-failure counter like any other success.
+        runtime.register_timer("t", 50, "tick", true).unwrap();
+        let call = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap();
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(runtime.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn register_timer_rejects_unknown_handler_and_invalid_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(dir.path(), r#"return { tick = function(ctx) end }"#);
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        // A missing handler errors naming the handler.
+        let error = runtime
+            .register_timer("t", 50, "no_such_handler", true)
+            .unwrap_err();
+        assert!(error.contains("no_such_handler"), "{error}");
+        // Invalid ids are rejected on the Rust path too, matching the Lua API.
+        let error = runtime.register_timer("", 50, "tick", true).unwrap_err();
+        assert!(error.contains("invalid timer id"), "{error}");
+        let error = runtime
+            .register_timer(&"x".repeat(MAX_ID_BYTES + 1), 50, "tick", true)
+            .unwrap_err();
+        assert!(error.contains("invalid timer id"), "{error}");
+        // Nothing was registered along the way.
+        assert!(runtime
+            .due_timer_ids(Instant::now() + Duration::from_millis(1000))
+            .is_empty());
     }
 }
