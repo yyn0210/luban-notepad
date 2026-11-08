@@ -97,7 +97,7 @@ Windows 使用多尺寸 `.ico`，macOS 使用 `.icns`。
 版本并提交后，推送同名标签：
 
 ```bash
-git tag v1.0.0-preview.15
+git tag v1.0.0-preview.16
 git push origin v1.0.0-preview.15
 ```
 
