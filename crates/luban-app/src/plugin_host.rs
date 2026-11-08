@@ -294,11 +294,12 @@ impl PluginHost {
         plugin_id: &str,
         entry: &str,
         command_id: &str,
+        args: Option<serde_json::Value>,
         input: CallInput,
     ) -> Option<RuntimeCall<()>> {
         let runtime = self.runtimes.get_mut(plugin_id)?;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.call_command(entry, command_id, input)
+            runtime.call_command(entry, command_id, args, input)
         })) {
             Ok(call) => Some(call),
             Err(_) => {

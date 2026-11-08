@@ -86,7 +86,9 @@ impl LubanApp {
             if !when.enabled(&context) {
                 return false;
             }
-            let ok = self.run_plugin_command(&plugin_id, &entry, id, window, cx);
+            // Task 11 wires the real args from panel clicks; menu, keybinding
+            // and CLI paths launch commands without args for now.
+            let ok = self.run_plugin_command(&plugin_id, &entry, id, None, window, cx);
             if ok {
                 if let Some(before) = recording_before {
                     // Plugin commands are recorded even when they only update

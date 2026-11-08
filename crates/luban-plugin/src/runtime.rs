@@ -29,7 +29,6 @@ const MAX_PANEL_LINE_BYTES: usize = 4 * 1024;
 const MAX_PANEL_SPANS: usize = 512;
 const MAX_PANEL_ACTIONS: usize = 8;
 const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
-const MAX_PANEL_ACTION_COMMAND_BYTES: usize = 128;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
 /// Maximum length for plugin-supplied resource ids (panels, commands).
@@ -596,7 +595,7 @@ impl PluginRuntime {
                 error: None,
             };
         };
-        self.invoke(&name, None, input).map_value(|_| ())
+        self.invoke(&name, None, None, input).map_value(|_| ())
     }
 
     pub fn deactivate(&mut self, input: CallInput) -> RuntimeCall<()> {
@@ -607,24 +606,30 @@ impl PluginRuntime {
                 error: None,
             };
         };
-        self.invoke(&name, None, input).map_value(|_| ())
+        self.invoke(&name, None, None, input).map_value(|_| ())
     }
 
+    /// Run a command entry with `(context, args)`: `args` is the JSON payload
+    /// carried by panel lines / header actions (`PanelCommand.args`) and
+    /// passed verbatim as the entry's second parameter (spec §5/§7). `None`
+    /// and `JsonValue::Null` both reach the entry as Lua nil, so v1
+    /// single-parameter entries keep working.
     pub fn call_command(
         &mut self,
         entry: &str,
         command_id: &str,
+        args: Option<JsonValue>,
         input: CallInput,
     ) -> RuntimeCall<()> {
         let call = self
-            .invoke(entry, Some(command_id), input)
+            .invoke(entry, Some(command_id), args, input)
             .map_value(|_| ());
         self.record_outcome(call.error.is_none());
         call
     }
 
     pub fn call_panel(&mut self, entry: &str, input: CallInput) -> RuntimeCall<PanelContent> {
-        let call = self.invoke(entry, None, input);
+        let call = self.invoke(entry, None, None, input);
         let call = match call.value {
             Some(value) if call.error.is_none() => match parse_panel(value) {
                 Ok(panel) => RuntimeCall {
@@ -942,6 +947,7 @@ impl PluginRuntime {
         &mut self,
         entry: &str,
         command_id: Option<&str>,
+        args: Option<JsonValue>,
         input: CallInput,
     ) -> RuntimeCall<Value> {
         let state = self.prepare_call(input);
@@ -971,7 +977,20 @@ impl PluginRuntime {
                         }
                     }
                 };
-                match call_with_traceback(&self.lua, &function, &self.error_handler, context) {
+                // Commands receive their args payload as the entry's second
+                // parameter (spec §5/§7); every other entry kind passes
+                // `None`, i.e. Lua nil, so v1 single-parameter entries keep
+                // working (Lua ignores trailing arguments).
+                let args_value = match args {
+                    Some(json) => json_to_lua(&self.lua, &json).unwrap_or(Value::Nil),
+                    None => Value::Nil,
+                };
+                match call_with_traceback(
+                    &self.lua,
+                    &function,
+                    &self.error_handler,
+                    (context, args_value),
+                ) {
                     Ok(value) => RuntimeCall {
                         output: RuntimeOutput {
                             actions: state.borrow().actions.clone(),
@@ -1060,8 +1079,9 @@ fn format_plugin_error(id: &str, entry: &str, error: &mlua::Error) -> String {
 /// Call a plugin entry through `xpcall` so Lua errors carry a traceback from
 /// the point where they were raised. The sandbox has no `debug` library, so
 /// the message handler is a Rust function backed by `Lua::traceback`. `args`
-/// becomes the trailing arguments of the call (a single table for
-/// command/panel entries, `(context, nil)` for event handlers).
+/// becomes the trailing arguments of the call: `(context, args)` for command
+/// entries (args nil when the host passes none) and `(context, nil)` for
+/// panel, event and timer handlers.
 fn call_with_traceback(
     lua: &Lua,
     function: &mlua::Function,
@@ -1916,7 +1936,17 @@ fn parse_panel(value: Value) -> Result<PanelContent, String> {
 
 /// Parse a panel line / header action `command` field (spec §7). v2 only
 /// accepts the table form `{ id = "...", args = {...} }`; the bare string
-/// form was removed. `nil` means no command (a plain line).
+/// form was removed.
+///
+/// `nil` asymmetry: for panel lines `nil` (or a missing `command` key) means
+/// "no command" and yields `Ok(None)` — a plain line. Header actions have no
+/// such meaning, so [`parse_panel_actions`] maps a missing/nil `command` to
+/// an error at its call site; this function itself only reports what it sees.
+///
+/// `args = {}` (an empty table) yields `Some({})`, so the command runs with
+/// an empty Lua table as its second parameter, while `args = nil` (or a
+/// missing `args` key) yields `None`, so the second parameter is nil —
+/// handlers can tell the two apart.
 ///
 /// `args` is a convenience, not a contract: a table that fails `lua_to_json`
 /// (cycles, over-deep nesting, mixed keys) or serializes over
@@ -1927,13 +1957,13 @@ fn parse_panel_command(value: Value) -> Result<Option<PanelCommand>, String> {
         return Ok(None);
     }
     let Value::Table(command) = value else {
-        return Err("line command must be a table { id, args }".to_string());
+        return Err("panel command must be a table { id, args }".to_string());
     };
     let id = match command.get::<Value>("id").unwrap_or(Value::Nil) {
         Value::String(id) => id.to_str().map_err(|error| error.to_string())?.to_string(),
         _ => return Err("panel command requires an 'id' string".to_string()),
     };
-    if id.is_empty() || id.len() > MAX_PANEL_ACTION_COMMAND_BYTES {
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
         return Err("panel command id is empty or too long".to_string());
     }
     let args_value = command.get::<Value>("args").unwrap_or(Value::Nil);
@@ -1980,9 +2010,13 @@ fn parse_panel_actions(value: Value) -> Result<Vec<PanelAction>, String> {
         if label.is_empty() || label.len() > MAX_PANEL_ACTION_LABEL_BYTES {
             return Err("panel action label is empty or too long".to_string());
         }
-        let Some(command) =
-            parse_panel_command(action.get::<Value>("command").unwrap_or(Value::Nil))?
-        else {
+        // Unlike the line path (which treats a missing/nil command as "plain
+        // line"), an action without a readable command is a programming
+        // error: propagate read failures instead of swallowing them.
+        let command_value = action
+            .get::<Value>("command")
+            .map_err(|error| format!("panel action command: {error}"))?;
+        let Some(command) = parse_panel_command(command_value)? else {
             return Err("panel action requires a command".to_string());
         };
         actions.push(PanelAction { label, command });
@@ -2137,7 +2171,7 @@ impl Drop for PluginRuntime {
             command_depth: 0,
             context_kind: CallContextKind::default(),
         };
-        let call = self.invoke(&name, None, input);
+        let call = self.invoke(&name, None, None, input);
         if let Some(error) = call.error {
             log::warn!("plugin '{}' deactivate failed: {error}", self.manifest.id);
         }
@@ -2201,14 +2235,15 @@ mod tests {
     }
 
     /// Run a command entry and return the collected host actions, panicking on
-    /// fail-fast errors.
+    /// fail-fast errors. Runs without args (`None`); tests exercising the args
+    /// payload pass it to `call_command`/`invoke` directly.
     fn run_command(
         runtime: &mut PluginRuntime,
         entry: &str,
         command_id: &str,
         input: CallInput,
     ) -> RuntimeOutput {
-        let call = runtime.call_command(entry, command_id, input);
+        let call = runtime.call_command(entry, command_id, None, input);
         assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
         call.output
     }
@@ -2220,7 +2255,7 @@ mod tests {
         command_id: &str,
         input: CallInput,
     ) -> String {
-        let call = runtime.call_command(entry, command_id, input);
+        let call = runtime.call_command(entry, command_id, None, input);
         match call.error {
             Some(error) => error,
             None => panic!("expected a fail-fast error, got {:?}", call.value),
@@ -2245,7 +2280,7 @@ mod tests {
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(call.is_ok(), "{:?}", call.error);
         assert_eq!(
             call.output.actions,
@@ -2284,7 +2319,7 @@ mod tests {
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(call.is_ok(), "{:?}", call.error);
         assert_eq!(call.output.actions, vec![HostAction::Notify("safe".into())]);
     }
@@ -2298,7 +2333,7 @@ mod tests {
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(!call.is_ok());
         let error = call.error.unwrap();
         assert!(error.contains("instruction limit"), "{error}");
@@ -2316,7 +2351,7 @@ mod tests {
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
         let mut input = input(&manifest, dir.path());
         input.document = None;
-        let call = runtime.call_command("run", "test.run", input);
+        let call = runtime.call_command("run", "test.run", None, input);
         assert!(!call.is_ok());
         let error = call.error.unwrap();
         assert!(error.contains("boom"), "{error}");
@@ -2393,10 +2428,16 @@ mod tests {
                     assert(decoded.a == 1 and decoded.b == "x" and decoded.c[1] == true)
                     luban.notify(encoded)
                 end,
+                echo = function(ctx, args)
+                    luban.notify(tostring(args and args.n or "nil"))
+                end,
                 list = function(ctx)
                     return {
                         title = "Demo",
-                        lines = { "one", { text = "two", command = { id = "test.run" } } },
+                        lines = {
+                            "one",
+                            { text = "two", command = { id = "echo", args = { n = 7 } } },
+                        },
                         actions = {
                             { label = "Refresh", command = { id = "test.run" } },
                             { label = "Info", command = { id = "test.info" } },
@@ -2407,7 +2448,7 @@ mod tests {
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(call.is_ok(), "{:?}", call.error);
         let panel = runtime.call_panel("list", input(&manifest, dir.path()));
         let panel = panel.value.unwrap();
@@ -2416,8 +2457,8 @@ mod tests {
         assert_eq!(
             panel.lines[1].command,
             Some(PanelCommand {
-                id: "test.run".to_string(),
-                args: None,
+                id: "echo".to_string(),
+                args: Some(serde_json::json!({ "n": 7 })),
             })
         );
         assert_eq!(panel.actions.len(), 2);
@@ -2429,6 +2470,18 @@ mod tests {
                 args: None,
             }
         );
+        // End-to-end: the args parsed off the Lua panel line flow through
+        // PanelCommand.args into call_command and reach the entry as its
+        // second parameter.
+        let command = panel.lines[1].command.clone().expect("line command");
+        let call = runtime.call_command(
+            "echo",
+            &command.id,
+            command.args,
+            input(&manifest, dir.path()),
+        );
+        assert!(call.is_ok(), "{:?}", call.error);
+        assert_eq!(call.output.actions, vec![HostAction::Notify("7".into())]);
     }
 
     #[test]
@@ -2480,7 +2533,7 @@ mod tests {
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
         let panel = runtime.call_panel("list", input(&manifest, dir.path()));
         let error = panel.error.expect("string commands must be rejected in v2");
-        assert!(error.contains("must be a table"), "{error}");
+        assert!(error.contains("panel command must be a table"), "{error}");
     }
 
     #[test]
@@ -2639,7 +2692,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_command_args_non_table_is_dropped_or_error() {
+    fn panel_command_args_non_table_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = write_plugin(
             dir.path(),
@@ -2658,6 +2711,109 @@ mod tests {
         let panel = runtime.call_panel("list", input(&manifest, dir.path()));
         let error = panel.error.expect("non-table args must be rejected");
         assert!(error.contains("'args' must be a table"), "{error}");
+    }
+
+    #[test]
+    fn command_entry_receives_args_as_second_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { run = function(ctx, args) return (args and args.n) or 0 end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        // `call_command` discards the entry's return value, so the value
+        // assertions go through `invoke`, the shared arg-threading path.
+        let call = runtime.invoke(
+            "run",
+            Some("t.args"),
+            Some(serde_json::json!({ "n": 7 })),
+            input(&manifest, dir.path()),
+        );
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(call.value, Some(Value::Integer(7)));
+        let call = runtime.invoke("run", Some("t.args"), None, input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(call.value, Some(Value::Integer(0)));
+    }
+
+    #[test]
+    fn args_are_json_round_tripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx, args)
+                    assert(type(args) == "table", "args type")
+                    assert(type(args.path) == "string", "path type")
+                    assert(type(args.depth) == "number", "depth type")
+                    assert(type(args.flag) == "boolean", "flag type")
+                    assert(#args.list == 2, "list length")
+                    assert(args.list[1] == 1 and args.list[2] == 2, "list items")
+                    return args.path
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.invoke(
+            "run",
+            Some("t.args"),
+            Some(serde_json::json!({
+                "path": "$.a",
+                "depth": 2,
+                "flag": true,
+                "list": [1, 2]
+            })),
+            input(&manifest, dir.path()),
+        );
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        match call.value {
+            Some(Value::String(path)) => assert_eq!(path.to_str().unwrap(), "$.a"),
+            other => panic!("expected the entry to return args.path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panel_entries_receive_nil_second_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx, args)
+                    return { lines = { { text = (args == nil and "nil" or "table") } } }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel
+            .value
+            .expect("panel entry must receive nil as second arg");
+        assert_eq!(panel.lines[0].text, "nil");
+    }
+
+    #[test]
+    fn command_depth_still_enforced_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { run = function(ctx, args) luban.command.run("next", args) end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let mut deep = input(&manifest, dir.path());
+        deep.command_depth = MAX_COMMAND_DEPTH;
+        let call =
+            runtime.call_command("run", "test.run", Some(serde_json::json!({ "n": 1 })), deep);
+        let error = call
+            .error
+            .expect("depth must still raise with args present");
+        assert!(
+            error.contains(&format!("maximum depth of {MAX_COMMAND_DEPTH}")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2700,7 +2856,7 @@ mod tests {
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(call.is_ok(), "{:?}", call.error);
         let error = command_error(
             &mut runtime,
@@ -2783,7 +2939,7 @@ mod tests {
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(call.is_ok(), "{:?}", call.error);
         assert_eq!(
             call.output.actions,
@@ -3553,6 +3709,7 @@ mod tests {
             &["on_active_document_changed"],
             r#"local M = {}
             M.changed = function(ctx, payload)
+                assert(type(ctx) == "table", "ctx type")
                 if payload ~= nil then error("payload must be nil") end
                 if ctx.document == nil then
                     luban.notify("nil")
@@ -4416,7 +4573,7 @@ mod tests {
         // the dispatching call and consumes its instruction budget — is
         // proven deterministically in milliseconds.
         runtime.instruction_limit = 1_000_000;
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
         assert!(!call.is_ok());
         let error = call.error.unwrap();
         assert!(error.contains("instruction limit exceeded"), "{error}");

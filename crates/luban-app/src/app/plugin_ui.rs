@@ -79,6 +79,7 @@ impl LubanApp {
         plugin_id: &str,
         entry: &str,
         command_id: &str,
+        args: Option<serde_json::Value>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -101,7 +102,7 @@ impl LubanApp {
         };
         let Some(call) = self
             .plugin_host
-            .run_command(plugin_id, entry, command_id, input)
+            .run_command(plugin_id, entry, command_id, args, input)
         else {
             self.set_status(
                 tr_args(
