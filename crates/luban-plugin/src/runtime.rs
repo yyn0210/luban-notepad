@@ -577,6 +577,13 @@ impl PluginRuntime {
     /// so later handlers observe mutations made by earlier ones. A failing
     /// handler does not stop the remaining ones — the first failure is
     /// surfaced and the whole dispatch counts as one quarantine step.
+    ///
+    /// The handler list is a snapshot taken before the dispatch starts:
+    /// handlers registered during the dispatch — including by the handlers
+    /// themselves — do not fire in it, and handlers removed during it still
+    /// fire. The instruction budget is shared across all handlers of the
+    /// dispatch, so a runaway handler can starve later ones into limit
+    /// failures; the whole dispatch still counts as one failure step.
     pub fn dispatch_event(&mut self, event: &str, input: CallInput) -> RuntimeCall<()> {
         let handlers = self
             .event_handlers
@@ -585,6 +592,9 @@ impl PluginRuntime {
             .cloned()
             .unwrap_or_default();
         if handlers.is_empty() {
+            // A no-op dispatch is still a successful dispatch: it resets the
+            // consecutive-failure counter like any other success.
+            self.record_outcome(true);
             return RuntimeCall {
                 output: RuntimeOutput::default(),
                 value: Some(()),
@@ -653,29 +663,15 @@ impl PluginRuntime {
     /// table and register it for a manifest-declared event, with the same
     /// validation as `luban.events.on` (declared event, handler limit).
     pub fn register_event(&mut self, event: &str, handler_name: &str) -> Result<(), String> {
-        if !self
-            .manifest
-            .events
-            .iter()
-            .any(|declared| declared == event)
-        {
-            return Err(format!("event '{event}' is not declared in the manifest"));
-        }
         let handler: mlua::Function = self.plugin.get(handler_name).map_err(|_| {
             format!(
                 "plugin '{}' has no function '{handler_name}'",
                 self.manifest.id
             )
         })?;
+        let allowed: BTreeSet<String> = self.manifest.events.iter().cloned().collect();
         let mut registry = self.event_handlers.borrow_mut();
-        let total: usize = registry.values().map(Vec::len).sum();
-        if total >= MAX_EVENT_HANDLERS {
-            return Err(format!(
-                "too many event handlers (limit {MAX_EVENT_HANDLERS})"
-            ));
-        }
-        registry.entry(event.to_string()).or_default().push(handler);
-        Ok(())
+        register_handler(&mut registry, &allowed, event.to_string(), handler)
     }
 
     /// Record a dispatch outcome for the consecutive-failure quarantine
@@ -698,6 +694,24 @@ impl PluginRuntime {
     /// Current consecutive-failure count (test/introspection helper).
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.get()
+    }
+
+    /// Host-side quarantine bookkeeping (Task 9): count a failed dispatch on
+    /// the same counter the runtime uses, so host-path failures (e.g. panics
+    /// while applying plugin actions) contribute to auto-disable too.
+    pub fn record_failure(&self) {
+        self.record_outcome(false);
+    }
+
+    /// Host-side quarantine bookkeeping (Task 9): count a successful dispatch.
+    pub fn record_success(&self) {
+        self.record_outcome(true);
+    }
+
+    /// Host-side quarantine bookkeeping (Task 9): clear the counter (e.g.
+    /// after the user manually re-enables a quarantined plugin).
+    pub fn reset_failures(&self) {
+        self.consecutive_failures.set(0);
     }
 
     /// Shared per-dispatch preparation for the command, panel, event and
@@ -1199,20 +1213,9 @@ fn install_luban_table(
     events_api.set(
         "on",
         lua.create_function(move |_, (name, handler): (String, mlua::Function)| {
-            if !on_allowed.contains(&name) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "event '{name}' is not declared in the manifest"
-                )));
-            }
             let mut registry = on_events.borrow_mut();
-            let total: usize = registry.values().map(Vec::len).sum();
-            if total >= MAX_EVENT_HANDLERS {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "too many event handlers (limit {MAX_EVENT_HANDLERS})"
-                )));
-            }
-            registry.entry(name).or_default().push(handler);
-            Ok(())
+            register_handler(&mut registry, &on_allowed, name, handler)
+                .map_err(mlua::Error::RuntimeError)
         })?,
     )?;
     let off_events = events_registry.clone();
@@ -1274,6 +1277,28 @@ fn validate_resource_id(id: &str, what: &str) -> mlua::Result<()> {
     if id.is_empty() || id.len() > MAX_ID_BYTES {
         return Err(mlua::Error::RuntimeError(format!("invalid {what} id")));
     }
+    Ok(())
+}
+
+/// Shared event-handler registration rule for `luban.events.on` and the
+/// Rust-side `PluginRuntime::register_event` helper: the event must be
+/// declared in the manifest and the total handler count stays under the cap.
+fn register_handler(
+    registry: &mut BTreeMap<String, Vec<mlua::Function>>,
+    allowed: &BTreeSet<String>,
+    name: String,
+    handler: mlua::Function,
+) -> Result<(), String> {
+    if !allowed.contains(&name) {
+        return Err(format!("event '{name}' is not declared in the manifest"));
+    }
+    let total: usize = registry.values().map(Vec::len).sum();
+    if total >= MAX_EVENT_HANDLERS {
+        return Err(format!(
+            "too many event handlers (limit {MAX_EVENT_HANDLERS})"
+        ));
+    }
+    registry.entry(name).or_default().push(handler);
     Ok(())
 }
 
@@ -2977,5 +3002,131 @@ mod tests {
         assert!(!error.contains("boom b"), "{error}");
         // Two failed handlers inside one dispatch count as ONE failure.
         assert_eq!(runtime.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn events_off_removes_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_events_plugin(
+            dir.path(),
+            &["on_document_save"],
+            r#"local M = {}
+            M.hit = function(ctx) luban.notify("hit") end
+            function M.activate(ctx)
+                luban.events.on("on_document_save", M.hit)
+            end
+            function M.off(ctx) luban.events.off("on_document_save") end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.activate(input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(call.output.actions, vec![HostAction::Notify("hit".into())]);
+        run_command(
+            &mut runtime,
+            "off",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert!(call.output.actions.is_empty());
+        assert_eq!(runtime.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn events_registered_mid_dispatch_fire_on_the_next_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_events_plugin(
+            dir.path(),
+            &["on_document_save"],
+            r#"local M = {}
+            M.first = function(ctx)
+                luban.events.on("on_document_save", M.late)
+                luban.notify("first")
+            end
+            M.late = function(ctx) luban.notify("late") end
+            function M.activate(ctx)
+                luban.events.on("on_document_save", M.first)
+            end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.activate(input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        // The handler registered during dispatch #1 does not fire in it: the
+        // handler list is snapshotted before the dispatch starts.
+        let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("first".into())]
+        );
+        // The registration survives into the next dispatch: `late` now runs
+        // after `first` (which fires again and re-registers it each time).
+        let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(
+            call.output.actions,
+            vec![
+                HostAction::Notify("first".into()),
+                HostAction::Notify("late".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn events_register_helper_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_events_plugin(
+            dir.path(),
+            &["on_document_save"],
+            r#"local M = {}
+            function M.activate(ctx) end
+            function M.bump(ctx) luban.notify("helper") end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.register_event("on_document_save", "bump").unwrap();
+        let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("helper".into())]
+        );
+    }
+
+    #[test]
+    fn events_dispatch_with_no_handlers_resets_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_events_plugin(
+            dir.path(),
+            &["on_document_save", "on_document_open"],
+            r#"local M = {}
+            M.boom = function(ctx) error("boom") end
+            function M.activate(ctx)
+                luban.events.on("on_document_save", M.boom)
+            end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.activate(input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        let call = runtime.dispatch_event("on_document_save", input(&manifest, dir.path()));
+        assert!(!call.is_ok());
+        assert_eq!(runtime.consecutive_failures(), 1);
+        // A dispatch with no registered handlers is a successful (no-op)
+        // dispatch and resets the consecutive-failure counter like any other
+        // success.
+        let call = runtime.dispatch_event("on_document_open", input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert!(call.output.actions.is_empty());
+        assert_eq!(runtime.consecutive_failures(), 0);
     }
 }
