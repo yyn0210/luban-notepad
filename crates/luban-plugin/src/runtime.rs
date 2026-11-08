@@ -15,7 +15,7 @@ use std::rc::Rc;
 use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use serde_json::{Map, Value as JsonValue};
 
-use crate::manifest::PluginManifest;
+use crate::manifest::{PluginManifest, SettingContribution};
 use crate::permissions::PermissionSet;
 
 pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 50_000_000;
@@ -31,21 +31,21 @@ const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
 const MAX_PANEL_ACTION_COMMAND_BYTES: usize = 128;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
-// Bounds for the v2 call context and host action surface; used by upcoming
-// v2 API tasks (event dispatch, timers, notifications, command cascades).
-#[allow(dead_code)]
+// Bounds for the v2 call context and host action surface; the still-unused
+// ones are consumed by upcoming v2 API tasks (event dispatch, timers, panel
+// command args).
+#[expect(dead_code)]
 const MAX_EVENT_HANDLERS: usize = 32;
-#[allow(dead_code)]
+#[expect(dead_code)]
 const MAX_TIMERS: usize = 16;
-#[allow(dead_code)]
+#[expect(dead_code)]
 const MIN_TIMER_MS: u64 = 50;
-#[allow(dead_code)]
+/// Maximum `command.run` cascade depth (pub: the app executor in Task 11
+/// rejects `HostAction::RunCommand` chains deeper than this).
+pub const MAX_COMMAND_DEPTH: u8 = 4;
 const MAX_NOTIFY_PER_CALL: usize = 8;
-#[allow(dead_code)]
 const MAX_NOTIFY_BYTES: usize = 1024;
-#[allow(dead_code)]
-const MAX_COMMAND_DEPTH: u8 = 4;
-#[allow(dead_code)]
+#[expect(dead_code)]
 const MAX_PANEL_ARGS_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
@@ -68,7 +68,7 @@ pub struct DocumentSnapshot {
 }
 
 /// Dispatch origin. Event/Edit contexts are cascade-suppressed; Edit is
-/// additionally read-only.
+/// additionally read-only. Timer dispatch shares `Event`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CallContextKind {
     #[default]
@@ -118,8 +118,9 @@ pub enum HostAction {
         key: String,
         value: JsonValue,
     },
-    /// Run a command through the host command system; `depth` already includes
-    /// this hop (+1).
+    /// Run a command through the host command system. `depth` is the depth of
+    /// the command being launched (caller's `command_depth` + 1); the executor
+    /// rejects `depth > MAX_COMMAND_DEPTH`.
     RunCommand {
         id: String,
         args: Option<JsonValue>,
@@ -311,6 +312,10 @@ struct CallState {
     settings: Map<String, JsonValue>,
     allowed_roots: Vec<PathBuf>,
     status_ids: BTreeSet<String>,
+    /// Declared setting schemas, for `luban.settings.set` validation.
+    schemas: Vec<SettingContribution>,
+    command_depth: u8,
+    context_kind: CallContextKind,
     actions: Vec<HostAction>,
 }
 
@@ -402,19 +407,33 @@ impl PluginRuntime {
             .iter()
             .map(|item| item.id.clone())
             .collect();
-        let state = Rc::new(RefCell::new(CallState::from_input(initial, &status_ids)));
+        let state = Rc::new(RefCell::new(CallState::from_input(
+            initial,
+            &status_ids,
+            &manifest.contributes.settings,
+        )));
         state.borrow_mut().permissions = permissions.clone();
         install_luban_table(&lua, state.clone())
             .map_err(|error| format!("cannot initialize plugin API: {error}"))?;
         let handler_limit_hit = limit_hit.clone();
+        // Rust-raised v2 API errors (`Err(mlua::Error::RuntimeError(..))` from
+        // the closures below) reach this handler as mlua WrappedFailure
+        // userdata whose message lives behind `__tostring`. Stringify through
+        // Lua's `tostring` (captured before any plugin code can override it);
+        // `coerce_string` cannot see that metamethod and would lose the
+        // message.
+        let handler_tostring: mlua::Function = lua
+            .globals()
+            .get("tostring")
+            .map_err(|error| format!("cannot install plugin error handler: {error}"))?;
         let error_handler = lua
             .create_function(move |lua, message: Value| {
                 let message = if handler_limit_hit.get() {
                     "plugin instruction limit exceeded".to_string()
                 } else {
-                    lua.coerce_string(message)?
-                        .map(|text| text.to_string_lossy())
-                        .unwrap_or_else(|| "plugin error".to_string())
+                    handler_tostring
+                        .call::<String>(message)
+                        .unwrap_or_else(|_| "plugin error".to_string())
                 };
                 match lua.traceback(Some(&message), 1) {
                     Ok(traceback) => Ok(Value::String(traceback)),
@@ -529,7 +548,8 @@ impl PluginRuntime {
             .iter()
             .map(|item| item.id.clone())
             .collect();
-        let mut call_state = CallState::from_input(input, &status_ids);
+        let mut call_state =
+            CallState::from_input(input, &status_ids, &self.manifest.contributes.settings);
         call_state.permissions = self.permissions.clone();
         let state = Rc::new(RefCell::new(call_state));
         let output = match install_luban_table(&self.lua, state.clone())
@@ -591,7 +611,11 @@ impl<T> RuntimeCall<T> {
 }
 
 impl CallState {
-    fn from_input(input: CallInput, status_ids: &BTreeSet<String>) -> Self {
+    fn from_input(
+        input: CallInput,
+        status_ids: &BTreeSet<String>,
+        schemas: &[SettingContribution],
+    ) -> Self {
         Self {
             plugin: input.plugin,
             permissions: PermissionSet::empty(),
@@ -599,6 +623,9 @@ impl CallState {
             settings: input.settings,
             allowed_roots: input.allowed_roots,
             status_ids: status_ids.clone(),
+            schemas: schemas.to_vec(),
+            command_depth: input.command_depth,
+            context_kind: input.context_kind,
             actions: Vec::new(),
         }
     }
@@ -661,6 +688,7 @@ fn call_with_traceback(
 
 fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result<()> {
     let luban = lua.create_table()?;
+    luban.set("version", 2)?;
 
     let log_plugin_id = state.borrow().plugin.id.clone();
     luban.set(
@@ -677,14 +705,30 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         })?,
     )?;
 
+    // Resource over-limits drop silently instead of failing the call.
     let notify_state = state.clone();
     luban.set(
         "notify",
         lua.create_function(move |_, message: String| {
-            notify_state
-                .borrow_mut()
+            let mut state = notify_state.borrow_mut();
+            let message = if message.len() > MAX_NOTIFY_BYTES {
+                truncate_utf8(&message, MAX_NOTIFY_BYTES).to_string()
+            } else {
+                message
+            };
+            let count = state
                 .actions
-                .push(HostAction::Notify(message));
+                .iter()
+                .filter(|action| matches!(action, HostAction::Notify(_)))
+                .count();
+            if count >= MAX_NOTIFY_PER_CALL {
+                log::warn!(
+                    "plugin '{}' notify dropped (limit {MAX_NOTIFY_PER_CALL})",
+                    state.plugin.id
+                );
+                return Ok(());
+            }
+            state.actions.push(HostAction::Notify(message));
             Ok(())
         })?,
     )?;
@@ -692,78 +736,81 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
     let json = lua.create_table()?;
     json.set(
         "encode",
-        lua.create_function(move |lua, value: Value| match lua_to_json(&value) {
-            Ok(value) => match serde_json::to_string(&value) {
-                Ok(text) => Ok((Value::String(lua.create_string(&text)?), None)),
-                Err(error) => Ok((Value::Nil, Some(error.to_string()))),
-            },
-            Err(error) => Ok((Value::Nil, Some(error))),
+        lua.create_function(move |lua, value: Value| {
+            let value = lua_to_json(&value).map_err(mlua::Error::RuntimeError)?;
+            let text = serde_json::to_string(&value)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            Ok(Value::String(lua.create_string(&text)?))
         })?,
     )?;
     json.set(
         "decode",
         lua.create_function(move |lua, text: String| {
-            match serde_json::from_str::<JsonValue>(&text) {
-                Ok(value) => match json_to_lua(lua, &value) {
-                    Ok(value) => Ok((value, None)),
-                    Err(error) => Ok((Value::Nil, Some(error.to_string()))),
-                },
-                Err(error) => Ok((Value::Nil, Some(error.to_string()))),
-            }
+            let value: JsonValue = serde_json::from_str(&text)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            json_to_lua(lua, &value)
         })?,
     )?;
     luban.set("json", json)?;
 
-    let document_state = state.clone();
-    luban.set(
-        "get_document",
+    let document = lua.create_table()?;
+    let get_document_state = state.clone();
+    document.set(
+        "get",
         lua.create_function(move |lua, ()| {
-            let state = document_state.borrow();
+            let state = get_document_state.borrow();
             match &state.document {
-                Some(document) => Ok((Value::Table(document_to_lua(lua, document)?), None)),
-                None => Ok((Value::Nil, Some("unsupported document".to_string()))),
+                Some(document) => Ok(Value::Table(document_to_lua(lua, document)?)),
+                None => Ok(Value::Nil),
             }
         })?,
     )?;
-
-    let set_document_state = state.clone();
-    luban.set(
-        "set_document_text",
+    let set_text_state = state.clone();
+    document.set(
+        "set_text",
         lua.create_function(
-            move |_, (text, select_start, select_end): (String, Option<usize>, Option<usize>)| {
-                let mut state = set_document_state.borrow_mut();
-                let selection = select_start.map(|start| (start, select_end.unwrap_or(start)));
-                match replace_document(&mut state, text, selection) {
-                    Ok(()) => Ok((Value::Boolean(true), None)),
-                    Err(error) => Ok((Value::Nil, Some(error))),
-                }
+            move |_, (text, start, end): (String, Option<usize>, Option<usize>)| {
+                let mut state = set_text_state.borrow_mut();
+                ensure_document_writable(&state)?;
+                let selection = match (start, end) {
+                    (None, None) => None,
+                    (Some(start), Some(end)) => Some((start, end)),
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(
+                            "set_text expects (text, sel_start, sel_end) with both offsets".into(),
+                        ))
+                    }
+                };
+                replace_document(&mut state, text, selection).map_err(mlua::Error::RuntimeError)?;
+                Ok(())
             },
         )?,
     )?;
-
     let insert_state = state.clone();
-    luban.set(
-        "insert_text",
+    document.set(
+        "insert",
         lua.create_function(move |_, text: String| {
             let mut state = insert_state.borrow_mut();
-            match insert_document(&mut state, text) {
-                Ok(()) => Ok((Value::Boolean(true), None)),
-                Err(error) => Ok((Value::Nil, Some(error))),
-            }
+            ensure_document_writable(&state)?;
+            insert_document(&mut state, text).map_err(mlua::Error::RuntimeError)?;
+            Ok(())
         })?,
     )?;
-
-    let replace_selection_state = state.clone();
-    luban.set(
-        "replace_selection",
-        lua.create_function(move |_, text: String| {
-            let mut state = replace_selection_state.borrow_mut();
-            match insert_document(&mut state, text) {
-                Ok(()) => Ok((Value::Boolean(true), None)),
-                Err(error) => Ok((Value::Nil, Some(error))),
+    let cursor_state = state.clone();
+    document.set(
+        "set_cursor",
+        lua.create_function(move |_, (line, col): (usize, usize)| {
+            if line == 0 || col == 0 {
+                return Err(mlua::Error::RuntimeError("line and col are 1-based".into()));
             }
+            cursor_state
+                .borrow_mut()
+                .actions
+                .push(HostAction::SetCursor { line, col });
+            Ok(())
         })?,
     )?;
+    luban.set("document", document)?;
 
     let settings = lua.create_table()?;
     let settings_state = state.clone();
@@ -772,9 +819,22 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         lua.create_function(move |lua, key: String| {
             let state = settings_state.borrow();
             match state.settings.get(&key) {
-                Some(value) => Ok((json_to_lua(lua, value)?, None::<String>)),
-                None => Ok((Value::Nil, None::<String>)),
+                Some(value) => json_to_lua(lua, value),
+                None => Ok(Value::Nil),
             }
+        })?,
+    )?;
+    let set_setting_state = state.clone();
+    settings.set(
+        "set",
+        lua.create_function(move |_, (key, value): (String, Value)| {
+            let mut state = set_setting_state.borrow_mut();
+            let json = lua_to_json(&value).map_err(mlua::Error::RuntimeError)?;
+            validate_setting(&state, &key, json.clone()).map_err(mlua::Error::RuntimeError)?;
+            state
+                .actions
+                .push(HostAction::SetSetting { key, value: json });
+            Ok(())
         })?,
     )?;
     luban.set("settings", settings)?;
@@ -786,13 +846,12 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         lua.create_function(move |_, (id, text): (String, String)| {
             let mut state = status_state.borrow_mut();
             if !state.status_ids.contains(&id) {
-                return Ok((
-                    Value::Nil,
-                    Some(format!("status item '{id}' is not declared")),
-                ));
+                return Err(mlua::Error::RuntimeError(format!(
+                    "status item '{id}' is not declared"
+                )));
             }
             state.actions.push(HostAction::SetStatus { id, text });
-            Ok((Value::Boolean(true), None))
+            Ok(Value::Boolean(true))
         })?,
     )?;
     luban.set("status", status)?;
@@ -802,10 +861,9 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         "highlight",
         lua.create_function(move |lua, (text, language): (String, String)| {
             if text.len() > MAX_HIGHLIGHT_BYTES {
-                return Ok((
-                    Value::Nil,
-                    Some(format!("text is larger than {MAX_HIGHLIGHT_BYTES} bytes")),
-                ));
+                return Err(mlua::Error::RuntimeError(format!(
+                    "text is larger than {MAX_HIGHLIGHT_BYTES} bytes"
+                )));
             }
             let spans = luban_core::syntax::highlight_spans(&text, &language);
             let table = lua.create_table()?;
@@ -815,27 +873,38 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
                 item.set("role", role)?;
                 table.set(index + 1, item)?;
             }
-            Ok((Value::Table(table), None))
+            Ok(Value::Table(table))
         })?,
     )?;
     luban.set("syntax", syntax)?;
 
     let panel = lua.create_table()?;
-    // Version 2 adds { actions = { { label, command }, ... } } to panel
-    // content, rendered as a flat action bar in the panel header.
-    panel.set("version", 2)?;
     let panel_state = state.clone();
     panel.set(
         "open",
         lua.create_function(move |_, id: String| {
             if id.is_empty() || id.len() > 128 {
-                return Ok((Value::Nil, Some("invalid panel id".to_string())));
+                return Err(mlua::Error::RuntimeError("invalid panel id".into()));
             }
             panel_state
                 .borrow_mut()
                 .actions
                 .push(HostAction::OpenPanel { id });
-            Ok((Value::Boolean(true), None))
+            Ok(Value::Boolean(true))
+        })?,
+    )?;
+    let refresh_state = state.clone();
+    panel.set(
+        "refresh",
+        lua.create_function(move |_, id: String| {
+            if id.is_empty() || id.len() > 128 {
+                return Err(mlua::Error::RuntimeError("invalid panel id".into()));
+            }
+            refresh_state
+                .borrow_mut()
+                .actions
+                .push(HostAction::RefreshPanel { id });
+            Ok(())
         })?,
     )?;
     luban.set("panel", panel)?;
@@ -847,25 +916,22 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         lua.create_function(move |lua, path: String| {
             let state = read_state.borrow();
             if !state.permissions.filesystem() {
-                return Ok((
-                    Value::Nil,
-                    Some("plugin does not have the filesystem permission".to_string()),
+                return Err(mlua::Error::RuntimeError(
+                    "plugin does not have the filesystem permission".into(),
                 ));
             }
-            match resolve_allowed_path(&state, &path, false) {
-                Ok(path) => match fs::metadata(&path) {
-                    Ok(metadata) if metadata.len() > MAX_FILE_BYTES => Ok((
-                        Value::Nil,
-                        Some(format!("file is larger than {MAX_FILE_BYTES} bytes")),
-                    )),
-                    Ok(_) => match fs::read_to_string(&path) {
-                        Ok(text) => Ok((Value::String(lua.create_string(&text)?), None)),
-                        Err(error) => Ok((Value::Nil, Some(error.to_string()))),
-                    },
-                    Err(error) => Ok((Value::Nil, Some(error.to_string()))),
-                },
-                Err(error) => Ok((Value::Nil, Some(error))),
+            let path =
+                resolve_allowed_path(&state, &path, false).map_err(mlua::Error::RuntimeError)?;
+            let metadata = fs::metadata(&path)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            if metadata.len() > MAX_FILE_BYTES {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "file is larger than {MAX_FILE_BYTES} bytes"
+                )));
             }
+            let text = fs::read_to_string(&path)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            Ok(Value::String(lua.create_string(&text)?))
         })?,
     )?;
     let write_state = state.clone();
@@ -874,48 +940,106 @@ fn install_luban_table(lua: &Lua, state: Rc<RefCell<CallState>>) -> mlua::Result
         lua.create_function(move |_, (path, text): (String, String)| {
             let state = write_state.borrow();
             if !state.permissions.filesystem() {
-                return Ok((
-                    Value::Nil,
-                    Some("plugin does not have the filesystem permission".to_string()),
+                return Err(mlua::Error::RuntimeError(
+                    "plugin does not have the filesystem permission".into(),
                 ));
             }
             if text.len() > MAX_DOCUMENT_BYTES {
-                return Ok((
-                    Value::Nil,
-                    Some(format!("text is larger than {MAX_DOCUMENT_BYTES} bytes")),
-                ));
+                return Err(mlua::Error::RuntimeError(format!(
+                    "text is larger than {MAX_DOCUMENT_BYTES} bytes"
+                )));
             }
-            match resolve_allowed_path(&state, &path, true) {
-                Ok(path) => match luban_core::atomic_write::write_atomic(&path, text.as_bytes()) {
-                    Ok(()) => Ok((Value::Boolean(true), None)),
-                    Err(error) => Ok((Value::Nil, Some(error.to_string()))),
-                },
-                Err(error) => Ok((Value::Nil, Some(error))),
-            }
+            let path =
+                resolve_allowed_path(&state, &path, true).map_err(mlua::Error::RuntimeError)?;
+            luban_core::atomic_write::write_atomic(&path, text.as_bytes())
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            Ok(Value::Boolean(true))
         })?,
     )?;
     luban.set("fs", fs)?;
 
+    let data_dir_state = state.clone();
     luban.set(
         "data_dir",
         lua.create_function(move |lua, ()| {
-            let state = state.borrow();
-            if let Err(error) = fs::create_dir_all(&state.plugin.data_dir) {
-                return Ok((
-                    Value::Nil,
-                    Some(format!("cannot create plugin data directory: {error}")),
-                ));
-            }
-            Ok((
-                Value::String(
-                    lua.create_string(state.plugin.data_dir.to_string_lossy().as_bytes())?,
-                ),
-                None,
-            ))
+            let state = data_dir_state.borrow();
+            fs::create_dir_all(&state.plugin.data_dir).map_err(|error| {
+                mlua::Error::RuntimeError(format!("cannot create plugin data directory: {error}"))
+            })?;
+            Ok(Value::String(lua.create_string(
+                state.plugin.data_dir.to_string_lossy().as_bytes(),
+            )?))
         })?,
     )?;
 
+    let command = lua.create_table()?;
+    let run_state = state.clone();
+    command.set(
+        "run",
+        lua.create_function(move |_, (id, args): (String, Option<Value>)| {
+            if id.is_empty() || id.len() > 128 {
+                return Err(mlua::Error::RuntimeError("invalid command id".into()));
+            }
+            let mut state = run_state.borrow_mut();
+            let args = match args {
+                Some(value) => Some(lua_to_json(&value).map_err(mlua::Error::RuntimeError)?),
+                None => None,
+            };
+            let depth = state.command_depth.saturating_add(1);
+            if depth > MAX_COMMAND_DEPTH {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "command.run exceeds the maximum depth of {MAX_COMMAND_DEPTH}"
+                )));
+            }
+            state
+                .actions
+                .push(HostAction::RunCommand { id, args, depth });
+            Ok(())
+        })?,
+    )?;
+    luban.set("command", command)?;
+
     lua.globals().set("luban", luban)?;
+    Ok(())
+}
+
+/// Truncate to `limit` bytes, backing off to the last UTF-8 character boundary
+/// so multi-byte text is never split mid-character.
+fn truncate_utf8(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// v2 API: document mutations are user-command only. The `on_edit` context is
+/// read-only and calls without a document raise fail-fast errors.
+fn ensure_document_writable(state: &CallState) -> Result<(), mlua::Error> {
+    if state.context_kind == CallContextKind::Edit {
+        return Err(mlua::Error::RuntimeError(
+            "document is read-only in the on_edit context".into(),
+        ));
+    }
+    if state.document.is_none() {
+        return Err(mlua::Error::RuntimeError("unsupported document".into()));
+    }
+    Ok(())
+}
+
+/// Check `key` against the plugin's declared setting schema.
+fn validate_setting(state: &CallState, key: &str, value: JsonValue) -> Result<(), String> {
+    let schema = state
+        .schemas
+        .iter()
+        .find(|setting| setting.key == key)
+        .ok_or_else(|| format!("setting '{key}' is not declared"))?;
+    if !crate::manifest::setting_value_is_valid(schema, &value) {
+        return Err(format!("invalid value for setting '{key}'"));
+    }
     Ok(())
 }
 
@@ -1439,6 +1563,33 @@ mod tests {
         }
     }
 
+    /// Run a command entry and return the collected host actions, panicking on
+    /// fail-fast errors.
+    fn run_command(
+        runtime: &mut PluginRuntime,
+        entry: &str,
+        command_id: &str,
+        input: CallInput,
+    ) -> RuntimeOutput {
+        let call = runtime.call_command(entry, command_id, input);
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        call.output
+    }
+
+    /// Run a command entry and return the fail-fast error message.
+    fn command_error(
+        runtime: &mut PluginRuntime,
+        entry: &str,
+        command_id: &str,
+        input: CallInput,
+    ) -> String {
+        let call = runtime.call_command(entry, command_id, input);
+        match call.error {
+            Some(error) => error,
+            None => panic!("expected a fail-fast error, got {:?}", call.value),
+        }
+    }
+
     #[test]
     fn runs_a_command_and_collects_actions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1448,8 +1599,9 @@ mod tests {
                 activate = function(ctx) luban.log("info", "activated") end,
                 deactivate = function(ctx) end,
                 run = function(ctx)
+                    luban.log("info", "running")
                     luban.notify("hello")
-                    luban.insert_text("X")
+                    luban.document.insert("X")
                     luban.status.set("test.status", "done")
                 end
             }"#,
@@ -1550,25 +1702,42 @@ mod tests {
             dir.path(),
             r#"return {
                 run = function(ctx)
-                    local ok, err = luban.fs.write(ctx.plugin.data_dir .. "/state.txt", "hello")
-                    assert(ok, err)
-                    local text = assert(luban.fs.read(ctx.plugin.data_dir .. "/state.txt"))
-                    assert(text == "hello")
-                end
+                    assert(luban.fs.write(ctx.plugin.data_dir .. "/state.txt", "hello"))
+                    assert(luban.fs.read(ctx.plugin.data_dir .. "/state.txt") == "hello")
+                end,
+                escape = function(ctx)
+                    luban.fs.write("/etc/luban-plugin-escape-test.txt", "no")
+                end,
             }"#,
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
-        assert!(call.is_ok(), "{:?}", call.error);
+        run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("data/state.txt")).unwrap(),
             "hello"
         );
+        let error = command_error(
+            &mut runtime,
+            "escape",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("outside the allowed roots"), "{error}");
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), PermissionSet::empty()).unwrap();
-        let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
-        assert!(!call.is_ok());
+        let error = command_error(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("filesystem permission"), "{error}");
     }
 
     #[test]
@@ -1578,8 +1747,11 @@ mod tests {
             dir.path(),
             r#"return {
                 run = function(ctx)
-                    assert(luban.panel.version == 2, "panel API version")
-                    luban.notify(luban.json.encode({ a = 1, b = "x", c = { true } }))
+                    assert(luban.version == 2, "API version")
+                    local encoded = luban.json.encode({ a = 1, b = "x", c = { true } })
+                    local decoded = luban.json.decode(encoded)
+                    assert(decoded.a == 1 and decoded.b == "x" and decoded.c[1] == true)
+                    luban.notify(encoded)
                 end,
                 list = function(ctx)
                     return {
@@ -1653,15 +1825,21 @@ mod tests {
                     assert(seen.primary, "primary role missing")
                     local plain = assert(luban.syntax.highlight("hello", "no-such-language"))
                     assert(#plain == 1 and plain[1].role == "primary")
-                    local missing, err = luban.syntax.highlight(string.rep("x", 70000), "rust")
-                    assert(missing == nil and err:find("larger than"))
-                end
+                end,
+                oversize = function(ctx) luban.syntax.highlight(string.rep("x", 70000), "rust") end,
             }"#,
         );
         let mut runtime =
             PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
         let call = runtime.call_command("run", "test.run", input(&manifest, dir.path()));
         assert!(call.is_ok(), "{:?}", call.error);
+        let error = command_error(
+            &mut runtime,
+            "oversize",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("larger than"), "{error}");
     }
 
     #[test]
@@ -1730,8 +1908,7 @@ mod tests {
             dir.path(),
             r#"return {
                 run = function(ctx)
-                    local ok, err = luban.panel.open("test.panel")
-                    assert(ok, err)
+                    assert(luban.panel.open("test.panel"))
                 end
             }"#,
         );
@@ -1750,5 +1927,415 @@ mod tests {
     #[test]
     fn context_kind_defaults_to_user() {
         assert_eq!(CallContextKind::default(), CallContextKind::User);
+    }
+
+    #[test]
+    fn notify_drops_messages_over_the_per_dispatch_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    for i = 1, 10 do luban.notify("n" .. i) end
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        let notifies: Vec<&str> = output
+            .actions
+            .iter()
+            .map(|action| match action {
+                HostAction::Notify(text) => text.as_str(),
+                _ => panic!("unexpected action {action:?}"),
+            })
+            .collect();
+        assert_eq!(notifies.len(), MAX_NOTIFY_PER_CALL);
+        assert_eq!(notifies.first(), Some(&"n1"));
+        assert_eq!(notifies.last(), Some(&"n8"));
+    }
+
+    #[test]
+    fn notify_truncates_long_messages_at_a_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        // 400 × "中" = 1200 bytes; the 1024-byte limit falls mid-character, so
+        // truncation must back off to the last boundary (1023 bytes, 341 chars).
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.notify(string.rep("中", 400)) end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        let HostAction::Notify(text) = &output.actions[0] else {
+            panic!("expected a notify action, got {:?}", output.actions);
+        };
+        assert_eq!(text.len(), 1023);
+        assert_eq!(text.chars().count(), 341);
+    }
+
+    #[test]
+    fn json_errors_are_fail_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                encode_bad = function(ctx) luban.json.encode(function() end) end,
+                decode_bad = function(ctx) luban.json.decode("oops") end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "encode_bad",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("cannot be encoded"), "{error}");
+        let error = command_error(
+            &mut runtime,
+            "decode_bad",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("expected"), "{error}");
+    }
+
+    #[test]
+    fn document_api_is_namespaced_and_fail_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                probe = function(ctx) luban.notify(tostring(luban.document.get() ~= nil)) end,
+                write = function(ctx) luban.document.set_text("x", 0, 0) end,
+                append = function(ctx) luban.document.insert("x") end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+
+        let output = run_command(
+            &mut runtime,
+            "probe",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(output.actions, vec![HostAction::Notify("true".into())]);
+
+        let mut without_document = input(&manifest, dir.path());
+        without_document.document = None;
+        let output = run_command(&mut runtime, "probe", "test.run", without_document);
+        assert_eq!(output.actions, vec![HostAction::Notify("false".into())]);
+
+        // set_text / insert raise instead of returning (nil, err).
+        let mut without_document = input(&manifest, dir.path());
+        without_document.document = None;
+        let error = command_error(&mut runtime, "write", "test.run", without_document);
+        assert!(error.contains("unsupported document"), "{error}");
+
+        let mut without_document = input(&manifest, dir.path());
+        without_document.document = None;
+        let error = command_error(&mut runtime, "append", "test.run", without_document);
+        assert!(error.contains("unsupported document"), "{error}");
+    }
+
+    #[test]
+    fn document_set_text_requires_both_selection_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.document.set_text("x", 1) end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("set_text expects"), "{error}");
+    }
+
+    #[test]
+    fn document_mutations_are_read_only_in_edit_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                write = function(ctx) luban.document.set_text("x", 1, 1) end,
+                append = function(ctx) luban.document.insert("x") end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let mut edit = input(&manifest, dir.path());
+        edit.context_kind = CallContextKind::Edit;
+        let error = command_error(&mut runtime, "write", "test.run", edit);
+        assert!(error.contains("read-only"), "{error}");
+        let mut edit = input(&manifest, dir.path());
+        edit.context_kind = CallContextKind::Edit;
+        let error = command_error(&mut runtime, "append", "test.run", edit);
+        assert!(error.contains("read-only"), "{error}");
+    }
+
+    #[test]
+    fn document_set_cursor_is_one_based() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.document.set_cursor(3, 1) end,
+                zero_line = function(ctx) luban.document.set_cursor(0, 1) end,
+                zero_col = function(ctx) luban.document.set_cursor(1, 0) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::SetCursor { line: 3, col: 1 }]
+        );
+        let error = command_error(
+            &mut runtime,
+            "zero_line",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("1-based"), "{error}");
+        let error = command_error(
+            &mut runtime,
+            "zero_col",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("1-based"), "{error}");
+    }
+
+    #[test]
+    fn settings_get_returns_nil_for_undeclared_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                probe = function(ctx)
+                    luban.notify(tostring(luban.settings.get("uppercase")))
+                    luban.notify(tostring(luban.settings.get("missing")))
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "probe",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![
+                HostAction::Notify("false".into()),
+                HostAction::Notify("nil".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn settings_set_validates_against_the_declared_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                ok = function(ctx) luban.settings.set("uppercase", true) end,
+                undeclared = function(ctx) luban.settings.set("missing", 1) end,
+                invalid = function(ctx) luban.settings.set("uppercase", "yes") end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(&mut runtime, "ok", "test.run", input(&manifest, dir.path()));
+        assert_eq!(
+            output.actions,
+            vec![HostAction::SetSetting {
+                key: "uppercase".into(),
+                value: serde_json::Value::Bool(true),
+            }]
+        );
+        let error = command_error(
+            &mut runtime,
+            "undeclared",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(
+            error.contains("setting 'missing' is not declared"),
+            "{error}"
+        );
+        let error = command_error(
+            &mut runtime,
+            "invalid",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(
+            error.contains("invalid value for setting 'uppercase'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn status_set_rejects_undeclared_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.status.set("other.status", "x") end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(
+            error.contains("status item 'other.status' is not declared"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn panel_open_and_refresh_are_fail_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                refresh = function(ctx) luban.panel.refresh("test.panel") end,
+                open_empty = function(ctx) luban.panel.open("") end,
+                open_long = function(ctx) luban.panel.open(string.rep("x", 129)) end,
+                refresh_empty = function(ctx) luban.panel.refresh("") end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "refresh",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::RefreshPanel {
+                id: "test.panel".into()
+            }]
+        );
+        for entry in ["open_empty", "open_long", "refresh_empty"] {
+            let error = command_error(
+                &mut runtime,
+                entry,
+                "test.run",
+                input(&manifest, dir.path()),
+            );
+            assert!(error.contains("invalid panel id"), "{entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn command_run_validates_id_and_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.command.run("other.plugin.cmd", { n = 1 }) end,
+                empty = function(ctx) luban.command.run("") end,
+                long = function(ctx) luban.command.run(string.rep("x", 129)) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::RunCommand {
+                id: "other.plugin.cmd".into(),
+                args: Some(serde_json::json!({ "n": 1 })),
+                depth: 1,
+            }]
+        );
+        for entry in ["empty", "long"] {
+            let error = command_error(
+                &mut runtime,
+                entry,
+                "test.run",
+                input(&manifest, dir.path()),
+            );
+            assert!(error.contains("invalid command id"), "{entry}: {error}");
+        }
+        // `depth` is the caller's command_depth + 1; chains beyond
+        // MAX_COMMAND_DEPTH raise.
+        let mut deep = input(&manifest, dir.path());
+        deep.command_depth = MAX_COMMAND_DEPTH;
+        let error = command_error(&mut runtime, "run", "test.run", deep);
+        assert!(
+            error.contains(&format!("maximum depth of {MAX_COMMAND_DEPTH}")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn data_dir_returns_the_plugin_data_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx) luban.notify(luban.data_dir()) end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let output = run_command(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            output.actions,
+            vec![HostAction::Notify(
+                dir.path().join("data").to_string_lossy().into()
+            )]
+        );
     }
 }
