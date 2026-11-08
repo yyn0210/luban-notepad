@@ -31,8 +31,12 @@ Luban Notepad 的所有重要变更都记录在此。
   `(nil, err)` 双值返回（mutator 成功返回 `nil`，校验类错误 `error()` 抛出，
   资源类超限静默丢弃）；面板 `command` 从字符串形态改为 `{ id, args }` 表；
   `luban.panel.version` 废弃移除。
-- 官方 markdown / JSON Preview 插件将随发布重写为 2.0.0（v2 原生，删除全部
-  feature-detect 降级路径）；插件仓库与商店条目更新由发布任务补充。
+- 官方 markdown / JSON Preview 插件发布 2.0.0（v2 原生重写，删除全部
+  feature-detect 降级路径）：拆分为沙箱 require 模块，`on_edit` 驱动解析缓存，
+  面板逐节点交互（markdown 标题折叠/跳转源行，JSON 逐节点折叠/展开且滚动
+  位置保留）；JSON 折叠状态主存 VM 内存并以 data 目录持久化兜底（补声明
+  `filesystem` 权限，更新时需重新批准）；商店条目与目录已同步（商店兼容性
+  判定改为 api_version 精确匹配）。
 
 ## [1.0.0-preview.16] — 2026-11-08
 
