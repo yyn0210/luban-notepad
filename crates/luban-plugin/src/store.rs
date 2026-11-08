@@ -908,7 +908,7 @@ mod tests {
             "latest_version": version,
             "versions": [{
                 "version": version,
-                "api_version": 1,
+                "api_version": 2,
                 "release_notes": "Initial release.",
                 "artifacts": artifacts
             }]
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(parsed.catalog.plugins.len(), 1);
         let plugin = &parsed.catalog.plugins[0];
         assert_eq!(plugin.id, "com.example.demo");
-        assert_eq!(plugin.versions[0].api_version, 1);
+        assert_eq!(plugin.versions[0].api_version, 2);
         assert_eq!(plugin.versions[0].artifacts[0].target, Target::Universal);
     }
 
@@ -969,10 +969,10 @@ mod tests {
         )]))
         .unwrap();
         let plugin = &parsed.catalog.plugins[0];
-        let candidate = plugin.install_candidate(Target::LinuxX64, 1).unwrap();
+        let candidate = plugin.install_candidate(Target::LinuxX64, 2).unwrap();
         assert!(candidate.exact_target);
         assert_eq!(candidate.artifact.target, Target::LinuxX64);
-        let candidate = plugin.install_candidate(Target::DarwinArm64, 1).unwrap();
+        let candidate = plugin.install_candidate(Target::DarwinArm64, 2).unwrap();
         assert!(!candidate.exact_target);
         assert_eq!(candidate.artifact.target, Target::Universal);
     }
@@ -988,7 +988,7 @@ mod tests {
         let plugin = &parsed.catalog.plugins[0];
         assert!(plugin.supports_target(Target::WindowsArm64));
         assert!(!plugin.supports_target(Target::LinuxX64));
-        assert!(plugin.install_candidate(Target::LinuxX64, 1).is_none());
+        assert!(plugin.install_candidate(Target::LinuxX64, 2).is_none());
     }
 
     #[test]
@@ -1098,12 +1098,12 @@ mod tests {
         plugin["versions"] = serde_json::json!([
             {
                 "version": "1.0.0",
-                "api_version": 1,
+                "api_version": 2,
                 "artifacts": [artifact("universal")]
             },
             {
                 "version": "1.2.0",
-                "api_version": 1,
+                "api_version": 2,
                 "artifacts": [artifact("universal")]
             }
         ]);
@@ -1111,18 +1111,18 @@ mod tests {
         let parsed = parse_catalog(&catalog_json(vec![plugin])).unwrap();
         let plugin = &parsed.catalog.plugins[0];
         assert_eq!(
-            plugin.update_status(None, Target::LinuxX64, 1),
+            plugin.update_status(None, Target::LinuxX64, 2),
             UpdateStatus::NotInstalled
         );
         assert_eq!(
-            plugin.update_status(Some("1.0.0"), Target::LinuxX64, 1),
+            plugin.update_status(Some("1.0.0"), Target::LinuxX64, 2),
             UpdateStatus::UpdateAvailable {
                 installed: "1.0.0".to_string(),
                 latest: "1.2.0".to_string()
             }
         );
         assert_eq!(
-            plugin.update_status(Some("1.2.0"), Target::LinuxX64, 1),
+            plugin.update_status(Some("1.2.0"), Target::LinuxX64, 2),
             UpdateStatus::Installed
         );
     }
@@ -1133,8 +1133,8 @@ mod tests {
         plugin["versions"][0]["api_version"] = serde_json::json!(3);
         let parsed = parse_catalog(&catalog_json(vec![plugin])).unwrap();
         let plugin = &parsed.catalog.plugins[0];
-        assert!(plugin.install_candidate(Target::LinuxX64, 1).is_none());
-        assert!(plugin.requires_newer_api(1));
+        assert!(plugin.install_candidate(Target::LinuxX64, 2).is_none());
+        assert!(plugin.requires_newer_api(2));
         assert_eq!(plugin.required_api_version(), 3);
     }
 

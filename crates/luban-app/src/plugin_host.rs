@@ -442,11 +442,12 @@ mod tests {
                 id: id.to_string(),
                 name: id.to_string(),
                 version: "1.0.0".to_string(),
-                api_version: 1,
+                api_version: 2,
                 main: "main.lua".to_string(),
                 description: None,
                 author: None,
                 permissions: Vec::new(),
+                events: Vec::new(),
                 dependencies: dependencies
                     .iter()
                     .map(|id| PluginDependency {

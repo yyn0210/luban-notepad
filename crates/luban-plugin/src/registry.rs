@@ -435,7 +435,7 @@ mod tests {
                     "id": "{id}",
                     "name": "{id}",
                     "version": "{version}",
-                    "api_version": 1,
+                    "api_version": 2,
                     "main": "main.lua",
                     "permissions": [{permissions}],
                     "dependencies": [{deps}]

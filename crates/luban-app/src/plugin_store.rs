@@ -859,7 +859,7 @@ mod tests {
                 "latest_version": "1.0.0",
                 "versions": [{
                     "version": "1.0.0",
-                    "api_version": 1,
+                    "api_version": 2,
                     "artifacts": [{
                         "target": target,
                         "url": artifact_url,
@@ -1006,7 +1006,7 @@ mod tests {
             "id": "com.example.e2e",
             "name": "End to end",
             "version": "1.0.0",
-            "api_version": 1,
+            "api_version": 2,
             "main": "main.lua"
         }"#;
         let file = fs::File::create(&package).unwrap();
@@ -1039,7 +1039,7 @@ mod tests {
             license: None,
             versions: vec![luban_plugin::store::StoreVersion {
                 version: "1.0.0".to_string(),
-                api_version: 1,
+                api_version: 2,
                 released_at: None,
                 release_notes: None,
                 artifacts: vec![Artifact {
@@ -1052,7 +1052,7 @@ mod tests {
             localizations: Default::default(),
         };
         let target = store::Target::current().unwrap_or(store::Target::Universal);
-        let candidate = plugin.install_candidate(target, 1).unwrap();
+        let candidate = plugin.install_candidate(target, 2).unwrap();
         let downloaded = download_artifact(
             &root,
             &plugin.id,

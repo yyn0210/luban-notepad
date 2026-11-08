@@ -22,6 +22,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "description",
     "author",
     "permissions",
+    "events",
     "dependencies",
     "contributes",
     "activate",
@@ -44,8 +45,17 @@ fn warn_unknown_fields(json: &str, dir: &Path) {
     }
 }
 
+/// v2 event surface. Runtime `luban.events.on` only allows registering events
+/// declared here.
+pub const EVENT_NAMES: &[&str] = &[
+    "on_document_open",
+    "on_document_save",
+    "on_active_document_changed",
+    "on_edit",
+];
+
 /// Host API major version understood by this build.
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
 /// Manifest file name inside a plugin directory.
 pub const MANIFEST_FILE: &str = "plugin.json";
 /// Maximum manifest size.
@@ -66,6 +76,8 @@ pub struct PluginManifest {
     pub author: Option<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub events: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<PluginDependency>,
     #[serde(default)]
@@ -121,7 +133,7 @@ pub struct CommandContribution {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MenuContribution {
-    /// Only `plugins` is accepted by API version 1.
+    /// Only `plugins` menus are accepted.
     pub menu: String,
     pub command: String,
     #[serde(default)]
@@ -252,17 +264,19 @@ impl PluginManifest {
         if self.version.trim().is_empty() || semver::Version::parse(&self.version).is_err() {
             errors.push(format!("plugin version '{}' is not SemVer", self.version));
         }
-        if self.api_version > API_VERSION {
-            errors.push(format!(
-                "plugin api_version {} is newer than the supported version {API_VERSION}",
+        if self.api_version != API_VERSION {
+            return Err(format!(
+                "plugin api_version {} is not supported; this host requires api_version 2 (v1 plugins must be updated for the v2 host)",
                 self.api_version
             ));
-        } else if self.api_version < API_VERSION {
-            log::warn!(
-                "plugin '{}' targets API version {}; loading with compatibility warnings",
-                self.id,
-                self.api_version
-            );
+        }
+        for event in &self.events {
+            if !EVENT_NAMES.contains(&event.as_str()) {
+                return Err(format!(
+                    "unknown event '{event}' in manifest events (allowed: {})",
+                    EVENT_NAMES.join(", ")
+                ));
+            }
         }
         if self
             .description
@@ -356,7 +370,7 @@ impl PluginManifest {
         for menu in &self.contributes.menus {
             if menu.menu != "plugins" {
                 errors.push(format!(
-                    "menu '{}' is not supported; API version 1 only accepts 'plugins'",
+                    "menu '{}' is not supported; only 'plugins' menus are accepted",
                     menu.menu
                 ));
             }
@@ -696,7 +710,7 @@ mod tests {
                 "id": "com.example.demo",
                 "name": "Demo",
                 "version": "1.0.0",
-                "api_version": 1,
+                "api_version": 2,
                 "main": "main.lua",
                 "permissions": ["filesystem"],
                 "contributes": {{
@@ -734,7 +748,7 @@ mod tests {
         assert!(PluginManifest::parse(&json, dir.path()).is_err());
         let json = manifest_json("").replace("\"1.0.0\"", "\"nope\"");
         assert!(PluginManifest::parse(&json, dir.path()).is_err());
-        let json = manifest_json("").replace("\"api_version\": 1", "\"api_version\": 2");
+        let json = manifest_json("").replace("\"api_version\": 2", "\"api_version\": 3");
         assert!(PluginManifest::parse(&json, dir.path()).is_err());
     }
 
@@ -783,5 +797,68 @@ mod tests {
         let (value, fallback) = normalize_setting_value(&setting, Some(&Value::from(0)));
         assert!(fallback);
         assert_eq!(value, Value::from(2.0));
+    }
+
+    /// Write a plugin directory containing the given manifest and entry file.
+    fn write_plugin_dir(dir: &Path, json: &str) {
+        fs::write(dir.join(MANIFEST_FILE), json).unwrap();
+        fs::write(dir.join("main.lua"), "return {}").unwrap();
+    }
+
+    #[test]
+    fn v2_manifest_parses_events() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            dir.path(),
+            r#"{
+                "id": "com.example.events",
+                "name": "Events",
+                "version": "1.0.0",
+                "api_version": 2,
+                "main": "main.lua",
+                "events": ["on_edit", "on_document_save"]
+            }"#,
+        );
+        let manifest = PluginManifest::load(dir.path()).unwrap();
+        assert_eq!(
+            manifest.events,
+            vec!["on_edit".to_string(), "on_document_save".to_string()]
+        );
+    }
+
+    #[test]
+    fn v1_manifest_is_rejected_with_update_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            dir.path(),
+            r#"{
+                "id": "com.example.legacy",
+                "name": "Legacy",
+                "version": "1.0.0",
+                "api_version": 1,
+                "main": "main.lua"
+            }"#,
+        );
+        let error = PluginManifest::load(dir.path()).unwrap_err();
+        assert!(error.contains("api_version 1"), "{error}");
+        assert!(error.contains("v2"), "{error}");
+    }
+
+    #[test]
+    fn unknown_event_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_dir(
+            dir.path(),
+            r#"{
+                "id": "com.example.boom",
+                "name": "Boom",
+                "version": "1.0.0",
+                "api_version": 2,
+                "main": "main.lua",
+                "events": ["on_boom"]
+            }"#,
+        );
+        let error = PluginManifest::load(dir.path()).unwrap_err();
+        assert!(error.contains("on_boom"), "{error}");
     }
 }

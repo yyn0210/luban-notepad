@@ -1324,7 +1324,7 @@ mod tests {
                 "id": "com.example.test",
                 "name": "Test",
                 "version": "1.0.0",
-                "api_version": 1,
+                "api_version": 2,
                 "main": "main.lua",
                 "permissions": ["filesystem"],
                 "activate": "activate",

@@ -1052,7 +1052,7 @@ mod tests {
                     "id": "{id}",
                     "name": "Demo",
                     "version": "1.0.0",
-                    "api_version": 1,
+                    "api_version": 2,
                     "main": "main.lua",
                     "permissions": [{permissions}],
                     "contributes": {{
@@ -1138,7 +1138,7 @@ mod tests {
             "id": "com.example.zip",
             "name": "Zip",
             "version": "1.0.0",
-            "api_version": 1,
+            "api_version": 2,
             "main": "main.lua"
         }"#;
         zip_plugin(
@@ -1162,7 +1162,7 @@ mod tests {
             "id": "com.example.cached",
             "name": "Cached",
             "version": "1.0.0",
-            "api_version": 1,
+            "api_version": 2,
             "main": "main.lua"
         }"#;
         zip_plugin(
@@ -1193,7 +1193,7 @@ mod tests {
             "id": "com.example.dependent",
             "name": "Dependent",
             "version": "1.0.0",
-            "api_version": 1,
+            "api_version": 2,
             "main": "main.lua",
             "dependencies": [{ "id": "com.example.base", "version": ">=1.0.0" }]
         });
@@ -1288,7 +1288,7 @@ mod tests {
                     "id": "com.example.store",
                     "name": "Store",
                     "version": "{version}",
-                    "api_version": 1,
+                    "api_version": 2,
                     "main": "main.lua",
                     "permissions": [{permissions}]
                 }}"#
@@ -1376,7 +1376,7 @@ mod tests {
             "id": "com.example.catalog",
             "name": "Catalog",
             "version": "1.0.0",
-            "api_version": 1,
+            "api_version": 2,
             "main": "main.lua"
         }"#;
         zip_plugin(
@@ -1414,7 +1414,7 @@ mod tests {
             "id": "com.example.native",
             "name": "Native",
             "version": "1.0.0",
-            "api_version": 1,
+            "api_version": 2,
             "main": "main.lua"
         }"#;
         zip_plugin(
