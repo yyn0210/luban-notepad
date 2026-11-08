@@ -34,8 +34,7 @@ const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
 /// Maximum length for plugin-supplied resource ids (panels, commands).
 const MAX_ID_BYTES: usize = 128;
-// Bounds for the v2 call context and host action surface; the still-unused
-// ones are consumed by upcoming v2 API tasks (panel command args).
+// Bounds for the v2 call context and host action surface.
 const MAX_EVENT_HANDLERS: usize = 32;
 /// Maximum number of simultaneously active timers per plugin (spec §9).
 const MAX_TIMERS: usize = 16;
@@ -49,7 +48,8 @@ const QUARANTINE_THRESHOLD: u32 = 10;
 pub const MAX_COMMAND_DEPTH: u8 = 4;
 const MAX_NOTIFY_PER_CALL: usize = 8;
 const MAX_NOTIFY_BYTES: usize = 1024;
-#[expect(dead_code)]
+/// Maximum serialized size of panel command `args`; larger payloads are
+/// dropped with a warning and the command still runs without args (spec §7).
 const MAX_PANEL_ARGS_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
@@ -1914,6 +1914,53 @@ fn parse_panel(value: Value) -> Result<PanelContent, String> {
     }
 }
 
+/// Parse a panel line / header action `command` field (spec §7). v2 only
+/// accepts the table form `{ id = "...", args = {...} }`; the bare string
+/// form was removed. `nil` means no command (a plain line).
+///
+/// `args` is a convenience, not a contract: a table that fails `lua_to_json`
+/// (cycles, over-deep nesting, mixed keys) or serializes over
+/// [`MAX_PANEL_ARGS_BYTES`] is dropped with a warning and the command still
+/// executes without args. A non-table `args` value is a programming error.
+fn parse_panel_command(value: Value) -> Result<Option<PanelCommand>, String> {
+    if matches!(value, Value::Nil) {
+        return Ok(None);
+    }
+    let Value::Table(command) = value else {
+        return Err("line command must be a table { id, args }".to_string());
+    };
+    let id = match command.get::<Value>("id").unwrap_or(Value::Nil) {
+        Value::String(id) => id.to_str().map_err(|error| error.to_string())?.to_string(),
+        _ => return Err("panel command requires an 'id' string".to_string()),
+    };
+    if id.is_empty() || id.len() > MAX_PANEL_ACTION_COMMAND_BYTES {
+        return Err("panel command id is empty or too long".to_string());
+    }
+    let args_value = command.get::<Value>("args").unwrap_or(Value::Nil);
+    let args = match args_value {
+        Value::Nil => None,
+        Value::Table(_) => match lua_to_json(&args_value, 0) {
+            Ok(json) => {
+                let serialized = serde_json::to_string(&json).unwrap_or_default();
+                if serialized.len() > MAX_PANEL_ARGS_BYTES {
+                    log::warn!(
+                        "panel command '{id}' args dropped: over {MAX_PANEL_ARGS_BYTES} bytes"
+                    );
+                    None
+                } else {
+                    Some(json)
+                }
+            }
+            Err(error) => {
+                log::warn!("panel command '{id}' args dropped: {error}");
+                None
+            }
+        },
+        _ => return Err("panel command 'args' must be a table".to_string()),
+    };
+    Ok(Some(PanelCommand { id, args }))
+}
+
 fn parse_panel_actions(value: Value) -> Result<Vec<PanelAction>, String> {
     let Value::Table(table) = value else {
         return Ok(Vec::new());
@@ -1930,23 +1977,15 @@ fn parse_panel_actions(value: Value) -> Result<Vec<PanelAction>, String> {
         let label: String = action
             .get("label")
             .map_err(|error| format!("panel action label: {error}"))?;
-        let command: String = action
-            .get("command")
-            .map_err(|error| format!("panel action command: {error}"))?;
         if label.is_empty() || label.len() > MAX_PANEL_ACTION_LABEL_BYTES {
             return Err("panel action label is empty or too long".to_string());
         }
-        if command.is_empty() || command.len() > MAX_PANEL_ACTION_COMMAND_BYTES {
-            return Err("panel action command is empty or too long".to_string());
-        }
-        // The table command form (with args) is parsed by the v2 panel API.
-        actions.push(PanelAction {
-            label,
-            command: PanelCommand {
-                id: command,
-                args: None,
-            },
-        });
+        let Some(command) =
+            parse_panel_command(action.get::<Value>("command").unwrap_or(Value::Nil))?
+        else {
+            return Err("panel action requires a command".to_string());
+        };
+        actions.push(PanelAction { label, command });
     }
     Ok(actions)
 }
@@ -1992,7 +2031,7 @@ fn parse_panel_line(line: &Table) -> Result<PanelLine, String> {
     if text.len() > MAX_PANEL_LINE_BYTES {
         return Err("panel line is too long".to_string());
     }
-    let command: Option<String> = line.get("command").ok().flatten();
+    let command = parse_panel_command(line.get::<Value>("command").unwrap_or(Value::Nil))?;
     let style = line
         .get::<Option<String>>("style")
         .ok()
@@ -2006,8 +2045,6 @@ fn parse_panel_line(line: &Table) -> Result<PanelLine, String> {
         .unwrap_or(0)
         .clamp(0, 8) as u8;
     let spans = parse_panel_spans(&text, line.get::<Value>("spans").unwrap_or(Value::Nil))?;
-    // The table command form (with args) is parsed by the v2 panel API.
-    let command = command.map(|id| PanelCommand { id, args: None });
     Ok(PanelLine {
         text,
         command,
@@ -2359,10 +2396,10 @@ mod tests {
                 list = function(ctx)
                     return {
                         title = "Demo",
-                        lines = { "one", { text = "two", command = "test.run" } },
+                        lines = { "one", { text = "two", command = { id = "test.run" } } },
                         actions = {
-                            { label = "Refresh", command = "test.run" },
-                            { label = "Info", command = "test.info" },
+                            { label = "Refresh", command = { id = "test.run" } },
+                            { label = "Info", command = { id = "test.info" } },
                         },
                     }
                 end
@@ -2392,6 +2429,235 @@ mod tests {
                 args: None,
             }
         );
+    }
+
+    #[test]
+    fn panel_commands_parse_table_form_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        lines = {
+                            {
+                                text = "fold",
+                                command = {
+                                    id = "json.fold.toggle",
+                                    args = { path = "$.a" },
+                                },
+                            },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(
+            panel.lines[0].command,
+            Some(PanelCommand {
+                id: "json.fold.toggle".to_string(),
+                args: Some(serde_json::json!({ "path": "$.a" })),
+            })
+        );
+    }
+
+    #[test]
+    fn panel_commands_reject_string_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return { lines = { { text = "x", command = "plain" } } }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let error = panel.error.expect("string commands must be rejected in v2");
+        assert!(error.contains("must be a table"), "{error}");
+    }
+
+    #[test]
+    fn panel_commands_missing_id_rejected() {
+        for source in [
+            r#"return { list = function(ctx)
+                    return { lines = { { text = "x", command = {} } } }
+                end }"#,
+            r#"return { list = function(ctx)
+                    return { lines = { { text = "x", command = { args = {} } } } }
+                end }"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let manifest = write_plugin(dir.path(), source);
+            let mut runtime =
+                PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+            let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+            let error = panel.error.expect("command without id must be rejected");
+            assert!(error.contains("requires an 'id' string"), "{error}");
+        }
+    }
+
+    #[test]
+    fn panel_commands_without_args_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        lines = {
+                            { text = "a", command = { id = "test.run" } },
+                            { text = "b", command = { id = "test.run", args = nil } },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(panel.lines.len(), 2);
+        for line in &panel.lines {
+            assert_eq!(
+                line.command,
+                Some(PanelCommand {
+                    id: "test.run".to_string(),
+                    args: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn panel_action_commands_parse_same_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        lines = {},
+                        actions = {
+                            {
+                                label = "Fold",
+                                command = {
+                                    id = "json.fold.toggle",
+                                    args = { path = "$.a" },
+                                },
+                            },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(
+            panel.actions[0].command,
+            PanelCommand {
+                id: "json.fold.toggle".to_string(),
+                args: Some(serde_json::json!({ "path": "$.a" })),
+            }
+        );
+    }
+
+    #[test]
+    fn panel_command_args_over_cap_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        lines = {
+                            {
+                                text = "big",
+                                command = {
+                                    id = "test.run",
+                                    args = { big = string.rep("x", 5000) },
+                                },
+                            },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel
+            .value
+            .expect("oversize args must be dropped, not fail");
+        assert_eq!(
+            panel.lines[0].command,
+            Some(PanelCommand {
+                id: "test.run".to_string(),
+                args: None,
+            })
+        );
+    }
+
+    #[test]
+    fn panel_command_args_depth_guard_drops_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    local deep = { leaf = true }
+                    for _ = 1, 200 do deep = { child = deep } end
+                    return {
+                        lines = {
+                            { text = "deep", command = { id = "test.run", args = deep } },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel
+            .value
+            .expect("over-deep args must be dropped, not fail");
+        assert_eq!(
+            panel.lines[0].command,
+            Some(PanelCommand {
+                id: "test.run".to_string(),
+                args: None,
+            })
+        );
+    }
+
+    #[test]
+    fn panel_command_args_non_table_is_dropped_or_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        lines = {
+                            { text = "n", command = { id = "test.run", args = 42 } },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let error = panel.error.expect("non-table args must be rejected");
+        assert!(error.contains("'args' must be a table"), "{error}");
     }
 
     #[test]
