@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use ignore::WalkBuilder;
 use walkdir::{DirEntry, WalkDir};
@@ -21,8 +22,22 @@ pub struct FileEntry {
     pub is_dir: bool,
 }
 
+/// A listed entry with the metadata a file picker shows next to the name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEntryInfo {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    /// File size in bytes. Directories report `None`.
+    pub size: Option<u64>,
+    pub modified: Option<SystemTime>,
+}
+
 /// List immediate children of `dir`, directories first and names sorted
-/// case-insensitively.
+/// case-insensitively. This lean variant does not stat every child; the
+/// explorer uses it for large trees, while the file picker calls
+/// [`list_directory_detailed`].
 pub fn list_directory(dir: impl AsRef<Path>, show_hidden: bool) -> Result<Vec<FileEntry>> {
     let dir = dir.as_ref();
     let mut entries = Vec::new();
@@ -35,6 +50,52 @@ pub fn list_directory(dir: impl AsRef<Path>, show_hidden: bool) -> Result<Vec<Fi
         }
         let is_dir = path.is_dir();
         entries.push(FileEntry { path, name, is_dir });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// List immediate children with size, modification time and symlink state.
+/// Metadata failures are tolerated per entry so one unreadable child cannot
+/// hide the rest of a folder.
+pub fn list_directory_detailed(
+    dir: impl AsRef<Path>,
+    show_hidden: bool,
+) -> Result<Vec<FileEntryInfo>> {
+    let dir = dir.as_ref();
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if !show_hidden && is_hidden(&path, &name) {
+            continue;
+        }
+        let file_type = entry.file_type().ok();
+        let is_symlink = file_type.is_some_and(|kind| kind.is_symlink());
+        // Follow symlinks so a link to a directory can be entered.
+        let is_dir = if is_symlink {
+            path.is_dir()
+        } else {
+            file_type.is_some_and(|kind| kind.is_dir())
+        };
+        let metadata = fs::metadata(&path).ok();
+        let size = (!is_dir)
+            .then(|| metadata.as_ref().map(|meta| meta.len()))
+            .flatten();
+        let modified = metadata.and_then(|meta| meta.modified().ok());
+        entries.push(FileEntryInfo {
+            path,
+            name,
+            is_dir,
+            is_symlink,
+            size,
+            modified,
+        });
     }
     entries.sort_by(|a, b| {
         b.is_dir
@@ -462,6 +523,26 @@ mod tests {
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["adir", "zdir", "a.txt", "b.txt"]);
         assert!(entries[0].is_dir);
+    }
+
+    #[test]
+    fn detailed_listing_reports_size_and_modified_time() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "notes.txt", "hello");
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let entries = list_directory_detailed(dir.path(), false).unwrap();
+        let src = entries.iter().find(|entry| entry.name == "src").unwrap();
+        assert!(src.is_dir);
+        assert_eq!(src.size, None);
+        assert!(src.modified.is_some());
+        let notes = entries
+            .iter()
+            .find(|entry| entry.name == "notes.txt")
+            .unwrap();
+        assert!(!notes.is_dir);
+        assert_eq!(notes.size, Some(5));
+        assert!(notes.modified.is_some());
+        assert!(!notes.is_symlink);
     }
 
     #[test]

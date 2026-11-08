@@ -21,6 +21,7 @@ use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarMo
 use gpui_kit::component::slider::SliderEvent;
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
+use gpui_kit::component::Icon;
 use gpui_kit::component::{Disableable as _, Selectable as _, Sizable as _, Size, TitleBar};
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
@@ -47,8 +48,7 @@ use luban_core::settings::{
 use luban_core::text as textutil;
 use luban_core::undo::EditKind;
 use luban_core::workspace::{
-    list_directory, search_workspace, FileEntry, FileMatch, FindInFilesOptions, FindInFilesOutcome,
-    WorkspaceSearchOptions,
+    search_workspace, FileMatch, FindInFilesOptions, FindInFilesOutcome, WorkspaceSearchOptions,
 };
 use luban_core::workspace_file::{WorkspaceFile, WorkspaceSettings};
 use luban_core::workspace_index::{build_index, IndexOptions, WorkspaceIndex};
@@ -57,11 +57,16 @@ use luban_plugin::manifest::StatusAlignment;
 use crate::column_editor::ColumnEditorState;
 use crate::commands::{self, CommandContext, Keymap};
 use crate::dialogs::{
-    next_listing_generation, CloseIntent, ConfirmState, FileDialogMode, FileDialogPurpose,
-    FileDialogState, FileFilter, GoToLineState, LanguagePickerState, SaveAsRequest, SaveThen,
+    CloseIntent, ConfirmState, GoToLineState, LanguagePickerState, SaveAsRequest, SaveThen,
 };
 use crate::document_map;
 use crate::explorer::ExplorerState;
+use crate::file_picker::{
+    breadcrumbs, build_sections, file_not_found_message, filter_presets, format_modified,
+    format_size, load_preview, next_listing_generation, not_a_folder_message, FileDialogMode,
+    FileDialogPurpose, FileDialogState, FileFilter, NewFolderState, PickerRow, PickerRowKind,
+    PlaceIcon, PlaceSection, PreviewContent, PreviewKind, SortKey,
+};
 use crate::file_watch::{FileWatcher, WatchEventKind};
 use crate::find::{FindInFilesPanel, FindPanel};
 use crate::huge_file::{
@@ -385,6 +390,9 @@ pub struct LubanApp {
     pub file_dialog: Option<FileDialogState>,
     file_path_input: Entity<InputState>,
     file_name_input: Entity<InputState>,
+    file_search_input: Entity<InputState>,
+    file_filter_input: Entity<InputState>,
+    file_new_folder_input: Entity<InputState>,
     pub confirm: Option<ConfirmState>,
     overwrite_save: Option<SaveAsRequest>,
     pending_export: Option<ExportFormat>,
@@ -427,6 +435,11 @@ pub struct LubanApp {
     pending_find_next: bool,
     pending_replace: bool,
     pending_file_confirm: bool,
+    pending_new_folder_create: bool,
+    /// A path to select once the picker finishes listing its parent folder.
+    pending_file_picker_select: Option<PathBuf>,
+    /// Enter was pressed in the picker's editable address field.
+    pending_file_picker_address: bool,
     pending_name_confirm: bool,
     pending_go_to_line: bool,
     pending_close_all_after_saves: bool,
@@ -673,7 +686,7 @@ fn plugin_platform_summary(plugin: &luban_plugin::store::StorePlugin) -> String 
 
 mod command_ui;
 mod editor_view;
-mod file_dialog;
+mod file_picker_ui;
 mod find_replace_ui;
 mod huge_file_ui;
 mod menus;
@@ -801,6 +814,14 @@ impl LubanApp {
             file_name_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(tr("dialog.file_name_placeholder"))
             }),
+            file_search_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder(tr("dialog.search_placeholder"))),
+            file_filter_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(tr("dialog.filter_custom_placeholder"))
+            }),
+            file_new_folder_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(tr("dialog.new_folder_placeholder"))
+            }),
             confirm: None,
             overwrite_save: None,
             pending_export: None,
@@ -838,6 +859,9 @@ impl LubanApp {
             pending_find_next: false,
             pending_replace: false,
             pending_file_confirm: false,
+            pending_new_folder_create: false,
+            pending_file_picker_select: None,
+            pending_file_picker_address: false,
             pending_name_confirm: false,
             pending_go_to_line: false,
             pending_close_all_after_saves: false,
@@ -902,9 +926,13 @@ impl LubanApp {
                                 app.cancel_overwrite(cx);
                                 true
                             } else if app.file_dialog.is_some() {
-                                app.cancel_file_dialog(cx);
-                                app.focus_editor(window, cx);
-                                true
+                                if app.file_dialog_escape(window, cx) {
+                                    true
+                                } else {
+                                    app.cancel_file_dialog(cx);
+                                    app.focus_editor(window, cx);
+                                    true
+                                }
                             } else if app.name_prompt.is_some() {
                                 app.name_prompt = None;
                                 app.focus_editor = true;
@@ -1014,6 +1042,14 @@ impl LubanApp {
                     }
                     return;
                 }
+                // Huge-document shortcuts must not act behind the modal file
+                // picker; the picker's own handler runs from `shortcut`.
+                let picker_open = weak_shortcuts
+                    .update(cx, |app, _| app.file_dialog.is_some())
+                    .unwrap_or(false);
+                if picker_open {
+                    return;
+                }
                 if command && !modifiers.shift && !modifiers.alt && key == "z" {
                     let _ = weak_shortcuts.update(cx, |app, cx| {
                         let editor_focused = app.tabs.get(app.active).is_some_and(|tab| {
@@ -1092,15 +1128,72 @@ impl LubanApp {
                     }
                 }));
         }
-        for entity in [app.file_path_input.clone(), app.file_name_input.clone()] {
-            app._subscriptions
-                .push(cx.subscribe(&entity, |this, _, event, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
+        app._subscriptions
+            .push(cx.subscribe(&app.file_path_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    if this
+                        .file_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.address_edit)
+                    {
+                        this.pending_file_picker_address = true;
+                    } else {
+                        this.pending_file_confirm = true;
+                    }
+                    cx.notify();
+                }
+            }));
+        app._subscriptions
+            .push(cx.subscribe(&app.file_name_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.pending_file_confirm = true;
+                    cx.notify();
+                }
+            }));
+        app._subscriptions
+            .push(
+                cx.subscribe(&app.file_search_input, |this, _, event, cx| match event {
+                    InputEvent::Change => {
+                        let value = this.file_search_input.read(cx).value().to_string();
+                        if let Some(dialog) = &mut this.file_dialog {
+                            dialog.set_search(value);
+                        }
+                        this.refresh_file_picker_preview(cx);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
                         this.pending_file_confirm = true;
                         cx.notify();
                     }
-                }));
-        }
+                    _ => {}
+                }),
+            );
+        app._subscriptions
+            .push(cx.subscribe(&app.file_filter_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = this.file_filter_input.read(cx).value().to_string();
+                    if let Some(dialog) = &mut this.file_dialog {
+                        if dialog.custom_filter {
+                            dialog.set_custom_filter(&value);
+                        }
+                    }
+                    this.refresh_file_picker_preview(cx);
+                    cx.notify();
+                }
+            }));
+        app._subscriptions.push(
+            cx.subscribe(
+                &app.file_new_folder_input,
+                |this, _, event, cx| match event {
+                    InputEvent::Change => cx.notify(),
+                    InputEvent::PressEnter { .. } => {
+                        this.pending_new_folder_create = true;
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        );
         for (entity, field) in [
             (app.large_file.from_input.clone(), RangeField::From),
             (app.large_file.to_input.clone(), RangeField::To),
@@ -4543,6 +4636,15 @@ impl LubanApp {
         let inputs = [
             (self.file_path_input.clone(), "dialog.path_placeholder"),
             (self.file_name_input.clone(), "dialog.file_name_placeholder"),
+            (self.file_search_input.clone(), "dialog.search_placeholder"),
+            (
+                self.file_filter_input.clone(),
+                "dialog.filter_custom_placeholder",
+            ),
+            (
+                self.file_new_folder_input.clone(),
+                "dialog.new_folder_placeholder",
+            ),
             (self.find.query.clone(), "find.query_placeholder"),
             (
                 self.find.replacement.clone(),
@@ -4745,6 +4847,14 @@ impl LubanApp {
         if self.pending_go_to_line {
             self.pending_go_to_line = false;
             self.apply_go_to_line(window, cx);
+        }
+        if self.pending_new_folder_create {
+            self.pending_new_folder_create = false;
+            self.create_file_picker_folder(window, cx);
+        }
+        if self.pending_file_picker_address {
+            self.pending_file_picker_address = false;
+            self.file_picker_apply_address(window, cx);
         }
         if self.pending_file_confirm {
             self.pending_file_confirm = false;

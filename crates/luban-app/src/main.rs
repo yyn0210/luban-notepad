@@ -12,6 +12,7 @@ mod commands;
 mod dialogs;
 mod document_map;
 mod explorer;
+mod file_picker;
 mod file_watch;
 mod find;
 mod highlighter;

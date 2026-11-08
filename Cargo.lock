@@ -3841,6 +3841,7 @@ name = "luban-app"
 version = "1.0.0-preview.15"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
  "embed-resource",
  "env_logger",

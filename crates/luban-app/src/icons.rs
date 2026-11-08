@@ -6,7 +6,21 @@ use std::borrow::Cow;
 use gpui_kit::assets::{icon_assets, Assets};
 use gpui_kit::{AssetSource, Result, SharedString};
 
-icon_assets!(ExtraIcons, [FilePlus, FolderSearch, Save, TextWrap]);
+icon_assets!(
+    ExtraIcons,
+    [
+        FilePlus,
+        FolderSearch,
+        Save,
+        TextWrap,
+        Pencil,
+        House,
+        Monitor,
+        Download,
+        Clock,
+        X,
+    ]
+);
 
 /// Serves [`ExtraIcons`] first and falls back to the component bundle.
 pub struct AppAssets;

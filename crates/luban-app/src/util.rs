@@ -115,6 +115,36 @@ pub fn absolutize(path: &Path) -> PathBuf {
     normalize(&absolute)
 }
 
+/// Resolve a path relative to `base` instead of the process working directory.
+/// Used by the file picker, where typed relative paths belong to the folder
+/// currently shown in the dialog.
+pub fn absolutize_from(base: &Path, path: &Path) -> PathBuf {
+    let path = expand_home(path);
+    if path.is_absolute() {
+        normalize(&path)
+    } else {
+        normalize(&base.join(path))
+    }
+}
+
+/// Expand a leading `~` (alone or followed by a separator) to the home
+/// directory. Other paths are returned unchanged.
+pub fn expand_home(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" || text.starts_with("~/") || text.starts_with("~\\") {
+        if let Some(home) = dirs::home_dir() {
+            let rest = text.trim_start_matches('~');
+            let rest = rest.trim_start_matches(['/', '\\']);
+            return if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            };
+        }
+    }
+    path.to_path_buf()
+}
+
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -208,6 +238,26 @@ mod tests {
             assert_eq!(command.program, "xdg-open");
             assert_eq!(command.args, vec!["/tmp/example".to_string()]);
         }
+    }
+
+    #[test]
+    fn picker_paths_resolve_against_the_dialog_folder() {
+        let base = Path::new("/tmp/dialog");
+        assert_eq!(
+            absolutize_from(base, Path::new("notes.txt")),
+            PathBuf::from("/tmp/dialog/notes.txt")
+        );
+        assert_eq!(
+            absolutize_from(base, Path::new("../shared/a.txt")),
+            PathBuf::from("/tmp/shared/a.txt")
+        );
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home(Path::new("~")), home);
+        assert_eq!(expand_home(Path::new("~/notes")), home.join("notes"));
+        assert_eq!(
+            expand_home(Path::new("relative")),
+            PathBuf::from("relative")
+        );
     }
 
     #[test]

@@ -99,6 +99,9 @@ pub struct Settings {
     /// Recently opened workspaces, most recent first.
     #[serde(default)]
     pub recent_workspaces: Vec<PathBuf>,
+    /// Folders visited in the file picker, most recent first.
+    #[serde(default)]
+    pub recent_dirs: Vec<PathBuf>,
     pub large_file_threshold: usize,
     /// Show the large-file controller automatically for files at or above the
     /// controller threshold.
@@ -201,6 +204,9 @@ fn default_ruler_columns() -> Vec<usize> {
 /// Maximum number of remembered workspaces.
 pub const MAX_RECENT_WORKSPACES: usize = 20;
 
+/// Maximum number of folders remembered by the file picker.
+pub const MAX_RECENT_DIRS: usize = 12;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -237,6 +243,7 @@ impl Default for Settings {
             max_recent_files: 20,
             recent_files: Vec::new(),
             recent_workspaces: Vec::new(),
+            recent_dirs: Vec::new(),
             large_file_threshold: 100 * 1024 * 1024,
             large_file_controller: true,
             large_file_controller_threshold: 200 * 1024 * 1024,
@@ -369,6 +376,9 @@ impl Settings {
         self.recent_workspaces.retain(|p| !p.as_os_str().is_empty());
         self.recent_workspaces.dedup_by(|a, b| paths_equal(a, b));
         self.recent_workspaces.truncate(MAX_RECENT_WORKSPACES);
+        self.recent_dirs.retain(|p| !p.as_os_str().is_empty());
+        self.recent_dirs.dedup_by(|a, b| paths_equal(a, b));
+        self.recent_dirs.truncate(MAX_RECENT_DIRS);
         normalize_ruler_columns(&mut self.ruler_columns);
         self.search_include = self.search_include.trim().to_string();
         self.search_exclude = self.search_exclude.trim().to_string();
@@ -404,6 +414,14 @@ impl Settings {
         self.recent_workspaces.retain(|p| !paths_equal(p, &path));
         self.recent_workspaces.insert(0, path);
         self.recent_workspaces.truncate(MAX_RECENT_WORKSPACES);
+    }
+
+    /// Push a folder visited by the file picker to the top of the recent list.
+    pub fn add_recent_dir(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.recent_dirs.retain(|p| !paths_equal(p, &path));
+        self.recent_dirs.insert(0, path);
+        self.recent_dirs.truncate(MAX_RECENT_DIRS);
     }
 
     pub fn remove_recent_workspace(&mut self, path: &Path) {
@@ -452,6 +470,7 @@ impl Settings {
         self.max_recent_files = other.max_recent_files;
         self.recent_files = other.recent_files.clone();
         self.recent_workspaces = other.recent_workspaces.clone();
+        self.recent_dirs = other.recent_dirs.clone();
         self.large_file_threshold = other.large_file_threshold;
         self.large_file_controller = other.large_file_controller;
         self.large_file_controller_threshold = other.large_file_controller_threshold;
@@ -745,6 +764,28 @@ mod tests {
         );
         s.remove_recent(Path::new("/c"));
         assert!(!s.recent_files.contains(&PathBuf::from("/c")));
+    }
+
+    #[test]
+    fn recent_dirs_are_deduplicated_and_bounded() {
+        let mut s = Settings::default();
+        for index in 0..MAX_RECENT_DIRS + 4 {
+            s.add_recent_dir(format!("/tmp/dir{index}"));
+        }
+        assert_eq!(s.recent_dirs.len(), MAX_RECENT_DIRS);
+        assert_eq!(
+            s.recent_dirs[0],
+            PathBuf::from(format!("/tmp/dir{}", MAX_RECENT_DIRS + 3))
+        );
+        s.add_recent_dir("/tmp/dir5");
+        assert_eq!(s.recent_dirs[0], PathBuf::from("/tmp/dir5"));
+        assert_eq!(
+            s.recent_dirs
+                .iter()
+                .filter(|path| path.as_path() == Path::new("/tmp/dir5"))
+                .count(),
+            1
+        );
     }
 
     #[test]

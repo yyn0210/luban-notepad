@@ -588,6 +588,29 @@ impl LubanApp {
             return true;
         }
 
+        // The file picker is modal: its own shortcuts run first, text editing
+        // chords pass through to its inputs, and every other command/chord is
+        // swallowed so commands cannot fire behind the dialog.
+        if self.file_dialog.is_some() {
+            if self.file_picker_shortcut(event, window, cx) {
+                return true;
+            }
+            let input_focused = self.file_picker_input_focused(window, cx);
+            if input_focused && command && matches!(key.as_str(), "c" | "v" | "x" | "a" | "z" | "y")
+            {
+                return false;
+            }
+            if command || alt {
+                return true;
+            }
+            let function_key = key.len() > 1
+                && key.starts_with('f')
+                && key[1..].chars().all(|ch| ch.is_ascii_digit());
+            if function_key {
+                return true;
+            }
+        }
+
         // Registered commands take precedence over the legacy inline
         // handlers below. Editing commands only apply while the editor owns
         // the focus, so a find field or dialog keeps Ctrl+C/V/A. A rebound
@@ -657,23 +680,6 @@ impl LubanApp {
                 && key.starts_with('f')
                 && key[1..].chars().all(|ch| ch.is_ascii_digit());
             return command || alt || function_key;
-        }
-
-        if self.file_dialog.is_some() {
-            if self.file_dialog_list_focused(window) {
-                if self.file_dialog_list_key(&key, modifiers, window, cx) {
-                    return true;
-                }
-            } else if key == "down"
-                && self
-                    .file_path_input
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window)
-            {
-                self.focus_file_dialog_list(0, window, cx);
-                return true;
-            }
         }
 
         if key == "f3" {

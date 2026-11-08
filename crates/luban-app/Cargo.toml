@@ -16,6 +16,7 @@ path = "src/main.rs"
 luban-core = { path = "../luban-core" }
 luban-plugin = { path = "../luban-plugin" }
 anyhow.workspace = true
+chrono.workspace = true
 dirs.workspace = true
 env_logger = "0.11"
 gpui-kit = { version = "0.8.0", features = ["syntect"] }

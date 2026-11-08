@@ -480,6 +480,120 @@ dialog.loading:
 dialog.list_failed:
   en: "Could not read this folder: %{error}"
   zh-CN: "无法读取此文件夹：%{error}"
+dialog.back:
+  en: "Back"
+  zh-CN: "后退"
+dialog.forward:
+  en: "Forward"
+  zh-CN: "前进"
+dialog.edit_path:
+  en: "Edit path"
+  zh-CN: "编辑路径"
+dialog.show_hidden:
+  en: "Show hidden files"
+  zh-CN: "显示隐藏文件"
+dialog.hide_hidden:
+  en: "Hide hidden files"
+  zh-CN: "隐藏隐藏文件"
+dialog.toggle_preview:
+  en: "Toggle preview"
+  zh-CN: "显示/隐藏预览"
+dialog.search_placeholder:
+  en: "Search this folder…"
+  zh-CN: "搜索当前文件夹…"
+dialog.filter_custom:
+  en: "Custom filter…"
+  zh-CN: "自定义筛选…"
+dialog.filter_custom_placeholder:
+  en: "*.md; *.txt"
+  zh-CN: "*.md; *.txt"
+dialog.new_folder:
+  en: "New folder"
+  zh-CN: "新建文件夹"
+dialog.new_folder_placeholder:
+  en: "Folder name"
+  zh-CN: "文件夹名称"
+dialog.create:
+  en: "Create"
+  zh-CN: "创建"
+dialog.retry:
+  en: "Retry"
+  zh-CN: "重试"
+dialog.empty_folder:
+  en: "This folder is empty"
+  zh-CN: "此文件夹为空"
+dialog.no_matches:
+  en: "No matching files"
+  zh-CN: "没有匹配的文件"
+dialog.items_count:
+  en: "%{count} items"
+  zh-CN: "%{count} 项"
+dialog.items_selected:
+  en: "%{count} items · %{selected} selected · %{size}"
+  zh-CN: "%{count} 项 · 已选 %{selected} 项 · %{size}"
+dialog.name_column:
+  en: "Name"
+  zh-CN: "名称"
+dialog.size_column:
+  en: "Size"
+  zh-CN: "大小"
+dialog.modified_column:
+  en: "Modified"
+  zh-CN: "修改时间"
+dialog.current_folder_selected:
+  en: "Will select: %{path}"
+  zh-CN: "将选择：%{path}"
+dialog.shortcut_hint:
+  en: "Enter confirm · %{mod}+L path · %{mod}+F search · F5 refresh"
+  zh-CN: "Enter 确认 · %{mod}+L 路径 · %{mod}+F 搜索 · F5 刷新"
+dialog.place_home:
+  en: "Home"
+  zh-CN: "主目录"
+dialog.place_desktop:
+  en: "Desktop"
+  zh-CN: "桌面"
+dialog.place_documents:
+  en: "Documents"
+  zh-CN: "文档"
+dialog.place_downloads:
+  en: "Downloads"
+  zh-CN: "下载"
+dialog.place_current_file:
+  en: "Current file folder"
+  zh-CN: "当前文件所在文件夹"
+dialog.places_quick:
+  en: "Quick access"
+  zh-CN: "快速访问"
+dialog.places_workspace:
+  en: "Workspace"
+  zh-CN: "工作区"
+dialog.places_recent:
+  en: "Recent"
+  zh-CN: "最近"
+dialog.places_locations:
+  en: "Locations"
+  zh-CN: "位置"
+dialog.preview:
+  en: "Preview"
+  zh-CN: "预览"
+dialog.preview_empty:
+  en: "Select a file to preview its content"
+  zh-CN: "选择文件以预览内容"
+dialog.preview_loading:
+  en: "Reading preview…"
+  zh-CN: "正在读取预览…"
+dialog.preview_binary:
+  en: "Binary file (%{size}), no preview"
+  zh-CN: "二进制文件（%{size}），不提供预览"
+dialog.preview_folder_items:
+  en: "%{path} · %{count} items"
+  zh-CN: "%{path} · %{count} 项"
+dialog.preview_multiple:
+  en: "%{count} files selected"
+  zh-CN: "已选择 %{count} 个文件"
+dialog.preview_truncated:
+  en: "Showing the first 200 lines"
+  zh-CN: "仅显示前 200 行"
 
 confirm.save_changes_title:
   en: "Save changes to “%{name}”?"

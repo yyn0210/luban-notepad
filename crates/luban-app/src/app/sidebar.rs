@@ -927,7 +927,7 @@ impl LubanApp {
         self.sync_file_watch(cx);
         cx.notify();
     }
-    fn copy_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+    pub(super) fn copy_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
         self.set_status(
             tr_args(
@@ -937,7 +937,7 @@ impl LubanApp {
             cx,
         );
     }
-    fn reveal_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+    pub(super) fn reveal_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Err(error) = util::reveal_file_command(path).spawn() {
             self.set_status(
                 tr_args(
