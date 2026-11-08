@@ -146,6 +146,17 @@ impl LubanApp {
             }
             (None, None) => {}
         }
+        // Successful synchronous save (Ctrl+S and every batch save): the
+        // snapshot reflects the tab that was just written, which may not be
+        // the active one. Huge, large-file, partial, non-text and read-only
+        // documents have no plugin snapshot and do not emit; the huge-file
+        // async save completion (finish_huge_save) is likewise covered by the
+        // snapshot contract and emits nothing.
+        if saved.is_some() {
+            if let Some(snapshot) = self.plugin_tab_snapshot(index, cx) {
+                self.plugin_emit(plugin_events::PluginEvent::DocumentSaved(snapshot));
+            }
+        }
         if saved.is_some() && then != SaveThen::Nothing {
             self.finish_save_flow(then, window, cx);
         }

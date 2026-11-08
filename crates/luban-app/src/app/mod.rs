@@ -500,6 +500,14 @@ pub struct LubanApp {
     /// side effects; the event pump skips emission so plugin actions cannot
     /// cascade back into the plugin that caused them.
     plugin_event_depth: u32,
+    /// Document events queued for the plugin event pump (50 ms tick).
+    plugin_event_queue: VecDeque<plugin_events::QueuedPluginEvent>,
+    /// Whether the plugin event pump task has been spawned. Only set when the
+    /// spawn actually happened, so a later reload that installs the first
+    /// runtime retries.
+    plugin_pump_started: bool,
+    /// Debounces edit generations for the pump's coalesced `on_edit` dispatch.
+    plugin_edit_debouncer: plugin_events::EditDebouncer,
     ipc_queue: Option<
         std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<crate::ipc::IpcCommand>>>,
     >,
@@ -695,6 +703,7 @@ mod file_picker_ui;
 mod find_replace_ui;
 mod huge_file_ui;
 mod menus;
+mod plugin_events;
 mod plugin_manager_ui;
 mod plugin_ui;
 mod preferences_ui;
@@ -908,6 +917,9 @@ impl LubanApp {
             plugin_panel_drag: None,
             plugin_panel_watch: 0,
             plugin_event_depth: 0,
+            plugin_event_queue: VecDeque::new(),
+            plugin_pump_started: false,
+            plugin_edit_debouncer: plugin_events::EditDebouncer::new(),
             ipc_queue: options.ipc_queue,
             pending_waits: Vec::new(),
             wait: options.wait,
@@ -1383,6 +1395,12 @@ impl LubanApp {
         })
         .detach();
 
+        // The earliest reliable pump start: the window handle is available
+        // here and any installed+enabled plugin is already loaded. The call is
+        // a no-op while no runtime is active (lazy start); a later windowed
+        // reload retries, so installing the first plugin starts the pump too.
+        app.start_plugin_pump(window, cx);
+
         if app.smoke_test {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(Duration::from_secs(3)).await;
@@ -1710,12 +1728,19 @@ impl LubanApp {
                 .is_some_and(|p| util::same_path(p, &path))
         }) {
             self.record_navigation(cx);
+            let changed = index != self.active;
             self.active = index;
             self.active_group = self.tabs[index].group;
             self.active_in_group[self.active_group] = Some(self.tabs[index].id);
             self.focus_editor = true;
             self.find.dirty = true;
             self.record_navigation(cx);
+            if changed {
+                // Re-opening a tab that is already open activates it rather
+                // than opening a second tab: that is an active-document
+                // change, not a document-open.
+                self.emit_active_document_changed(cx);
+            }
             cx.notify();
             return true;
         }
@@ -1833,6 +1858,14 @@ impl LubanApp {
                     tr_args("status.opened", &[("path", path.display().to_string())])
                 };
                 self.set_status(status, cx);
+                // The tab is mounted and active now, so the snapshot reflects
+                // the freshly opened document. Huge, large-file, partial,
+                // non-text and read-only documents have no plugin snapshot and
+                // do not emit (open_path_at, the file picker and drag-and-drop
+                // all funnel fresh opens through this path).
+                if let Some(snapshot) = self.plugin_document_snapshot(cx) {
+                    self.plugin_emit(plugin_events::PluginEvent::DocumentOpened(snapshot));
+                }
                 true
             }
             Err(err) => {
@@ -3376,6 +3409,11 @@ impl LubanApp {
                 ),
                 cx,
             );
+        }
+        // First save of an untitled document and every Save As land here; the
+        // snapshot reflects the just-saved tab.
+        if let Some(snapshot) = self.plugin_tab_snapshot(index, cx) {
+            self.plugin_emit(plugin_events::PluginEvent::DocumentSaved(snapshot));
         }
         self.finish_save_flow(request.then, window, cx);
         cx.notify();

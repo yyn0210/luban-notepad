@@ -197,6 +197,7 @@ impl LubanApp {
         if index >= self.tabs.len() {
             return;
         }
+        let active_before = self.tabs.get(self.active).map(|tab| tab.id);
         let closed = self.tabs[index].id;
         self.cancel_diff_for_tab(closed);
         let closed_group = self.tabs[index].group;
@@ -218,6 +219,9 @@ impl LubanApp {
             self.active_group = 0;
             self.active_in_group = [None, None];
             self.new_file(window, cx);
+            // Closing the last tab lands on a fresh untitled document; that is
+            // an active-document change for the plugin pump.
+            self.emit_active_document_changed(cx);
             return;
         }
         if !closed_active {
@@ -250,6 +254,11 @@ impl LubanApp {
         self.focus_editor = true;
         self.find.clear();
         self.find.dirty = true;
+        // Only a change of the active tab itself is an active-document
+        // change; closing a background tab just shifts indices.
+        if self.tabs.get(self.active).map(|tab| tab.id) != active_before {
+            self.emit_active_document_changed(cx);
+        }
         cx.notify();
     }
 
@@ -820,7 +829,8 @@ impl LubanApp {
         cx: &mut Context<Self>,
     ) {
         if index < self.tabs.len() {
-            if index != self.active {
+            let changed = index != self.active;
+            if changed {
                 self.record_navigation(cx);
             }
             self.sync_active(window, cx);
@@ -833,6 +843,9 @@ impl LubanApp {
             self.find.dirty = true;
             self.record_navigation(cx);
             self.focus_editor(window, cx);
+            if changed {
+                self.emit_active_document_changed(cx);
+            }
             cx.notify();
         }
     }
@@ -871,6 +884,7 @@ impl LubanApp {
         // The previously focused editor is no longer mounted, so keyboard
         // focus has to move to the tab that just became active.
         self.focus_editor(window, cx);
+        self.emit_active_document_changed(cx);
         cx.notify();
     }
 

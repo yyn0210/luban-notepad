@@ -5,7 +5,7 @@ impl LubanApp {
     // Plugin runtime UI: commands, diffs, snippets and panels
     // ------------------------------------------------------------------
 
-    fn plugin_allowed_roots(&self) -> Vec<PathBuf> {
+    pub(super) fn plugin_allowed_roots(&self) -> Vec<PathBuf> {
         let document_dir = self
             .active_doc()
             .and_then(|doc| doc.path.as_deref())
@@ -42,11 +42,24 @@ impl LubanApp {
             .collect()
     }
 
-    fn plugin_document_snapshot(
+    pub(super) fn plugin_document_snapshot(
         &self,
         cx: &gpui_kit::App,
     ) -> Option<luban_plugin::runtime::DocumentSnapshot> {
-        let tab = self.active_tab()?;
+        self.plugin_tab_snapshot(self.active, cx)
+    }
+
+    /// Snapshot one tab by index for the plugin runtime. The active tab is the
+    /// common case ([`Self::plugin_document_snapshot`]); the event pump also
+    /// snapshots an arbitrary saved tab for its `DocumentSaved` batch events.
+    /// Huge, partial-range, large-file, non-text and read-only documents are
+    /// never exposed to plugins.
+    pub(super) fn plugin_tab_snapshot(
+        &self,
+        index: usize,
+        cx: &gpui_kit::App,
+    ) -> Option<luban_plugin::runtime::DocumentSnapshot> {
+        let tab = self.tabs.get(index)?;
         if tab.large_file
             || tab.doc.is_huge()
             || tab.doc.partial_range().is_some()
@@ -119,21 +132,19 @@ impl LubanApp {
     }
 
     /// True while any plugin-originated call's actions are being applied.
-    /// The Task 10 event pump's emit sites check this before emitting their
-    /// own events, so a plugin's write-backs cannot cascade back into the
-    /// plugin that caused them; until then only the executor maintains the
-    /// counter.
-    #[allow(dead_code)]
+    /// The event pump's emit sites check this before emitting their own
+    /// events, so a plugin's write-backs cannot cascade back into the
+    /// plugin that caused them.
     pub(super) fn plugin_in_event_context(&self) -> bool {
         self.plugin_event_depth > 0
     }
 
     /// Apply one plugin-originated call's actions. This is the single
     /// write-back point for every `HostAction` the runtime emits from a
-    /// command, event or timer call (commands now; events and timers via the
-    /// pump later), so depth bookkeeping and the status/error contract stay
-    /// uniform. Panel renders keep their own read-only action match.
-    fn apply_plugin_call(
+    /// command, event or timer call, so depth bookkeeping and the
+    /// status/error contract stay uniform. Panel renders keep their own
+    /// read-only action match.
+    pub(super) fn apply_plugin_call(
         &mut self,
         plugin_id: &str,
         call: luban_plugin::runtime::RuntimeCall<()>,
@@ -222,8 +233,9 @@ impl LubanApp {
     /// counter and resuming. Panic semantics are unchanged: the hook still
     /// runs once and the unwind still propagates. A drop guard cannot express
     /// this because the guarded region itself needs `&mut self`, so the guard
-    /// is spelled catch/resume instead.
-    fn raise_event_depth_during<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    /// is spelled catch/resume instead. The event pump dispatches every
+    /// plugin call through this so its emit sites stay suppressed.
+    pub(super) fn raise_event_depth_during<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.plugin_event_depth = self.plugin_event_depth.saturating_add(1);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.plugin_event_depth = self.plugin_event_depth.saturating_sub(1);
@@ -390,8 +402,11 @@ impl LubanApp {
     }
 
     pub fn reload_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = window;
         self.reload_plugins_now(cx);
+        // Lazy pump start: runtimes may have appeared (install, enable). The
+        // started flag is only set on an actual spawn, so a reload without
+        // plugins leaves the pump unstarted and the next one retries.
+        self.start_plugin_pump(window, cx);
     }
 
     /// Reload the plugin host without needing a window handle, so background

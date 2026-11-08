@@ -394,12 +394,23 @@ impl PluginHost {
         })
     }
 
-    // The dispatch wrappers below are consumed by the Task 10 event/timer
-    // pump (and quarantine auto-disable); until then only the tests call them.
+    // The dispatch wrappers below are consumed by the app-side event/timer
+    // pump (and quarantine auto-disable).
+
+    /// Active plugin ids (plan order, runtime loaded). The event pump uses
+    /// this for the timer and quarantine sweeps, which are per-plugin rather
+    /// than per-event.
+    pub fn active_plugin_ids(&self) -> Vec<String> {
+        self.plan
+            .order
+            .iter()
+            .filter(|id| self.runtimes.contains_key(*id))
+            .cloned()
+            .collect()
+    }
 
     /// Active plugin ids whose manifest declares `event` and whose runtime
-    /// loaded — the Task 10 event pump dispatches each of these.
-    #[allow(dead_code)]
+    /// loaded — the event pump dispatches each of these.
     pub fn listeners_of(&self, event: &str) -> Vec<String> {
         self.plan
             .order
@@ -419,7 +430,6 @@ impl PluginHost {
     /// [`Self::run_command`]: the runtime records non-panic outcomes inside
     /// `dispatch_event`; the host counts only panics — one counter, no
     /// double-counting.
-    #[allow(dead_code)]
     pub fn dispatch_event(
         &mut self,
         plugin_id: &str,
@@ -445,9 +455,8 @@ impl PluginHost {
         })
     }
 
-    /// Due timer ids of one plugin (BTreeMap key order; the Task 10 pump caps
+    /// Due timer ids of one plugin (BTreeMap key order; the pump caps
     /// dispatches per tick). Empty for a plugin without a runtime.
-    #[allow(dead_code)]
     pub fn due_timer_ids(&self, plugin_id: &str, now: std::time::Instant) -> Vec<String> {
         self.runtimes
             .get(plugin_id)
@@ -462,7 +471,6 @@ impl PluginHost {
     /// quarantine contract as [`Self::run_command`]: the runtime records
     /// non-panic outcomes inside `fire_timer`; the host counts only panics —
     /// one counter, no double-counting.
-    #[allow(dead_code)]
     pub fn fire_timer(
         &mut self,
         plugin_id: &str,
@@ -489,9 +497,8 @@ impl PluginHost {
     }
 
     /// True when the plugin's consecutive-failure count reached the quarantine
-    /// threshold (the Task 10 pump auto-disables it). False for a plugin
+    /// threshold (the pump auto-disables it). False for a plugin
     /// without a runtime.
-    #[allow(dead_code)]
     pub fn quarantine_due(&self, plugin_id: &str) -> bool {
         self.runtimes
             .get(plugin_id)
@@ -500,7 +507,6 @@ impl PluginHost {
 
     /// Clear the failure counter (the user re-enabled a quarantined plugin
     /// from the Plugins menu). No-op for a plugin without a runtime.
-    #[allow(dead_code)]
     pub fn reset_failures(&mut self, plugin_id: &str) {
         if let Some(runtime) = self.runtimes.get(plugin_id) {
             runtime.reset_failures();
