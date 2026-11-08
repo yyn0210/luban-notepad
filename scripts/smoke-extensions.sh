@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke coverage for the 1.0 extension surface.
+# End-to-end smoke coverage for the plugin API v2 extension surface.
 #
 # Requires a built `target/debug/luban-notepad` (or LUBAN_BIN) and a display.
 # CI runs it on Xvfb; locally it can use an existing DISPLAY.
@@ -43,7 +43,7 @@ cat > "$TMP/plugins/com.example.smoke/plugin.json" <<'JSON'
   "id": "com.example.smoke",
   "name": "Smoke",
   "version": "1.0.0",
-  "api_version": 1,
+  "api_version": 2,
   "main": "main.lua",
   "activate": "activate",
   "contributes": {
@@ -71,7 +71,7 @@ return {
     luban.log("info", "SMOKE_PLUGIN_RAN")
     luban.log("info", "SMOKE_DOC " .. tostring(document and document.line) .. ":" .. tostring(document and document.column))
     luban.notify("SMOKE_NOTIFY")
-    luban.insert_text(luban.settings.get("text"))
+    luban.document.insert(luban.settings.get("text"))
     luban.status.set("smoke.status", "smoke-ran")
   end,
   fail = function(ctx) error("smoke failure") end,
@@ -79,7 +79,7 @@ return {
     return {
       title = "Smoke panel",
       lines = {
-        { text = "Run", command = "smoke.run" },
+        { text = "Run", command = { id = "smoke.run" } },
         "Read-only line"
       }
     }
