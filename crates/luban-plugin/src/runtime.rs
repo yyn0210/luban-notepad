@@ -34,11 +34,11 @@ const MAX_ROLE_BYTES: usize = 32;
 /// Maximum length for plugin-supplied resource ids (panels, commands).
 const MAX_ID_BYTES: usize = 128;
 // Bounds for the v2 call context and host action surface; the still-unused
-// ones are consumed by upcoming v2 API tasks (timers, panel command args).
+// ones are consumed by upcoming v2 API tasks (panel command args).
 const MAX_EVENT_HANDLERS: usize = 32;
-#[expect(dead_code)]
+/// Maximum number of simultaneously active timers per plugin (spec §9).
 const MAX_TIMERS: usize = 16;
-#[expect(dead_code)]
+/// Smallest timer interval; shorter requests are clamped up (spec §9).
 const MIN_TIMER_MS: u64 = 50;
 /// Consecutive failed dispatches (commands, panels, events, timers) before
 /// [`PluginRuntime::should_quarantine`] trips (spec §6).
@@ -324,9 +324,10 @@ struct CallState {
     actions: Vec<HostAction>,
 }
 
-/// One registered timer. Declared so the runtime carries the registry from the
-/// start; Task 5 wires the timer API and the pump semantics.
-#[expect(dead_code)]
+/// One registered timer. `interval` is `None` for one-shot timers
+/// (`luban.timer.after`) and `Some(period)` for repeating ones
+/// (`luban.timer.every`). Entries live in the runtime's timer map, so
+/// rebuilding the VM (a fresh [`PluginRuntime`]) clears them automatically.
 #[derive(Clone)]
 struct TimerEntry {
     callback: mlua::Function,
@@ -348,7 +349,11 @@ pub struct PluginRuntime {
     /// `luban.events` closures installed on every call so registrations made
     /// during one dispatch survive into later ones.
     event_handlers: Rc<RefCell<BTreeMap<String, Vec<mlua::Function>>>>,
-    /// Registered timers (Task 5 wires the timer API and pump).
+    /// Registered timers keyed by id; shared with the `luban.timer` closures
+    /// installed on every call (so registrations made during one dispatch
+    /// survive into later ones) and drained by the host pump via
+    /// [`Self::fire_timer`]. Entries live here, not in the Lua VM, so
+    /// rebuilding the VM clears them.
     timers: Rc<RefCell<BTreeMap<String, TimerEntry>>>,
     /// Consecutive failed dispatches; any successful dispatch resets it.
     /// The host quarantines the plugin when [`Self::should_quarantine`].
@@ -674,6 +679,115 @@ impl PluginRuntime {
         register_handler(&mut registry, &allowed, event.to_string(), handler)
     }
 
+    /// Explicit registration helper / future host use: resolve `handler_name`
+    /// in the plugin table and register it as a timer, with the same rules as
+    /// `luban.timer.after/every` (interval clamp, active-timer cap, overwrite
+    /// of an existing id). Timers are not declared in the manifest, so no
+    /// event-style allow-list applies.
+    pub fn register_timer(
+        &mut self,
+        id: &str,
+        ms: u64,
+        handler_name: &str,
+        one_shot: bool,
+    ) -> Result<(), String> {
+        let callback: mlua::Function = self.plugin.get(handler_name).map_err(|_| {
+            format!(
+                "plugin '{}' has no function '{handler_name}'",
+                self.manifest.id
+            )
+        })?;
+        register_timer_entry(
+            &mut self.timers.borrow_mut(),
+            id.to_string(),
+            callback,
+            ms,
+            one_shot,
+        )
+    }
+
+    /// Ids of the timers due at `now`, in `BTreeMap` key (alphabetical) order.
+    /// The host pump calls this every tick and feeds each id to
+    /// [`Self::fire_timer`].
+    pub fn due_timer_ids(&self, now: std::time::Instant) -> Vec<String> {
+        self.timers
+            .borrow()
+            .iter()
+            .filter(|(_, entry)| entry.next_due <= now)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Fire one timer, dispatched like an event handler: same call
+    /// preparation, instruction budget, `(context, nil)` argument shape and
+    /// quarantine counting (the `context_kind` comes from the `input` the
+    /// host passes).
+    ///
+    /// The entry is taken out of the map before any plugin code runs (no
+    /// borrow guard is live across Lua, mirroring `dispatch_event`'s handler
+    /// snapshot). A repeating timer is reinserted *before* dispatch with
+    /// `next_due = now + interval`, so a handler that registers or cancels
+    /// timers cannot corrupt the iteration and an overrun still schedules the
+    /// next fire relative to now — no catch-up stacking. A one-shot timer
+    /// stays removed, so firing an expired id is an error.
+    ///
+    /// The `Err` variant is reserved for unknown ids; a failing callback is
+    /// contained in `RuntimeCall::error` and counted via `record_outcome`.
+    pub fn fire_timer(&mut self, id: &str, input: CallInput) -> Result<RuntimeCall<()>, String> {
+        let entry = self.timers.borrow_mut().remove(id);
+        let Some(entry) = entry else {
+            return Err(format!("timer '{id}' is not active"));
+        };
+        if let Some(interval) = entry.interval {
+            self.timers.borrow_mut().insert(
+                id.to_string(),
+                TimerEntry {
+                    callback: entry.callback.clone(),
+                    next_due: std::time::Instant::now() + interval,
+                    interval: Some(interval),
+                },
+            );
+        }
+        let state = self.prepare_call(input);
+        let context = match install_luban_table(
+            &self.lua,
+            state.clone(),
+            self.event_handlers.clone(),
+            self.timers.clone(),
+        )
+        .and_then(|()| context_table(&self.lua, &state, None))
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.record_outcome(false);
+                return Ok(RuntimeCall {
+                    output: RuntimeOutput::default(),
+                    value: None,
+                    error: Some(format!("cannot prepare plugin call: {error}")),
+                });
+            }
+        };
+        self.remaining.set(self.instruction_limit);
+        self.limit_hit.set(false);
+        let error = call_with_traceback(
+            &self.lua,
+            &entry.callback,
+            &self.error_handler,
+            (context, Value::Nil),
+        )
+        .err()
+        .map(|error| format_plugin_error(&self.manifest.id, id, &error));
+        let output = RuntimeOutput {
+            actions: state.borrow().actions.clone(),
+        };
+        self.record_outcome(error.is_none());
+        Ok(RuntimeCall {
+            output,
+            value: Some(()),
+            error,
+        })
+    }
+
     /// Record a dispatch outcome for the consecutive-failure quarantine
     /// counter: success resets it, failure bumps it.
     fn record_outcome(&self, ok: bool) {
@@ -894,7 +1008,7 @@ fn install_luban_table(
     lua: &Lua,
     state: Rc<RefCell<CallState>>,
     events_registry: Rc<RefCell<BTreeMap<String, Vec<mlua::Function>>>>,
-    _timers: Rc<RefCell<BTreeMap<String, TimerEntry>>>,
+    timers: Rc<RefCell<BTreeMap<String, TimerEntry>>>,
 ) -> mlua::Result<()> {
     let luban = lua.create_table()?;
     luban.set("version", 2)?;
@@ -1228,6 +1342,23 @@ fn install_luban_table(
     )?;
     luban.set("events", events_api)?;
 
+    // Timers: `after` (one-shot) and `every` (repeating) register callbacks in
+    // the runtime's timer map; the host pump dispatches due timers through
+    // `PluginRuntime::fire_timer`, which shares the event-dispatch path
+    // (instruction budget, error containment, quarantine counting). Entries
+    // live in the runtime struct, so rebuilding the VM clears them.
+    let timer = lua.create_table()?;
+    timer.set("after", install_timer_fn(lua, timers.clone(), true)?)?;
+    timer.set("every", install_timer_fn(lua, timers.clone(), false)?)?;
+    timer.set(
+        "cancel",
+        lua.create_function(move |_, id: String| {
+            timers.borrow_mut().remove(&id);
+            Ok(())
+        })?,
+    )?;
+    luban.set("timer", timer)?;
+
     lua.globals().set("luban", luban)?;
     Ok(())
 }
@@ -1300,6 +1431,57 @@ fn register_handler(
     }
     registry.entry(name).or_default().push(handler);
     Ok(())
+}
+
+/// Shared timer registration rule for `luban.timer.after/every` and the
+/// Rust-side `PluginRuntime::register_timer` helper: intervals below
+/// `MIN_TIMER_MS` are clamped up, the active-timer count stays under the cap
+/// (overwriting an existing id is always allowed) and a duplicate id replaces
+/// the previous entry outright.
+fn register_timer_entry(
+    timers: &mut BTreeMap<String, TimerEntry>,
+    id: String,
+    callback: mlua::Function,
+    ms: u64,
+    one_shot: bool,
+) -> Result<(), String> {
+    let is_new = !timers.contains_key(&id);
+    if is_new && timers.len() >= MAX_TIMERS {
+        return Err(format!("too many active timers (limit {MAX_TIMERS})"));
+    }
+    let clamped = ms.max(MIN_TIMER_MS);
+    let interval = std::time::Duration::from_millis(clamped);
+    timers.insert(
+        id,
+        TimerEntry {
+            callback,
+            next_due: std::time::Instant::now() + interval,
+            interval: if one_shot { None } else { Some(interval) },
+        },
+    );
+    Ok(())
+}
+
+/// Build `luban.timer.after` / `luban.timer.every`: validate the id and the
+/// interval, then insert a `TimerEntry` via `register_timer_entry`. Timers are
+/// not declared in the manifest, so there is no event-style allow-list.
+fn install_timer_fn(
+    lua: &Lua,
+    timers: Rc<RefCell<BTreeMap<String, TimerEntry>>>,
+    one_shot: bool,
+) -> mlua::Result<mlua::Function> {
+    lua.create_function(
+        move |_, (id, ms, callback): (String, i64, mlua::Function)| {
+            validate_resource_id(&id, "timer")?;
+            if ms < 0 {
+                return Err(mlua::Error::RuntimeError(
+                    "timer interval must be non-negative".into(),
+                ));
+            }
+            register_timer_entry(&mut timers.borrow_mut(), id, callback, ms as u64, one_shot)
+                .map_err(mlua::Error::RuntimeError)
+        },
+    )
 }
 
 fn context_table(
@@ -1780,6 +1962,7 @@ mod tests {
     use super::*;
     use crate::manifest::PluginManifest;
     use crate::settings::defaults as settings_defaults;
+    use std::time::{Duration, Instant};
 
     fn write_plugin(dir: &Path, main: &str) -> PluginManifest {
         fs::create_dir_all(dir).unwrap();
@@ -3128,5 +3311,374 @@ mod tests {
         assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
         assert!(call.output.actions.is_empty());
         assert_eq!(runtime.consecutive_failures(), 0);
+    }
+
+    // ---- timers (spec §9) ----
+    //
+    // Due-ness is checked with `Instant` arithmetic instead of sleeps so the
+    // tests stay fast and CI-stable: `due_timer_ids` is a pure function of the
+    // `now` argument.
+
+    #[test]
+    fn timers_clamp_below_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { tick = function(ctx) luban.notify("tick") end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let registered = Instant::now();
+        // 1ms is below MIN_TIMER_MS and is clamped up to 50ms.
+        runtime.register_timer("t", 1, "tick", true).unwrap();
+        // Not due 49ms after registration...
+        assert!(runtime
+            .due_timer_ids(registered + Duration::from_millis(49))
+            .is_empty());
+        // ...but due well after the clamped interval.
+        assert_eq!(
+            runtime.due_timer_ids(registered + Duration::from_millis(1000)),
+            vec!["t".to_string()]
+        );
+    }
+
+    #[test]
+    fn timers_fire_once_for_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"local M = {}
+            M.count = 0
+            function M.tick(ctx, payload)
+                if payload ~= nil then error("payload must be nil") end
+                M.count = M.count + 1
+                luban.notify("tick " .. M.count)
+            end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.register_timer("t1", 50, "tick", true).unwrap();
+        assert_eq!(
+            runtime.due_timer_ids(Instant::now() + Duration::from_millis(1000)),
+            vec!["t1".to_string()]
+        );
+        let call = runtime
+            .fire_timer("t1", input(&manifest, dir.path()))
+            .unwrap();
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        // The callback ran exactly once, with the dispatch context and a nil
+        // payload, and its module counter incremented.
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("tick 1".into())]
+        );
+        // One-shot: the entry is gone after firing.
+        assert!(runtime
+            .due_timer_ids(Instant::now() + Duration::from_millis(1000))
+            .is_empty());
+        let error = runtime
+            .fire_timer("t1", input(&manifest, dir.path()))
+            .unwrap_err();
+        assert!(error.contains("timer 't1' is not active"), "{error}");
+    }
+
+    #[test]
+    fn timers_repeat_for_every() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"local M = {}
+            M.count = 0
+            function M.tick(ctx)
+                M.count = M.count + 1
+                luban.notify("tick " .. M.count)
+            end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.register_timer("t", 1000, "tick", false).unwrap();
+        let call = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap();
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("tick 1".into())]
+        );
+        // Repeating: the entry was reinserted before dispatch with
+        // next_due = now + interval, so it is not due right after firing...
+        assert!(runtime.due_timer_ids(Instant::now()).is_empty());
+        // ...but due again one interval later.
+        assert_eq!(
+            runtime.due_timer_ids(Instant::now() + Duration::from_millis(1000)),
+            vec!["t".to_string()]
+        );
+        // And it keeps firing.
+        let call = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap();
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("tick 2".into())]
+        );
+    }
+
+    #[test]
+    fn timers_unknown_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(dir.path(), r#"return { tick = function(ctx) end }"#);
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = runtime
+            .fire_timer("ghost", input(&manifest, dir.path()))
+            .unwrap_err();
+        assert!(error.contains("timer 'ghost' is not active"), "{error}");
+    }
+
+    #[test]
+    fn timers_cap_at_sixteen() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                fill = function(ctx)
+                    for i = 1, 16 do
+                        luban.timer.every("t" .. i, 100, function() end)
+                    end
+                end,
+                extra = function(ctx) luban.timer.every("t17", 100, function() end) end,
+                overwrite = function(ctx) luban.timer.every("t1", 200, function() end) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        run_command(
+            &mut runtime,
+            "fill",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            runtime
+                .due_timer_ids(Instant::now() + Duration::from_millis(1000))
+                .len(),
+            MAX_TIMERS
+        );
+        // A 17th distinct id raises at the cap.
+        let error = command_error(
+            &mut runtime,
+            "extra",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(
+            error.contains(&format!("too many active timers (limit {MAX_TIMERS})")),
+            "{error}"
+        );
+        // Overwriting an existing id still works at the cap.
+        run_command(
+            &mut runtime,
+            "overwrite",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert_eq!(
+            runtime
+                .due_timer_ids(Instant::now() + Duration::from_millis(1000))
+                .len(),
+            MAX_TIMERS
+        );
+    }
+
+    #[test]
+    fn timers_overwrite_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                first = function(ctx) luban.notify("first") end,
+                second = function(ctx) luban.notify("second") end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.register_timer("t", 50, "first", true).unwrap();
+        runtime.register_timer("t", 50, "second", true).unwrap();
+        // The duplicate registration replaced the first entry: only the second
+        // callback runs.
+        let call = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap();
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("second".into())]
+        );
+        // And there is exactly one (one-shot) entry: no second fire.
+        let error = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap_err();
+        assert!(error.contains("timer 't' is not active"), "{error}");
+    }
+
+    #[test]
+    fn timers_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"local M = {}
+            M.tick = function(ctx)
+                luban.notify("tick")
+                luban.timer.cancel("self")
+            end
+            M.quiet = function(ctx) end
+            function M.cancel_other(ctx) luban.timer.cancel("other") end
+            function M.cancel_absent(ctx) luban.timer.cancel("ghost") end
+            return M"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        // Cancel of an absent id is a no-op.
+        run_command(
+            &mut runtime,
+            "cancel_absent",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        // A repeating timer whose callback cancels itself mid-dispatch: the
+        // entry was reinserted before dispatch and the handler's cancel then
+        // removed it, so it never fires again.
+        runtime.register_timer("self", 1000, "tick", false).unwrap();
+        let call = runtime
+            .fire_timer("self", input(&manifest, dir.path()))
+            .unwrap();
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        assert_eq!(call.output.actions, vec![HostAction::Notify("tick".into())]);
+        assert!(runtime
+            .due_timer_ids(Instant::now() + Duration::from_millis(1000))
+            .is_empty());
+        let error = runtime
+            .fire_timer("self", input(&manifest, dir.path()))
+            .unwrap_err();
+        assert!(error.contains("timer 'self' is not active"), "{error}");
+        // A cancel from another dispatch removes the timer; firing it errors.
+        runtime
+            .register_timer("other", 1000, "quiet", true)
+            .unwrap();
+        run_command(
+            &mut runtime,
+            "cancel_other",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        let error = runtime
+            .fire_timer("other", input(&manifest, dir.path()))
+            .unwrap_err();
+        assert!(error.contains("timer 'other' is not active"), "{error}");
+    }
+
+    #[test]
+    fn timers_failure_counts_toward_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return { boom = function(ctx) error("boom") end }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.register_timer("t", 50, "boom", true).unwrap();
+        // fire_timer's Err variant is reserved for unknown ids; a failing
+        // callback is contained in RuntimeCall::error.
+        let call = runtime
+            .fire_timer("t", input(&manifest, dir.path()))
+            .unwrap();
+        assert!(!call.is_ok());
+        let error = call.error.unwrap();
+        assert!(error.contains("boom"), "{error}");
+        // The failure names the timer id as the failing entry.
+        assert!(error.contains("failed in 't'"), "{error}");
+        assert_eq!(runtime.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn timers_receive_context_and_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                tick = function(ctx, payload)
+                    if payload ~= nil then error("payload must be nil") end
+                    luban.notify("text:" .. ctx.document.text)
+                end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.register_timer("t", 50, "tick", true).unwrap();
+        // The pump passes the dispatch context_kind in the CallInput (Event
+        // for timers); the runtime only consumes it.
+        let mut timer_input = input(&manifest, dir.path());
+        timer_input.context_kind = CallContextKind::Event;
+        let call = runtime.fire_timer("t", timer_input).unwrap();
+        assert!(call.is_ok(), "{}", call.error.unwrap_or_default());
+        // The callback sees the dispatch context's document and its notify
+        // surfaces in the RuntimeCall output.
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("text:abc".into())]
+        );
+    }
+
+    #[test]
+    fn timers_validate_id_and_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                empty_id = function(ctx) luban.timer.after("", 100, function() end) end,
+                long_id = function(ctx)
+                    luban.timer.after(string.rep("x", 129), 100, function() end)
+                end,
+                negative = function(ctx) luban.timer.after("t", -1, function() end) end,
+                zero = function(ctx) luban.timer.after("t0", 0, function() end) end,
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        for entry in ["empty_id", "long_id"] {
+            let error = command_error(
+                &mut runtime,
+                entry,
+                "test.run",
+                input(&manifest, dir.path()),
+            );
+            assert!(error.contains("invalid timer id"), "{entry}: {error}");
+        }
+        let error = command_error(
+            &mut runtime,
+            "negative",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(
+            error.contains("timer interval must be non-negative"),
+            "{error}"
+        );
+        // ms == 0 is not an error: it is clamped up to MIN_TIMER_MS.
+        let before = Instant::now();
+        run_command(
+            &mut runtime,
+            "zero",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(runtime
+            .due_timer_ids(before + Duration::from_millis(49))
+            .is_empty());
+        assert_eq!(
+            runtime.due_timer_ids(before + Duration::from_millis(1000)),
+            vec!["t0".to_string()]
+        );
     }
 }
