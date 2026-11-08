@@ -404,6 +404,12 @@ impl PluginRuntime {
         // currently being evaluated — the only point where a cycle can
         // re-enter `require` — so a circular dependency raises instead of
         // recursing to a Rust stack overflow.
+        //
+        // Notes for plugin authors: `require('main')` re-evaluates main.lua as
+        // a module, so its top-level side effects run a second time; and a
+        // module whose body returns nil caches and returns nil (stock Lua's
+        // require would return true instead), so side-effect modules should
+        // return an explicit table or `true`.
         let module_cache: Rc<RefCell<HashMap<String, Value>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let loading: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
@@ -416,11 +422,21 @@ impl PluginRuntime {
                 }
                 if loading.borrow().contains(&name) {
                     return Err(mlua::Error::RuntimeError(format!(
-                        "circular module dependency: '{name}'"
+                        "module '{name}': circular dependency"
                     )));
                 }
                 let path =
                     resolve_module_path(&plugin_dir, &name).map_err(mlua::Error::RuntimeError)?;
+                // Same resource bound as `luban.fs.read`: an over-large module
+                // file fails the load instead of being slurped whole.
+                let metadata = fs::metadata(&path).map_err(|error| {
+                    mlua::Error::RuntimeError(format!("module '{name}': {error}"))
+                })?;
+                if metadata.len() > MAX_FILE_BYTES {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "module '{name}': file is larger than {MAX_FILE_BYTES} bytes"
+                    )));
+                }
                 let source = fs::read_to_string(&path).map_err(|error| {
                     mlua::Error::RuntimeError(format!("module '{name}': {error}"))
                 })?;
@@ -433,8 +449,15 @@ impl PluginRuntime {
                 let evaluated: mlua::Result<Value> =
                     lua.load(&source).set_name(format!("@{name}.lua")).eval();
                 loading.borrow_mut().remove(&name);
-                let value =
-                    evaluated.map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+                // Propagate the original eval error unwrapped: re-wrapping it
+                // as a string would bake one mlua Display prefix plus one
+                // traceback blob into the message per require nesting level
+                // (a 600-deep chain produced a 122 KB error). mlua's
+                // CallbackError Display already traces errors down to their
+                // root and deduplicates the nested tracebacks, so the final
+                // message stays bounded. Plugins see the same WrappedFailure
+                // error object through pcall as for any other host API error.
+                let value = evaluated?;
                 module_cache.borrow_mut().insert(name, value.clone());
                 Ok(value)
             })
@@ -1709,9 +1732,10 @@ fn resolve_allowed_path(state: &CallState, path: &str, write: bool) -> Result<Pa
 /// Names may only contain `[a-z0-9._]`, every dot-separated segment must be
 /// non-empty (so `..` and absolute paths are impossible by construction) and
 /// the name itself must be 1..=256 bytes. As defense in depth against
-/// symlinked directories, the resolved file's parent must canonicalize inside
-/// the canonical plugin directory; the file itself need not exist yet — a
-/// missing module surfaces from the caller's read as `module '<name>': ...`.
+/// symlinks, both the resolved file's parent and the file itself (when it
+/// exists) must canonicalize inside the canonical plugin directory. A missing
+/// module file keeps its resolved path so the caller's read surfaces
+/// `module '<name>': ...`.
 fn resolve_module_path(plugin_dir: &Path, name: &str) -> Result<PathBuf, String> {
     if name.is_empty() || name.len() > 256 {
         return Err("invalid module name".into());
@@ -1742,10 +1766,24 @@ fn resolve_module_path(plugin_dir: &Path, name: &str) -> Result<PathBuf, String>
     if !resolved_parent.starts_with(&root) {
         return Err(format!("module '{name}' escapes the plugin directory"));
     }
-    Ok(resolved_parent.join(
+    let resolved = resolved_parent.join(
         path.file_name()
             .expect("module path always has a file name"),
-    ))
+    );
+    // The file itself may be a symlink pointing outside the plugin
+    // directory: canonicalizing an existing file resolves the link, and the
+    // target must stay inside. A missing file keeps the resolved path —
+    // the caller's read produces the `module '<name>': ...` error.
+    if resolved.exists() {
+        let resolved_file = resolved
+            .canonicalize()
+            .map_err(|error| format!("module '{name}': {error}"))?;
+        if !resolved_file.starts_with(&root) {
+            return Err(format!("module '{name}' escapes the plugin directory"));
+        }
+        return Ok(resolved_file);
+    }
+    Ok(resolved)
 }
 
 /// Recursion limit for Lua→JSON conversion; mirrors serde_json's own nesting
@@ -4009,14 +4047,17 @@ mod tests {
             "test.run",
             input(&manifest, dir.path()),
         );
-        assert!(error.contains("circular module dependency"), "{error}");
+        assert!(
+            error.contains("module 'self': circular dependency"),
+            "{error}"
+        );
         let error = command_error(
             &mut runtime,
             "mutual",
             "test.run",
             input(&manifest, dir.path()),
         );
-        assert!(error.contains("circular module dependency"), "{error}");
+        assert!(error.contains("module 'a': circular dependency"), "{error}");
         // The failed circular loads did not poison the loader: a normal module
         // still loads afterwards.
         let output = run_command(
@@ -4113,5 +4154,117 @@ mod tests {
         assert!(!call.is_ok());
         let error = call.error.unwrap();
         assert!(error.contains("instruction limit exceeded"), "{error}");
+    }
+
+    /// The module file itself must not be a symlink pointing outside the
+    /// plugin directory: `resolve_module_path` canonicalizes an existing file
+    /// and rejects targets outside the canonical plugin dir (symlinked parent
+    /// directories were already rejected).
+    #[test]
+    fn require_rejects_symlinked_module_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("target.lua"), "return 'pwned'").unwrap();
+            symlink(
+                outside.path().join("target.lua"),
+                dir.path().join("evil.lua"),
+            )
+            .unwrap();
+            let manifest = write_plugin(
+                dir.path(),
+                r#"return { run = function(ctx) require('evil') end }"#,
+            );
+            let mut runtime =
+                PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+            let error = command_error(
+                &mut runtime,
+                "run",
+                "test.run",
+                input(&manifest, dir.path()),
+            );
+            assert!(error.contains("escapes the plugin directory"), "{error}");
+        }
+    }
+
+    /// A directory inside the plugin directory that is itself a symlink must
+    /// not become a module path component: the resolved parent canonicalizes
+    /// to the link target, which lies outside the plugin dir.
+    #[test]
+    fn require_rejects_symlinked_parent_directory() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("evil.lua"), "return 'pwned'").unwrap();
+            symlink(outside.path(), dir.path().join("link")).unwrap();
+            let manifest = write_plugin(
+                dir.path(),
+                r#"return { run = function(ctx) require('link.evil') end }"#,
+            );
+            let mut runtime =
+                PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+            let error = command_error(
+                &mut runtime,
+                "run",
+                "test.run",
+                input(&manifest, dir.path()),
+            );
+            assert!(error.contains("escapes the plugin directory"), "{error}");
+        }
+    }
+
+    /// An error raised in a deeply nested require chain must not accumulate
+    /// one mlua Display prefix (or traceback blob) per nesting level: the
+    /// status-bar summary would otherwise become pure
+    /// `runtime error: runtime error: ...` noise.
+    #[test]
+    fn require_deep_chain_error_stays_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        const DEPTH: usize = 60;
+        // chain_0 raises; chain_k requires chain_{k-1}, so the error crosses
+        // DEPTH require nesting levels before surfacing in the entry.
+        fs::write(dir.path().join("chain_0.lua"), "error('boom')").unwrap();
+        for k in 1..DEPTH {
+            fs::write(
+                dir.path().join(format!("chain_{k}.lua")),
+                format!("return require('chain_{}')", k - 1),
+            )
+            .unwrap();
+        }
+        let manifest = write_plugin(
+            dir.path(),
+            &format!(
+                "return {{ run = function(ctx) require('chain_{}') end }}",
+                DEPTH - 1
+            ),
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let error = command_error(
+            &mut runtime,
+            "run",
+            "test.run",
+            input(&manifest, dir.path()),
+        );
+        assert!(error.contains("boom"), "{error}");
+        // The mlua Display prefix must not stack once per nesting level (the
+        // top-level pipeline contributes a constant number, as for any host
+        // API error).
+        let prefixes = error.matches("runtime error: ").count();
+        assert!(
+            prefixes <= 3,
+            "error prefixes stack per require level ({prefixes}): {error}"
+        );
+        // Generous bound pinning that the message stays bounded instead of
+        // embedding one traceback blob per nesting level.
+        assert!(
+            error.len() < 30_000,
+            "error grew unbounded: {} chars",
+            error.len()
+        );
     }
 }
