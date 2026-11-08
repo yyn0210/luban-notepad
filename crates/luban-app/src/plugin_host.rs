@@ -16,7 +16,8 @@ use luban_plugin::manifest::{
 };
 use luban_plugin::registry::{LoadPlan, PluginRegistry, PluginState};
 use luban_plugin::runtime::{
-    CallInput, PanelContent, PluginIdentity, PluginRuntime, RuntimeCall, RuntimeOutput,
+    CallContextKind, CallInput, PanelContent, PluginIdentity, PluginRuntime, RuntimeCall,
+    RuntimeOutput,
 };
 
 use crate::commands::{CommandWhen, DynamicCommandSpec};
@@ -127,6 +128,8 @@ impl PluginHost {
                 document: None,
                 settings: plugin_settings_map.clone(),
                 allowed_roots,
+                command_depth: 0,
+                context_kind: CallContextKind::default(),
             };
             let mut runtime =
                 match PluginRuntime::new(manifest, &entry.dir, entry.permissions.clone()) {

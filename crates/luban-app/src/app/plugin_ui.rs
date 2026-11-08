@@ -96,6 +96,8 @@ impl LubanApp {
             document: self.plugin_document_snapshot(cx),
             settings,
             allowed_roots: self.plugin_allowed_roots(),
+            command_depth: 0,
+            context_kind: luban_plugin::runtime::CallContextKind::default(),
         };
         let Some(call) = self
             .plugin_host
@@ -138,6 +140,20 @@ impl LubanApp {
                             cx,
                         );
                     }
+                }
+                luban_plugin::runtime::HostAction::RefreshPanel { id } => {
+                    log::debug!(
+                        "plugin '{plugin_id}' requested panel refresh '{id}' (not wired yet)"
+                    );
+                }
+                luban_plugin::runtime::HostAction::SetCursor { .. } => {
+                    log::debug!("plugin cursor action (not wired yet)");
+                }
+                luban_plugin::runtime::HostAction::SetSetting { key, .. } => {
+                    log::debug!("plugin setting write-back '{key}' (not wired yet)");
+                }
+                luban_plugin::runtime::HostAction::RunCommand { id, .. } => {
+                    log::debug!("plugin requested command run '{id}' (not wired yet)");
                 }
             }
         }
@@ -762,6 +778,8 @@ impl LubanApp {
             document: self.plugin_document_snapshot(cx),
             settings,
             allowed_roots: self.plugin_allowed_roots(),
+            command_depth: 0,
+            context_kind: luban_plugin::runtime::CallContextKind::default(),
         };
         let Some(call) = self.plugin_host.panel_content(plugin_id, panel_id, input) else {
             self.set_status(
@@ -787,6 +805,20 @@ impl LubanApp {
                 }
                 luban_plugin::runtime::HostAction::OpenPanel { id } => {
                     log::warn!("plugin panel '{panel_id}' requested panel '{id}'; action ignored");
+                }
+                luban_plugin::runtime::HostAction::RefreshPanel { id } => {
+                    log::debug!(
+                        "plugin panel '{panel_id}' requested refresh '{id}' (not wired yet)"
+                    );
+                }
+                luban_plugin::runtime::HostAction::SetCursor { .. } => {
+                    log::debug!("plugin cursor action (not wired yet)");
+                }
+                luban_plugin::runtime::HostAction::SetSetting { key, .. } => {
+                    log::debug!("plugin setting write-back '{key}' (not wired yet)");
+                }
+                luban_plugin::runtime::HostAction::RunCommand { id, .. } => {
+                    log::debug!("plugin requested command run '{id}' (not wired yet)");
                 }
             }
         }
@@ -897,7 +929,7 @@ impl LubanApp {
         let weak_action = cx.weak_entity();
         let action_buttons = actions.into_iter().enumerate().map(move |(index, action)| {
             let weak = weak_action.clone();
-            let command = action.command;
+            let command = action.command.id;
             Button::new(("plugin-panel-action", index))
                 .label(action.label)
                 .ghost()
@@ -1309,9 +1341,12 @@ impl LubanApp {
                     let _ = weak.update(cx, |this, cx| {
                         this.plugin_panel = None;
                         this.focus_editor(window, cx);
-                        if !this.run_command(&command, window, cx) {
+                        if !this.run_command(&command.id, window, cx) {
                             this.set_status(
-                                tr_args("status.command_failed", &[("command", command.clone())]),
+                                tr_args(
+                                    "status.command_failed",
+                                    &[("command", command.id.clone())],
+                                ),
                                 cx,
                             );
                         }

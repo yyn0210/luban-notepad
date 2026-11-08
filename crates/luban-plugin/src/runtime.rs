@@ -31,6 +31,22 @@ const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
 const MAX_PANEL_ACTION_COMMAND_BYTES: usize = 128;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
+// Bounds for the v2 call context and host action surface; used by upcoming
+// v2 API tasks (event dispatch, timers, notifications, command cascades).
+#[allow(dead_code)]
+const MAX_EVENT_HANDLERS: usize = 32;
+#[allow(dead_code)]
+const MAX_TIMERS: usize = 16;
+#[allow(dead_code)]
+const MIN_TIMER_MS: u64 = 50;
+#[allow(dead_code)]
+const MAX_NOTIFY_PER_CALL: usize = 8;
+#[allow(dead_code)]
+const MAX_NOTIFY_BYTES: usize = 1024;
+#[allow(dead_code)]
+const MAX_COMMAND_DEPTH: u8 = 4;
+#[allow(dead_code)]
+const MAX_PANEL_ARGS_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct PluginIdentity {
@@ -51,12 +67,26 @@ pub struct DocumentSnapshot {
     pub modified: bool,
 }
 
+/// Dispatch origin. Event/Edit contexts are cascade-suppressed; Edit is
+/// additionally read-only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CallContextKind {
+    #[default]
+    User,
+    Event,
+    Edit,
+}
+
 #[derive(Clone, Debug)]
 pub struct CallInput {
     pub plugin: PluginIdentity,
     pub document: Option<DocumentSnapshot>,
     pub settings: Map<String, JsonValue>,
     pub allowed_roots: Vec<PathBuf>,
+    /// Depth of the command.run chain that initiated this call (user/CLI/panel
+    /// click = 0).
+    pub command_depth: u8,
+    pub context_kind: CallContextKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +102,28 @@ pub enum HostAction {
     },
     OpenPanel {
         id: String,
+    },
+    /// Re-render the plugin's already-open panel (ignored when closed).
+    RefreshPanel {
+        id: String,
+    },
+    /// Set the active document cursor (1-based, host clamps).
+    SetCursor {
+        line: usize,
+        col: usize,
+    },
+    /// Write back a plugin setting (host validates against the declared schema
+    /// and persists).
+    SetSetting {
+        key: String,
+        value: JsonValue,
+    },
+    /// Run a command through the host command system; `depth` already includes
+    /// this hop (+1).
+    RunCommand {
+        id: String,
+        args: Option<JsonValue>,
+        depth: u8,
     },
 }
 
@@ -102,16 +154,25 @@ pub struct PanelContent {
     pub actions: Vec<PanelAction>,
 }
 
+/// Command reference carried by panel lines / header actions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelCommand {
+    pub id: String,
+    /// JSON-compatible args, passed verbatim as the command entry's second
+    /// parameter.
+    pub args: Option<JsonValue>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelAction {
     pub label: String,
-    pub command: String,
+    pub command: PanelCommand,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelLine {
     pub text: String,
-    pub command: Option<String>,
+    pub command: Option<PanelCommand>,
     pub style: PanelLineStyle,
     /// Nesting level for list/quote lines, clamped to `0..=8`.
     pub indent: u8,
@@ -332,6 +393,8 @@ impl PluginRuntime {
             document: None,
             settings: Map::new(),
             allowed_roots: vec![dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())],
+            command_depth: 0,
+            context_kind: CallContextKind::default(),
         };
         let status_ids: BTreeSet<String> = manifest
             .contributes
@@ -1153,7 +1216,14 @@ fn parse_panel_actions(value: Value) -> Result<Vec<PanelAction>, String> {
         if command.is_empty() || command.len() > MAX_PANEL_ACTION_COMMAND_BYTES {
             return Err("panel action command is empty or too long".to_string());
         }
-        actions.push(PanelAction { label, command });
+        // The table command form (with args) is parsed by the v2 panel API.
+        actions.push(PanelAction {
+            label,
+            command: PanelCommand {
+                id: command,
+                args: None,
+            },
+        });
     }
     Ok(actions)
 }
@@ -1213,6 +1283,8 @@ fn parse_panel_line(line: &Table) -> Result<PanelLine, String> {
         .unwrap_or(0)
         .clamp(0, 8) as u8;
     let spans = parse_panel_spans(&text, line.get::<Value>("spans").unwrap_or(Value::Nil))?;
+    // The table command form (with args) is parsed by the v2 panel API.
+    let command = command.map(|id| PanelCommand { id, args: None });
     Ok(PanelLine {
         text,
         command,
@@ -1302,6 +1374,8 @@ impl Drop for PluginRuntime {
             document: None,
             settings: crate::settings::defaults(&self.manifest.contributes.settings),
             allowed_roots: vec![self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone())],
+            command_depth: 0,
+            context_kind: CallContextKind::default(),
         };
         let call = self.invoke(&name, None, input);
         if let Some(error) = call.error {
@@ -1360,6 +1434,8 @@ mod tests {
             }),
             settings: settings_defaults(&manifest.contributes.settings),
             allowed_roots: vec![dir.to_path_buf()],
+            command_depth: 0,
+            context_kind: CallContextKind::default(),
         }
     }
 
@@ -1525,10 +1601,22 @@ mod tests {
         let panel = panel.value.unwrap();
         assert_eq!(panel.title.as_deref(), Some("Demo"));
         assert_eq!(panel.lines.len(), 2);
-        assert_eq!(panel.lines[1].command.as_deref(), Some("test.run"));
+        assert_eq!(
+            panel.lines[1].command,
+            Some(PanelCommand {
+                id: "test.run".to_string(),
+                args: None,
+            })
+        );
         assert_eq!(panel.actions.len(), 2);
         assert_eq!(panel.actions[0].label, "Refresh");
-        assert_eq!(panel.actions[1].command, "test.info");
+        assert_eq!(
+            panel.actions[1].command,
+            PanelCommand {
+                id: "test.info".to_string(),
+                args: None,
+            }
+        );
     }
 
     #[test]
@@ -1657,5 +1745,10 @@ mod tests {
                 id: "test.panel".into()
             }]
         );
+    }
+
+    #[test]
+    fn context_kind_defaults_to_user() {
+        assert_eq!(CallContextKind::default(), CallContextKind::User);
     }
 }
