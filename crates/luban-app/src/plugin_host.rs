@@ -82,25 +82,35 @@ pub struct PluginHost {
 pub(crate) enum RunCommandRoute {
     /// `depth > MAX_COMMAND_DEPTH`: the cascade is rejected.
     DepthExceeded,
-    /// A built-in command; args, if any, are ignored.
+    /// A live plugin command. Checked first — the same precedence the
+    /// user-path dispatch applies — so a plugin command whose id equals a
+    /// built-in's cannot slip through the built-in fast path and re-enter
+    /// the host at depth 0, bypassing the cascade cap.
+    Plugin,
+    /// A built-in command (no plugin command carries this id); args, if any,
+    /// are ignored.
     BuiltIn,
-    /// Not built-in: the host resolves a live plugin command or reports the
-    /// command as not found.
-    HostCommand,
+    /// Neither a live plugin command nor a built-in.
+    NotFound,
 }
 
 /// Pure routing decision for a plugin-requested command run, consumed by the
 /// app-side action executor. `depth` is the depth of the command being
 /// launched (the requesting command's `command_depth` + 1); the runtime's own
 /// `command.run` applies the same cap, so both layers agree on the limit.
-pub(crate) fn route_run_command(id: &str, depth: u8) -> RunCommandRoute {
+/// `is_plugin_command` is the host's `command(id)` hit: plugin-first here
+/// keeps the executor's precedence identical to the user path.
+pub(crate) fn route_run_command(id: &str, depth: u8, is_plugin_command: bool) -> RunCommandRoute {
     if depth > luban_plugin::runtime::MAX_COMMAND_DEPTH {
         return RunCommandRoute::DepthExceeded;
+    }
+    if is_plugin_command {
+        return RunCommandRoute::Plugin;
     }
     if crate::commands::spec(id).is_some() {
         return RunCommandRoute::BuiltIn;
     }
-    RunCommandRoute::HostCommand
+    RunCommandRoute::NotFound
 }
 
 impl PluginHost {
@@ -986,29 +996,173 @@ mod tests {
     }
 
     #[test]
-    fn run_command_route_rejects_depth_and_knows_builtins() {
+    fn run_command_route_is_plugin_first_and_rejects_depth() {
         // The depth of the command being launched is capped: the first chain
-        // step past MAX_COMMAND_DEPTH is rejected before any host lookup.
+        // step past MAX_COMMAND_DEPTH is rejected before any host lookup,
+        // whatever the id would have routed to.
         assert_eq!(
-            route_run_command("anything", luban_plugin::runtime::MAX_COMMAND_DEPTH + 1),
+            route_run_command(
+                "anything",
+                luban_plugin::runtime::MAX_COMMAND_DEPTH + 1,
+                true
+            ),
             RunCommandRoute::DepthExceeded
         );
         assert_eq!(
-            route_run_command("anything", u8::MAX),
+            route_run_command("anything", u8::MAX, false),
             RunCommandRoute::DepthExceeded
+        );
+        // A live plugin command wins even when its id equals a built-in's.
+        // Built-in-first here would let the built-in path re-enter the host
+        // at depth 0 and bypass the cascade cap.
+        assert_eq!(
+            route_run_command("file.save", 0, true),
+            RunCommandRoute::Plugin
+        );
+        // A built-in id with no live plugin command behind it routes to the
+        // built-in; anything else is not found.
+        assert_eq!(
+            route_run_command("file.save", 0, false),
+            RunCommandRoute::BuiltIn
+        );
+        assert_eq!(
+            route_run_command("unknown.command", 0, false),
+            RunCommandRoute::NotFound
         );
         // A launch at the cap itself is still allowed; the runtime enforces
         // the same boundary for its own `command.run`.
         assert_eq!(
-            route_run_command("ghost.command", luban_plugin::runtime::MAX_COMMAND_DEPTH),
-            RunCommandRoute::HostCommand
+            route_run_command(
+                "unknown.command",
+                luban_plugin::runtime::MAX_COMMAND_DEPTH,
+                false
+            ),
+            RunCommandRoute::NotFound
         );
-        // Built-ins route before the host, plugin commands and unknown ids
-        // alike resolve there.
-        assert_eq!(route_run_command("file.save", 0), RunCommandRoute::BuiltIn);
+    }
+
+    /// Write one plugin whose single command entry chains
+    /// `luban.command.run(chains_to)`.
+    fn write_chaining_plugin(
+        root: &Path,
+        id: &str,
+        command_id: &str,
+        entry: &str,
+        chains_to: &str,
+    ) {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("plugin.json"),
+            format!(
+                r#"{{
+                    "id": "{id}",
+                    "name": "{id}",
+                    "version": "1.0.0",
+                    "api_version": 2,
+                    "main": "main.lua",
+                    "permissions": [],
+                    "events": [],
+                    "activate": "activate",
+                    "deactivate": "deactivate",
+                    "contributes": {{
+                        "commands": [{{ "id": "{command_id}", "label": "Chain", "entry": "{entry}" }}]
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.lua"),
+            format!(
+                r#"return {{
+                    activate = function(ctx) end,
+                    {entry} = function(ctx) luban.command.run("{chains_to}") end,
+                }}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shadowed_builtin_chain_still_climbs_the_depth() {
+        // Regression for the built-in-first bypass: "shadow" contributes a
+        // command with the BUILT-IN id "file.save" whose entry chains into
+        // "chainer.step", whose entry chains back. The executor resolves
+        // plugin commands first and feeds each emitted action's depth back
+        // as the next call's command_depth, so the chain climbs until the
+        // runtime's own cap trips — instead of re-entering the shadow at
+        // depth 0 forever through the built-in fast path. (PluginHost::load
+        // rejects conflicting ids, so a shadow is only exercisable via a
+        // hand-built host like this one; the executor must not rely on
+        // that.)
+        let dir = tempfile::tempdir().unwrap();
+        write_chaining_plugin(dir.path(), "shadow", "file.save", "run", "chainer.step");
+        write_chaining_plugin(dir.path(), "chainer", "chainer.step", "step", "file.save");
+        let mut host = host_from(dir.path());
+        for (plugin_id, command_id, entry) in [
+            ("shadow", "file.save", "run"),
+            ("chainer", "chainer.step", "step"),
+        ] {
+            host.commands.push(PluginCommand {
+                id: Box::leak(command_id.to_string().into_boxed_str()),
+                label: "Chain".to_string(),
+                plugin_id: plugin_id.to_string(),
+                entry: entry.to_string(),
+                when: CommandWhen::Always,
+                default_binding: None,
+                in_menu: false,
+            });
+        }
+        // The shadowed built-in id routes to the plugin command, not the
+        // built-in fast path.
         assert_eq!(
-            route_run_command("unknown.command", 0),
-            RunCommandRoute::HostCommand
+            route_run_command("file.save", 1, host.command("file.save").is_some()),
+            RunCommandRoute::Plugin
+        );
+
+        // Mirror of the executor's RunCommand arm: plugin-first, feeding
+        // each emitted action's depth back as the next call's
+        // command_depth.
+        let mut pending = vec![(
+            "shadow".to_string(),
+            "run".to_string(),
+            "file.save".to_string(),
+            0u8,
+        )];
+        let mut calls = 0usize;
+        let mut final_error = String::new();
+        while let Some((plugin_id, entry, id, depth)) = pending.pop() {
+            calls += 1;
+            let mut input = host_input(&host, &plugin_id);
+            input.command_depth = depth;
+            let call = host
+                .run_command(&plugin_id, &entry, &id, None, input)
+                .expect("runtime loaded");
+            if let Some(error) = &call.error {
+                final_error = error.clone();
+                break;
+            }
+            for action in call.output.actions {
+                if let HostAction::RunCommand { id, args: _, depth } = action {
+                    let command = host.command(&id).cloned();
+                    match crate::plugin_host::route_run_command(&id, depth, command.is_some()) {
+                        crate::plugin_host::RunCommandRoute::Plugin => {
+                            let command = command.expect("route promised a plugin command");
+                            pending.push((command.plugin_id, command.entry, id, depth));
+                        }
+                        other => panic!("chain left the plugin path: {other:?}"),
+                    }
+                }
+            }
+        }
+        // Five hops (input depths 0..=4); the fifth command's own
+        // luban.command.run computes depth 5 and the runtime's cap rejects
+        // it.
+        assert_eq!(calls, 5);
+        assert!(
+            final_error.contains("exceeds the maximum depth of 4"),
+            "{final_error}"
         );
     }
 }

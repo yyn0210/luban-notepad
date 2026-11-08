@@ -129,9 +129,10 @@ impl LubanApp {
     }
 
     /// Apply one plugin-originated call's actions. This is the single
-    /// write-back point for every `HostAction` the runtime emits (commands
-    /// now; events and timers via the pump later), so depth bookkeeping and
-    /// the status/error contract stay uniform.
+    /// write-back point for every `HostAction` the runtime emits from a
+    /// command, event or timer call (commands now; events and timers via the
+    /// pump later), so depth bookkeeping and the status/error contract stay
+    /// uniform. Panel renders keep their own read-only action match.
     fn apply_plugin_call(
         &mut self,
         plugin_id: &str,
@@ -142,80 +143,101 @@ impl LubanApp {
         // Actions applied inside this call are the plugin's own event-context
         // side effects. The pump sets its own suppression before queueing
         // events; this guard covers nested command.run chains spawned from
-        // event contexts.
-        self.plugin_event_depth = self.plugin_event_depth.saturating_add(1);
-        let mut ok = call.error.is_none();
-        for action in call.output.actions {
-            match action {
-                luban_plugin::runtime::HostAction::SetDocumentText { text, selection } => {
-                    let (start, end) = selection.unwrap_or((0, 0));
-                    self.replace_document_text(text, start, end, window, cx);
-                }
-                luban_plugin::runtime::HostAction::Notify(message) => {
-                    self.set_status(message, cx);
-                }
-                luban_plugin::runtime::HostAction::SetStatus { id, text } => {
-                    self.plugin_host.set_status(plugin_id, &id, text);
-                    cx.notify();
-                }
-                luban_plugin::runtime::HostAction::OpenPanel { id } => {
-                    if self
-                        .plugin_host
-                        .panels
-                        .iter()
-                        .any(|panel| panel.plugin_id == plugin_id && panel.id == id)
-                    {
-                        self.open_plugin_panel(plugin_id, &id, window, cx);
-                    } else {
-                        self.set_status(
-                            format!("plugin '{plugin_id}' requested unknown panel '{id}'"),
-                            cx,
-                        );
+        // event contexts. The guard also restores the counter on unwind, so
+        // a panic cannot leave event emission suppressed forever.
+        self.raise_event_depth_during(move |this| {
+            let mut ok = true;
+            for action in call.output.actions {
+                match action {
+                    luban_plugin::runtime::HostAction::SetDocumentText { text, selection } => {
+                        let (start, end) = selection.unwrap_or((0, 0));
+                        this.replace_document_text(text, start, end, window, cx);
                     }
-                }
-                luban_plugin::runtime::HostAction::RefreshPanel { id } => {
-                    // Only a re-render of THIS plugin's already-open panel.
-                    // A closed panel is a silent no-op: there is no target to
-                    // refresh, and `luban.panel.open` exists for opening one.
-                    let open = self
-                        .plugin_panel
-                        .as_ref()
-                        .is_some_and(|panel| panel.plugin_id == plugin_id && panel.panel_id == id);
-                    if open {
-                        self.refresh_plugin_panel(plugin_id, &id, window, cx);
+                    luban_plugin::runtime::HostAction::Notify(message) => {
+                        this.set_status(message, cx);
                     }
-                }
-                luban_plugin::runtime::HostAction::SetCursor { line, col } => {
-                    self.set_plugin_cursor(line, col, window, cx);
-                }
-                luban_plugin::runtime::HostAction::SetSetting { key, value } => {
-                    if self.persist_plugin_setting(plugin_id, &key, value) {
+                    luban_plugin::runtime::HostAction::SetStatus { id, text } => {
+                        this.plugin_host.set_status(plugin_id, &id, text);
                         cx.notify();
-                    } else {
-                        ok = false;
-                        self.set_status(
-                            format!(
-                                "plugin '{plugin_id}' cannot write setting '{key}': \
-                                 undeclared or invalid value"
-                            ),
-                            cx,
-                        );
                     }
-                }
-                luban_plugin::runtime::HostAction::RunCommand { id, args, depth } => {
-                    ok &= self.apply_run_command_action(&id, args, depth, window, cx);
+                    luban_plugin::runtime::HostAction::OpenPanel { id } => {
+                        if this
+                            .plugin_host
+                            .panels
+                            .iter()
+                            .any(|panel| panel.plugin_id == plugin_id && panel.id == id)
+                        {
+                            this.open_plugin_panel(plugin_id, &id, window, cx);
+                        } else {
+                            this.set_status(
+                                format!("plugin '{plugin_id}' requested unknown panel '{id}'"),
+                                cx,
+                            );
+                        }
+                    }
+                    luban_plugin::runtime::HostAction::RefreshPanel { id } => {
+                        // Only a re-render of THIS plugin's already-open panel.
+                        // A closed panel is a silent no-op: there is no target
+                        // to refresh, and `luban.panel.open` exists for
+                        // opening one.
+                        let open = this.plugin_panel.as_ref().is_some_and(|panel| {
+                            panel.plugin_id == plugin_id && panel.panel_id == id
+                        });
+                        if open {
+                            this.refresh_plugin_panel(plugin_id, &id, window, cx);
+                        }
+                    }
+                    luban_plugin::runtime::HostAction::SetCursor { line, col } => {
+                        this.set_plugin_cursor(line, col, window, cx);
+                    }
+                    luban_plugin::runtime::HostAction::SetSetting { key, value } => {
+                        if this.persist_plugin_setting(plugin_id, &key, value) {
+                            cx.notify();
+                        } else {
+                            ok = false;
+                            this.set_status(
+                                format!(
+                                    "plugin '{plugin_id}' cannot write setting '{key}': \
+                                     undeclared or invalid value"
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    luban_plugin::runtime::HostAction::RunCommand { id, args, depth } => {
+                        ok &= this.apply_run_command_action(&id, args, depth, window, cx);
+                    }
                 }
             }
-        }
-        self.plugin_event_depth = self.plugin_event_depth.saturating_sub(1);
-        if let Some(error) = call.error {
-            ok = false;
-            self.set_status(error, cx);
-        }
-        ok
+            if let Some(error) = call.error {
+                ok = false;
+                this.set_status(error, cx);
+            }
+            ok
+        })
     }
 
-    /// Resolve and run one plugin-requested `HostAction::RunCommand`.
+    /// Run `f` with the plugin-event suppression counter raised, restoring it
+    /// afterwards — including on unwind, by catching the panic, repairing the
+    /// counter and resuming. Panic semantics are unchanged: the hook still
+    /// runs once and the unwind still propagates. A drop guard cannot express
+    /// this because the guarded region itself needs `&mut self`, so the guard
+    /// is spelled catch/resume instead.
+    fn raise_event_depth_during<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.plugin_event_depth = self.plugin_event_depth.saturating_add(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.plugin_event_depth = self.plugin_event_depth.saturating_sub(1);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Resolve and run one plugin-requested `HostAction::RunCommand`. Plugin
+    /// commands resolve first — the same precedence the user-path
+    /// [`Self::run_command`] applies — so a plugin command whose id equals a
+    /// built-in's cannot reach the built-in fast path and re-enter the host
+    /// at depth 0, which would bypass the cascade cap.
     fn apply_run_command_action(
         &mut self,
         id: &str,
@@ -224,28 +246,15 @@ impl LubanApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        match crate::plugin_host::route_run_command(id, depth) {
+        let plugin_command = self.plugin_host.command(id).cloned();
+        match crate::plugin_host::route_run_command(id, depth, plugin_command.is_some()) {
             crate::plugin_host::RunCommandRoute::DepthExceeded => {
                 self.set_status(format!("command '{id}' exceeded run depth"), cx);
                 false
             }
-            crate::plugin_host::RunCommandRoute::BuiltIn => {
-                if args.is_some() {
-                    log::warn!("built-in command '{id}' ignores args");
-                }
-                // A built-in command is not itself a plugin call, but its
-                // implementation may dispatch plugin commands; keep the
-                // suppression guard up while it runs.
-                self.plugin_event_depth = self.plugin_event_depth.saturating_add(1);
-                let ran = self.run_command(id, window, cx);
-                self.plugin_event_depth = self.plugin_event_depth.saturating_sub(1);
-                ran
-            }
-            crate::plugin_host::RunCommandRoute::HostCommand => {
-                let Some(command) = self.plugin_host.command(id).cloned() else {
-                    self.set_status(format!("command '{id}' not found"), cx);
-                    return false;
-                };
+            crate::plugin_host::RunCommandRoute::Plugin => {
+                // route_run_command classified this id as a plugin command.
+                let command = plugin_command.expect("route promised a plugin command");
                 self.run_plugin_command(
                     &command.plugin_id,
                     &command.entry,
@@ -255,6 +264,22 @@ impl LubanApp {
                     window,
                     cx,
                 )
+            }
+            crate::plugin_host::RunCommandRoute::BuiltIn => {
+                if args.is_some() {
+                    log::warn!("built-in command '{id}' ignores args");
+                }
+                // A built-in id routed here has no plugin command behind it
+                // (plugin-first routing above), but keep the suppression
+                // guard up while it runs. Accepted residual: macro playback
+                // replays recorded ids through `run_command` at the ambient
+                // depth, but recording is user-driven and out of plugin
+                // reach.
+                self.raise_event_depth_during(|this| this.run_command(id, window, cx))
+            }
+            crate::plugin_host::RunCommandRoute::NotFound => {
+                self.set_status(format!("command '{id}' not found"), cx);
+                false
             }
         }
     }
@@ -283,8 +308,9 @@ impl LubanApp {
     /// the `--goto` semantics: positions clamp to the document bounds (the
     /// `HostAction` contract says the host clamps), the caret is a collapsed
     /// selection, and the editor scrolls the caret into view. Huge documents
-    /// jump through the disk engine; range views cannot map a file-global
-    /// line and report that instead.
+    /// jump through the disk engine; range views — including a huge document
+    /// narrowed to a partial range, whose line index is range-local — cannot
+    /// map a file-global line and report that instead.
     fn set_plugin_cursor(
         &mut self,
         line: usize,
@@ -292,18 +318,22 @@ impl LubanApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.tabs.get(self.active).map(|_| self.active) else {
-            return;
-        };
-        if self.tabs[index].doc.is_huge() {
-            self.huge_jump_line(line as u64, col as u64, window, cx);
-            cx.notify();
+        if self.active >= self.tabs.len() {
             return;
         }
-        if self.tabs[index].large_file || self.tabs[index].doc.partial_range().is_some() {
-            // Range views carry local line numbers only; a file-global line
-            // cannot be mapped back without scanning the prefix.
+        let index = self.active;
+        // The partial check must come first: a huge document WITH a partial
+        // range is reachable (huge range view, session restore), and the disk
+        // engine's line index is range-local there. Mirrors `open_path_at`,
+        // which refuses exactly this state. A `large_file` tab is only in a
+        // reduced rendering mode; its full text is loaded, so it does not
+        // need the refusal.
+        if self.tabs[index].doc.partial_range().is_some() {
             self.set_status(tr("status.line_outside_partial"), cx);
+            return;
+        }
+        if self.tabs[index].doc.is_huge() {
+            self.huge_jump_line(line as u64, col as u64, window, cx);
             return;
         }
         // Same rope math as the `--goto` path: clamp the line to the last
