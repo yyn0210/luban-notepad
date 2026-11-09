@@ -2550,44 +2550,50 @@ mod tests {
     #[test]
     fn filesystem_requires_permission_and_stays_in_roots() {
         let dir = tempfile::tempdir().unwrap();
+        // Keep the plugin root one level below the tempdir so a sibling path is
+        // outside the allowed roots while its parent still exists on every
+        // platform (`/etc` does not on Windows).
+        let plugin_dir = dir.path().join("plugin");
+        let outside = dir.path().join("outside.txt");
         let manifest = write_plugin(
-            dir.path(),
+            &plugin_dir,
             r#"return {
                 run = function(ctx)
                     luban.fs.write(ctx.plugin.data_dir .. "/state.txt", "hello")
                     assert(luban.fs.read(ctx.plugin.data_dir .. "/state.txt") == "hello")
                 end,
-                escape = function(ctx)
-                    luban.fs.write("/etc/luban-plugin-escape-test.txt", "no")
+                escape = function(ctx, args)
+                    luban.fs.write(args.path, "no")
                 end,
             }"#,
         );
         let mut runtime =
-            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+            PluginRuntime::new(&manifest, &plugin_dir, manifest.permissions()).unwrap();
         run_command(
             &mut runtime,
             "run",
             "test.run",
-            input(&manifest, dir.path()),
+            input(&manifest, &plugin_dir),
         );
         assert_eq!(
-            fs::read_to_string(dir.path().join("data/state.txt")).unwrap(),
+            fs::read_to_string(plugin_dir.join("data/state.txt")).unwrap(),
             "hello"
         );
-        let error = command_error(
-            &mut runtime,
+        let call = runtime.call_command(
             "escape",
             "test.run",
-            input(&manifest, dir.path()),
+            Some(serde_json::json!({ "path": outside })),
+            input(&manifest, &plugin_dir),
         );
+        let error = call.error.expect("escaping the roots must fail");
         assert!(error.contains("outside the allowed roots"), "{error}");
         let mut runtime =
-            PluginRuntime::new(&manifest, dir.path(), PermissionSet::empty()).unwrap();
+            PluginRuntime::new(&manifest, &plugin_dir, PermissionSet::empty()).unwrap();
         let error = command_error(
             &mut runtime,
             "run",
             "test.run",
-            input(&manifest, dir.path()),
+            input(&manifest, &plugin_dir),
         );
         assert!(error.contains("filesystem permission"), "{error}");
     }
