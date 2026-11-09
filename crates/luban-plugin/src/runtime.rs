@@ -27,6 +27,8 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PANEL_LINES: usize = 5_000;
 const MAX_PANEL_LINE_BYTES: usize = 4 * 1024;
 const MAX_PANEL_SPANS: usize = 512;
+const MAX_PANEL_CELLS: usize = 32;
+const MAX_PANEL_CELL_WEIGHT: u8 = 32;
 const MAX_PANEL_ACTIONS: usize = 8;
 const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
@@ -182,6 +184,23 @@ pub struct PanelLine {
     pub indent: u8,
     /// Inline runs. Empty means the line is rendered as plain `text`.
     pub spans: Vec<PanelSpan>,
+    /// Table row cells. Non-empty means the host renders the line as one row
+    /// of a real table instead of as monospace text; consecutive rows with
+    /// cells form one table.
+    pub cells: Vec<PanelCell>,
+    /// Local image source for `style = "image"` lines. The host resolves it
+    /// against the active document's directory and falls back to the line
+    /// text (the alt text) when the path is remote, missing or outside that
+    /// directory.
+    pub image: Option<String>,
+    /// True for continuation lines of the same paragraph (hard breaks and
+    /// over-long line splits): the host drops the inter-paragraph margin.
+    pub tight: bool,
+    /// True when this line starts a new block widget of the same kind as the
+    /// previous line (for example the first line of a second fenced code
+    /// block). The host ends the current code/table group without inserting a
+    /// spacer row.
+    pub break_before: bool,
 }
 
 impl PanelLine {
@@ -192,8 +211,44 @@ impl PanelLine {
             style: PanelLineStyle::Text,
             indent: 0,
             spans: Vec::new(),
+            cells: Vec::new(),
+            image: None,
+            tight: false,
+            break_before: false,
         }
     }
+}
+
+/// Horizontal alignment of a table cell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelCellAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl PanelCellAlign {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "left" => Some(Self::Left),
+            "center" => Some(Self::Center),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+/// One cell of a table row. `weight` is the relative column width used by the
+/// host's flex layout; the plugin derives it from the widest cell in the
+/// column so short columns stay narrow and description columns get room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelCell {
+    pub text: String,
+    pub spans: Vec<PanelSpan>,
+    pub align: PanelCellAlign,
+    pub header: bool,
+    pub weight: u8,
 }
 
 /// Block-level presentation for one panel line.
@@ -213,6 +268,7 @@ pub enum PanelLineStyle {
     List,
     Table,
     Rule,
+    Image,
 }
 
 impl PanelLineStyle {
@@ -231,6 +287,7 @@ impl PanelLineStyle {
             "list" => Some(Self::List),
             "table" => Some(Self::Table),
             "rule" => Some(Self::Rule),
+            "image" => Some(Self::Image),
             _ => None,
         }
     }
@@ -1137,6 +1194,14 @@ fn install_luban_table(
 ) -> mlua::Result<()> {
     let luban = lua.create_table()?;
     luban.set("version", 2)?;
+    // Optional capability discovery. Additive host features advertise
+    // themselves here so a plugin can fall back gracefully on older hosts
+    // instead of bumping `api_version` and breaking every plugin at once.
+    let features = lua.create_table()?;
+    features.set("panel_tables", true)?;
+    features.set("panel_tight_lines", true)?;
+    features.set("panel_images", true)?;
+    luban.set("features", features)?;
 
     let log_plugin_id = state.borrow().plugin.id.clone();
     luban.set(
@@ -2100,13 +2165,104 @@ fn parse_panel_line(line: &Table) -> Result<PanelLine, String> {
         .unwrap_or(0)
         .clamp(0, 8) as u8;
     let spans = parse_panel_spans(&text, line.get::<Value>("spans").unwrap_or(Value::Nil))?;
+    let cells = parse_panel_cells(line.get::<Value>("cells").unwrap_or(Value::Nil))?;
+    let image = line
+        .get::<Option<String>>("image")
+        .ok()
+        .flatten()
+        .filter(|source| !source.is_empty() && source.len() <= MAX_PANEL_LINE_BYTES);
+    let tight = line
+        .get::<Option<bool>>("tight")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let break_before = line
+        .get::<Option<bool>>("break_before")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
     Ok(PanelLine {
         text,
         command,
         style,
         indent,
         spans,
+        cells,
+        image,
+        tight,
+        break_before,
     })
+}
+
+/// Parse the optional `cells` field of a table row line. Accepts a mixed
+/// sequence of cell tables and plain strings (a string is a left-aligned
+/// non-header cell with weight 1). An empty/missing value yields no cells and
+/// keeps the line on the legacy monospace `table` path.
+fn parse_panel_cells(value: Value) -> Result<Vec<PanelCell>, String> {
+    let Value::Table(table) = value else {
+        return Ok(Vec::new());
+    };
+    let mut cells = Vec::new();
+    for value in table.sequence_values::<Value>() {
+        let value = value.map_err(|error| format!("cannot read panel cell: {error}"))?;
+        if cells.len() >= MAX_PANEL_CELLS {
+            return Err(format!("panel row has more than {MAX_PANEL_CELLS} cells"));
+        }
+        match value {
+            Value::String(text) => {
+                let text = text
+                    .to_str()
+                    .map_err(|error| error.to_string())?
+                    .to_string();
+                if text.len() > MAX_PANEL_LINE_BYTES {
+                    return Err("panel cell is too long".to_string());
+                }
+                cells.push(PanelCell {
+                    text,
+                    spans: Vec::new(),
+                    align: PanelCellAlign::Left,
+                    header: false,
+                    weight: 1,
+                });
+            }
+            Value::Table(cell) => {
+                let text: String = cell
+                    .get("text")
+                    .map_err(|error| format!("panel cell text: {error}"))?;
+                if text.len() > MAX_PANEL_LINE_BYTES {
+                    return Err("panel cell is too long".to_string());
+                }
+                let spans =
+                    parse_panel_spans(&text, cell.get::<Value>("spans").unwrap_or(Value::Nil))?;
+                let align = cell
+                    .get::<Option<String>>("align")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| PanelCellAlign::parse(&value))
+                    .unwrap_or_default();
+                let header = cell
+                    .get::<Option<bool>>("header")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                let weight = cell
+                    .get::<Option<i64>>("weight")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1)
+                    .clamp(1, i64::from(MAX_PANEL_CELL_WEIGHT)) as u8;
+                cells.push(PanelCell {
+                    text,
+                    spans,
+                    align,
+                    header,
+                    weight,
+                });
+            }
+            _ => return Err("panel cells must be strings or tables".to_string()),
+        }
+    }
+    Ok(cells)
 }
 
 fn parse_panel_spans(text: &str, value: Value) -> Result<Vec<PanelSpan>, String> {
@@ -2906,6 +3062,13 @@ mod tests {
                         { text = "mismatch", style = "muted", spans = {
                             { text = "other", style = "bold" },
                         }},
+                        { text = "tight", tight = true },
+                        { text = "| a | b |", style = "table", cells = {
+                            { text = "Name", header = true, weight = 12 },
+                            { text = "42", align = "right", weight = 3 },
+                        }},
+                        { text = "| c | d |", style = "table", cells = { { text = "x", weight = 999 }, "y" } },
+                        { text = "break", break_before = true },
                     } }
                 end
             }"#,
@@ -2926,6 +3089,84 @@ mod tests {
         // A span list that does not reconstruct the line falls back to text.
         assert_eq!(panel.lines[4].spans.len(), 0);
         assert_eq!(panel.lines[4].text, "mismatch");
+        assert!(panel.lines[5].tight);
+        assert!(!panel.lines[0].tight);
+        let row = &panel.lines[6];
+        assert_eq!(row.cells.len(), 2);
+        assert_eq!(row.cells[0].text, "Name");
+        assert!(row.cells[0].header);
+        assert_eq!(row.cells[0].weight, 12);
+        assert_eq!(row.cells[1].align, PanelCellAlign::Right);
+        assert_eq!(row.cells[1].weight, 3);
+        assert_eq!(panel.lines[7].cells.len(), 2);
+        assert_eq!(panel.lines[7].cells[0].text, "x");
+        assert!(!panel.lines[7].cells[0].header);
+        assert_eq!(panel.lines[7].cells[0].weight, MAX_PANEL_CELL_WEIGHT);
+        assert_eq!(panel.lines[7].cells[1].text, "y");
+        assert_eq!(panel.lines[7].cells[1].weight, 1);
+        assert!(!panel.lines[6].break_before);
+        assert!(panel.lines[8].break_before);
+    }
+
+    #[test]
+    fn panel_rows_reject_excessive_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    local cells = {}
+                    for i = 1, 40 do cells[i] = "x" end
+                    return { lines = { { text = "", style = "table", cells = cells } } }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        assert!(panel.error.is_some());
+    }
+
+    #[test]
+    fn panel_image_lines_parse_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return { lines = {
+                        { text = "Logo", style = "image", image = "docs/logo.png" },
+                        { text = "No source", style = "image" },
+                    } }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(panel.lines[0].style, PanelLineStyle::Image);
+        assert_eq!(panel.lines[0].image.as_deref(), Some("docs/logo.png"));
+        assert_eq!(panel.lines[0].text, "Logo");
+        assert_eq!(panel.lines[1].image, None);
+    }
+
+    #[test]
+    fn plugin_can_detect_host_panel_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    assert(luban.features and luban.features.panel_tables == true)
+                    assert(luban.features.panel_tight_lines == true)
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{:?}", call.error);
     }
 
     #[test]

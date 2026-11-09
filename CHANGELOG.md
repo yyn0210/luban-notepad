@@ -4,6 +4,26 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+## [1.0.0-preview.18] — 2026-11-09
+
+### 新增
+
+- 插件面板新增块级能力：`cells` 结构化表格行（对齐、表头、列宽权重）、
+  `tight` 段内续行、`break_before` 分组边界，以及只读能力表 `luban.features`
+  （`panel_tables`、`panel_tight_lines`、`panel_images`）供插件渐进增强。
+- 插件面板排版向 VSCode/IDEA Markdown 预览对齐：真实表格（表头底色、
+  分隔线、斑马纹、按内容分配列宽）、圆角代码卡片、H1/H2 分隔线、14px
+  正文字号与 1.6 行高、列表/引用/硬换行间距；`style = "image"` 行渲染
+  文档目录内的本地图片（越界/远程/缺失回退 alt 文本）。
+
+### 变更
+
+- 官方 Markdown Preview 插件 2.1.0：真实表格与 VSCode/IDEA 风格排版；
+  隐藏展开标题的折叠前缀、`show_link_targets` 默认关闭、相邻代码块独立
+  成块、硬换行不再产生段落间距；原始 HTML 块提取可见文本后显示。
+
+## [1.0.0-preview.17] — 2026-11-09
+
 ### 新增
 
 - 插件系统 v2（破坏性升级，清单 `api_version` 升为 2，v1 插件拒载并提示更新）：

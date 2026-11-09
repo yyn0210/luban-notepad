@@ -329,15 +329,52 @@ luban.timer.cancel(id)          -- remove; unknown ids are a no-op
 ```lua
 {
   text = "纯文本回退",              -- 必填
-  style = "text",                  -- text|muted|h1..h6|code|quote|list|table|rule
+  style = "text",                  -- text|muted|h1..h6|code|quote|list|table|rule|image
   indent = 0,                      -- 0..8
   spans = {                        -- 可选；拼接后必须等于 text
     { text = "粗体", style = "bold" },
     { text = "fn", role = "keyword" },
   },
   command = { id = "json.fold.toggle", args = { path = "$.a[0]" } },
+  image = "docs/logo.png",          -- style = "image" 时的本地图片源
+  tight = false,                   -- true：段内续行，不追加段间距
+  break_before = false,            -- true：同种块的新块起点
+  cells = {                        -- style = "table" 时的结构化单元格
+    { text = "名称", header = true, weight = 8, align = "left" },
+    { text = "42", align = "right", weight = 3 },
+  },
 }
 ```
+
+### 块级渲染
+
+宿主把连续的同类行合并成块控件，而不是逐行当作文本：
+
+- 连续的 `style = "code"` 行渲染为一个圆角代码卡片；`break_before = true`
+  开启下一张卡片（用于相邻的围栏代码块），不会插入空行。
+- `style = "table"` 且 `cells` 非空的行渲染为真实表格：连续行合并为一张表，
+  表头行带底色并与内容行画分隔线，偶数内容行带斑马纹。`cells` 中每项是
+  字符串或 `{ text, spans?, align?, header?, weight? }`：
+  - `align`：`left`（默认）、`center`、`right`。
+  - `header`：表头单元格，加粗并置于表头行。
+  - `weight`：列宽权重，1–32，默认 1；按内容最宽的列分配面板宽度。
+  - 每行最多 32 个单元格；单元格 `text` 与行一样受 4 KiB 上限约束。
+  - `text` 仍是必填的回退文本；老宿主忽略 `cells`，按等宽 `table` 行渲染。
+- `tight = true` 用于同一段落内的硬换行或超长行拆分：宿主去掉该行底部
+  段间距，使换行不产生段落间隙。
+- `style = "image"` 行渲染本地图片：`image` 是相对于当前文档目录的路径（也接受
+  目录内的绝对路径），宿主只读取规范化后仍位于文档目录内、且扩展名受图片解码器
+  支持的文件；`text` 作为 alt 文本。远程 URL、`data:`、缺失文件与越界路径按
+  alt 文本回退，不发起网络请求。
+- 行命令与代码/表格内容可以同时使用；点击整行仍执行 `command`。
+
+插件可读取只读能力表 `luban.features` 做渐进增强（缺失或 `false` 表示老宿主）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `panel_tables` | 面板支持 `cells` 结构化表格行 |
+| `panel_tight_lines` | 面板识别 `tight` 续行标志 |
+| `panel_images` | 面板渲染 `style = "image"` 的本地图片行 |
 
 `command` 统一为 `{ id, args }` 表（字符串形态已移除）：`id` 是要执行的命令，
 `args` 是 JSON 兼容的 Lua 表，宿主作为目标命令入口的第二参数传入。规则：
@@ -368,8 +405,8 @@ span 的 `style` 是空格分隔的标志：`bold`、`italic`、`underline`、`s
 宿主用当前语法主题着色。spans 总字节不超过 4 KiB，且拼接必须等于 `text`，
 否则整行按 `text` 渲染。
 
-容量帽：最多 5,000 行、单行 4 KiB、512 个 spans、8 个操作，超出时截断或拒绝
-并提示。
+容量帽：最多 5,000 行、单行 4 KiB、512 个 spans、每行 32 个表格单元格、
+8 个操作，超出时截断或拒绝并提示。
 
 “插件”菜单按插件分组：一级只显示插件名称（清单 `name`），展开后先列出
 `contributes.menus` 中声明的命令，再列出该插件的面板。菜单只接受

@@ -1154,13 +1154,31 @@ impl LubanApp {
             SharedString::from(self.settings.font_family.clone())
         };
         let base_font = window.text_style().font();
+        let panel_width = match placement {
+            luban_plugin::manifest::PanelPlacement::Right => {
+                fit_plugin_panel_width(width, window.bounds().size.width.as_f32())
+            }
+            luban_plugin::manifest::PanelPlacement::Bottom => window.bounds().size.width.as_f32(),
+        };
+        // The panel content is inset by 20px on each side; keep images clear
+        // of the always-visible scrollbar on the right as well.
+        let image_max_width = (panel_width - 48.0).max(64.0);
+        let document_dir = self
+            .active_doc()
+            .and_then(|doc| doc.path.as_deref())
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
         let weak_close = cx.weak_entity();
         let weak_refresh = cx.weak_entity();
         let weak_focus = cx.weak_entity();
-        let rows: Vec<AnyElement> = lines
-            .into_iter()
-            .map(|line| Self::plugin_panel_line(line, &code_font_family, &base_font, cx))
-            .collect();
+        let rows: Vec<AnyElement> = Self::plugin_panel_rows(
+            lines,
+            document_dir.as_deref(),
+            image_max_width,
+            &code_font_family,
+            &base_font,
+            cx,
+        );
         let weak_action = cx.weak_entity();
         let action_buttons = actions.into_iter().enumerate().map(move |(index, action)| {
             let weak = weak_action.clone();
@@ -1310,7 +1328,7 @@ impl LubanApp {
             .child(content);
         match placement {
             luban_plugin::manifest::PanelPlacement::Right => {
-                let width = fit_plugin_panel_width(width, window.bounds().size.width.as_f32());
+                let width = panel_width;
                 let dragging = self
                     .plugin_panel_drag
                     .as_ref()
@@ -1401,125 +1419,368 @@ impl LubanApp {
     }
 
     /// Build one rich panel row. `text` is the plain fallback; `spans` and
-    /// `style` carry the presentation added in 1.0.0-preview.2.
-    fn plugin_panel_line(
-        line: luban_plugin::runtime::PanelLine,
+    /// `style` carry the presentation added in 1.0.0-preview.2. Consecutive
+    /// code lines and table rows are grouped into block widgets here so the
+    /// preview reads like an HTML render instead of a list of monospace rows.
+    fn plugin_panel_rows(
+        lines: Vec<luban_plugin::runtime::PanelLine>,
+        document_dir: Option<&Path>,
+        image_max_width: f32,
+        code_font_family: &SharedString,
+        base_font: &Font,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        use luban_plugin::runtime::PanelLineStyle;
+
+        let mut rows = Vec::new();
+        let mut iter = lines.into_iter().peekable();
+        while let Some(line) = iter.next() {
+            if line.style == PanelLineStyle::Image {
+                rows.push(Self::plugin_panel_image(
+                    &line,
+                    document_dir,
+                    image_max_width,
+                    base_font,
+                    cx,
+                ));
+            } else if line.style == PanelLineStyle::Table && !line.cells.is_empty() {
+                let mut table = vec![line];
+                while iter.peek().is_some_and(|next| {
+                    next.style == PanelLineStyle::Table
+                        && !next.cells.is_empty()
+                        && !next.break_before
+                }) {
+                    table.push(iter.next().expect("peeked table row"));
+                }
+                rows.push(Self::plugin_panel_table(
+                    &table,
+                    code_font_family,
+                    base_font,
+                    cx,
+                ));
+            } else if line.style == PanelLineStyle::Code {
+                let mut block = vec![line];
+                while iter
+                    .peek()
+                    .is_some_and(|next| next.style == PanelLineStyle::Code && !next.break_before)
+                {
+                    block.push(iter.next().expect("peeked code line"));
+                }
+                rows.push(Self::plugin_panel_code_block(
+                    &block,
+                    code_font_family,
+                    base_font,
+                    cx,
+                ));
+            } else {
+                rows.push(Self::plugin_panel_line(
+                    line,
+                    code_font_family,
+                    base_font,
+                    cx,
+                ));
+            }
+        }
+        rows
+    }
+
+    /// Wrap a panel element with the click behavior of its line command. Used
+    /// by plain lines and by grouped block widgets (code lines, table rows,
+    /// images) so grouping never drops interactions that worked before.
+    fn plugin_command_element(
+        element: Div,
+        command: Option<luban_plugin::runtime::PanelCommand>,
+        hover: gpui_kit::Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(command) = command else {
+            return element.into_any_element();
+        };
+        let weak = cx.weak_entity();
+        element
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover))
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    // v2: the panel stays open, scroll position is preserved,
+                    // editor focus is not stolen.
+                    if !this.run_command_with_args(&command.id, command.args.clone(), window, cx) {
+                        this.set_status(
+                            tr_args("status.command_failed", &[("command", command.id.clone())]),
+                            cx,
+                        );
+                    }
+                });
+            })
+            .into_any_element()
+    }
+
+    /// Render consecutive table rows as one bordered, full-width table with a
+    /// tinted header row. Column widths follow the per-cell `weight` the
+    /// plugin derived from the widest cell in each column.
+    fn plugin_panel_table(
+        rows: &[luban_plugin::runtime::PanelLine],
         code_font_family: &SharedString,
         base_font: &Font,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use luban_plugin::runtime::{PanelLineStyle, PanelSpan, PanelSpanStyle};
+        use gpui_kit::TextAlign;
+        use luban_plugin::runtime::PanelCellAlign;
 
         let theme = cx.theme().clone();
         let colors = theme.colors;
         let highlight = theme.highlight_theme.clone();
-        let syntax_background = colors.secondary;
+        let row_count = rows.len();
+        let mut row_elements = Vec::with_capacity(row_count);
+        for (row_index, row) in rows.iter().enumerate() {
+            let is_header = row.cells.iter().any(|cell| cell.header);
+            let cell_count = row.cells.len();
+            let mut cell_elements = Vec::with_capacity(cell_count);
+            for (cell_index, cell) in row.cells.iter().enumerate() {
+                let text = Self::panel_styled_text(
+                    &cell.text,
+                    &cell.spans,
+                    base_font,
+                    code_font_family,
+                    colors,
+                    &highlight,
+                    colors.foreground,
+                    cell.header,
+                    false,
+                );
+                let mut cell_element = div()
+                    .flex_grow(f32::from(cell.weight.max(1)))
+                    .flex_basis(px(0.0))
+                    .flex_shrink_1()
+                    .min_w(px(0.0))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .text_size(px(14.0))
+                    .line_height(relative(1.45))
+                    .text_align(match cell.align {
+                        PanelCellAlign::Left => TextAlign::Left,
+                        PanelCellAlign::Center => TextAlign::Center,
+                        PanelCellAlign::Right => TextAlign::Right,
+                    });
+                if cell.header {
+                    cell_element = cell_element.font_weight(FontWeight::BOLD);
+                }
+                if cell_index + 1 < cell_count {
+                    cell_element = cell_element.border_r_1().border_color(colors.border);
+                }
+                cell_elements.push(cell_element.child(text).into_any_element());
+            }
+            let mut row_element = div()
+                .flex()
+                .w_full()
+                .items_stretch()
+                .children(cell_elements);
+            if is_header {
+                row_element = row_element.bg(colors.secondary.opacity(0.55));
+            } else if row_index % 2 == 1 {
+                // GitHub/VSCode zebra striping: tint every second body row.
+                row_element = row_element.bg(colors.secondary.opacity(0.28));
+            }
+            if row_index + 1 < row_count {
+                row_element = row_element.border_b_1().border_color(colors.border);
+            }
+            row_elements.push(Self::plugin_command_element(
+                row_element,
+                row.command.clone(),
+                colors.secondary.opacity(0.5),
+                cx,
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .my(px(8.0))
+            .border_1()
+            .border_color(colors.border)
+            .rounded_md()
+            .overflow_hidden()
+            .children(row_elements)
+            .into_any_element()
+    }
+
+    /// Render consecutive code lines as one rounded, padded block instead of
+    /// one tinted strip per line.
+    fn plugin_panel_code_block(
+        lines: &[luban_plugin::runtime::PanelLine],
+        code_font_family: &SharedString,
+        base_font: &Font,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let colors = theme.colors;
+        let highlight = theme.highlight_theme.clone();
+        let syntax_background = panel_code_background(&highlight, colors);
         let syntax_foreground = highlight
             .style
             .editor_foreground
             .unwrap_or(colors.foreground);
-
-        let mut base_color = colors.foreground;
-        let mut code_family = false;
-        let mut element = div().px(px(8.0)).rounded_sm();
-        match line.style {
-            PanelLineStyle::Text => {
-                element = element.py(px(3.0)).mb(px(4.0));
-            }
-            PanelLineStyle::Muted => {
-                base_color = colors.muted_foreground;
-                element = element.py(px(3.0)).mb(px(4.0));
-            }
-            PanelLineStyle::H1 => {
-                element = element
-                    .text_2xl()
-                    .font_weight(FontWeight::BOLD)
-                    .pt(px(14.0))
-                    .pb(px(6.0));
-            }
-            PanelLineStyle::H2 => {
-                element = element
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .pt(px(12.0))
-                    .pb(px(4.0));
-            }
-            PanelLineStyle::H3 => {
-                element = element
-                    .text_lg()
-                    .font_weight(FontWeight::BOLD)
-                    .pt(px(10.0))
-                    .pb(px(4.0));
-            }
-            PanelLineStyle::H4 | PanelLineStyle::H5 | PanelLineStyle::H6 => {
-                element = element
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .pt(px(8.0))
-                    .pb(px(2.0));
-            }
-            PanelLineStyle::Code => {
-                base_color = syntax_foreground;
-                code_family = true;
-                element = element
-                    .bg(syntax_background)
-                    .text_sm()
-                    .py(px(2.0))
-                    .min_h(px(18.0));
-            }
-            PanelLineStyle::Quote => {
-                base_color = colors.muted_foreground;
-                element = element
-                    .text_sm()
-                    .border_l_2()
-                    .border_color(colors.border)
-                    .pl(px(12.0 + f32::from(line.indent) * 12.0))
-                    .py(px(1.0))
-                    .mb(px(1.0));
-            }
-            PanelLineStyle::List => {
-                element = element
-                    .text_sm()
-                    .pl(px(8.0 + f32::from(line.indent) * 14.0))
-                    .py(px(2.0))
-                    .mb(px(1.0));
-            }
-            PanelLineStyle::Table => {
-                code_family = true;
-                element = element.text_sm().py(px(1.0));
-            }
-            PanelLineStyle::Rule => {
-                return div()
-                    .py(px(8.0))
-                    .child(div().h(px(1.0)).w_full().bg(colors.border))
-                    .into_any_element();
-            }
+        let mut line_elements = Vec::with_capacity(lines.len());
+        for line in lines {
+            let text = Self::panel_styled_text(
+                &line.text,
+                &line.spans,
+                base_font,
+                code_font_family,
+                colors,
+                &highlight,
+                syntax_foreground,
+                false,
+                true,
+            );
+            line_elements.push(Self::plugin_command_element(
+                div()
+                    .w_full()
+                    .min_h(px(17.0))
+                    .text_size(px(12.5))
+                    .line_height(relative(1.5))
+                    .child(text),
+                line.command.clone(),
+                colors.secondary.opacity(0.5),
+                cx,
+            ));
         }
-        if !matches!(line.style, PanelLineStyle::Quote | PanelLineStyle::List) {
-            element = element.pl(px(8.0 + f32::from(line.indent) * 14.0));
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .my(px(8.0))
+            .px(px(16.0))
+            .py(px(12.0))
+            .bg(syntax_background)
+            .rounded_md()
+            .children(line_elements)
+            .into_any_element()
+    }
+
+    /// Render a local image block. Remote URLs, missing files and paths that
+    /// escape the document's directory fall back to the alt text, matching the
+    /// preview's no-network policy without hiding the source's intent.
+    fn plugin_panel_image(
+        line: &luban_plugin::runtime::PanelLine,
+        document_dir: Option<&Path>,
+        max_width: f32,
+        _base_font: &Font,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let colors = theme.colors;
+        let alt = if line.text.trim().is_empty() {
+            "image".to_string()
+        } else {
+            line.text.trim().to_string()
+        };
+        let fallback = move || {
+            div()
+                .w_full()
+                .px(px(8.0))
+                .py(px(2.0))
+                .text_size(px(13.0))
+                .text_color(colors.muted_foreground)
+                .child(format!("🖼 {alt}"))
+                .into_any_element()
+        };
+        let Some(path) = line
+            .image
+            .as_deref()
+            .and_then(|source| resolve_panel_image_source(source, document_dir))
+        else {
+            return div()
+                .w_full()
+                .my(px(10.0))
+                .child(fallback())
+                .into_any_element();
+        };
+        let alt_for_failure = if line.text.trim().is_empty() {
+            "image".to_string()
+        } else {
+            line.text.trim().to_string()
+        };
+        let fallback_color = colors.muted_foreground;
+        let Some((width, height)) = image::image_dimensions(&path).ok() else {
+            return div()
+                .w_full()
+                .my(px(10.0))
+                .child(fallback())
+                .into_any_element();
+        };
+        if width == 0 || height == 0 {
+            return div()
+                .w_full()
+                .my(px(10.0))
+                .child(fallback())
+                .into_any_element();
         }
+        // GPUI's `max_w` clamps the paint but keeps the intrinsic height in
+        // the layout, which leaves a large gap under wide images. Scale both
+        // dimensions from the file header instead; never upscale.
+        let scale = (max_width / width as f32).min(1.0);
+        let display_width = (width as f32 * scale).max(1.0);
+        let display_height = (height as f32 * scale).max(1.0);
+        Self::plugin_command_element(
+            div()
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .w_full()
+                .my(px(8.0))
+                .child(
+                    img(path)
+                        .w(px(display_width))
+                        .h(px(display_height))
+                        .rounded_md()
+                        .with_fallback(move || {
+                            div()
+                                .px(px(8.0))
+                                .text_size(px(13.0))
+                                .text_color(fallback_color)
+                                .child(format!("🖼 {alt_for_failure}"))
+                                .into_any_element()
+                        }),
+                ),
+            line.command.clone(),
+            colors.secondary.opacity(0.5),
+            cx,
+        )
+    }
 
-        let heading = matches!(
-            line.style,
-            PanelLineStyle::H1
-                | PanelLineStyle::H2
-                | PanelLineStyle::H3
-                | PanelLineStyle::H4
-                | PanelLineStyle::H5
-                | PanelLineStyle::H6
-        );
+    /// Build the styled text shared by panel lines, code blocks and table
+    /// cells. Runs inherit their size and line height from the parent
+    /// element; only font family/weight/style and colors live here.
+    #[allow(clippy::too_many_arguments)]
+    fn panel_styled_text(
+        text: &str,
+        spans: &[luban_plugin::runtime::PanelSpan],
+        base_font: &Font,
+        code_font_family: &SharedString,
+        colors: gpui_kit::component::theme::ThemeColor,
+        highlight: &gpui_kit::component::highlighter::HighlightTheme,
+        base_color: gpui_kit::Hsla,
+        force_bold: bool,
+        code_family: bool,
+    ) -> StyledText {
+        use luban_plugin::runtime::{PanelSpan, PanelSpanStyle};
 
-        let spans: Vec<PanelSpan> = if line.spans.is_empty() {
-            vec![PanelSpan {
-                text: line.text.clone(),
+        let default_span;
+        let spans: &[PanelSpan] = if spans.is_empty() {
+            default_span = PanelSpan {
+                text: text.to_string(),
                 style: PanelSpanStyle::default(),
                 role: None,
-            }]
+            };
+            std::slice::from_ref(&default_span)
         } else {
-            line.spans.clone()
+            spans
         };
         let mut runs: Vec<TextRun> = Vec::new();
-        for span in &spans {
+        for span in spans {
             if span.text.is_empty() {
                 continue;
             }
@@ -1536,7 +1797,7 @@ impl LubanApp {
                     font.style = style;
                 }
             }
-            if heading || span.style.bold() {
+            if force_bold || span.style.bold() {
                 font.weight = FontWeight::BOLD;
             }
             if span.style.italic() {
@@ -1551,7 +1812,7 @@ impl LubanApp {
             } else {
                 base_color
             };
-            let background_color = span.style.code().then_some(syntax_background);
+            let background_color = span.style.code().then_some(colors.secondary.opacity(0.65));
             let underline =
                 (span.style.link() || span.style.underline()).then_some(UnderlineStyle {
                     thickness: px(1.0),
@@ -1571,38 +1832,303 @@ impl LubanApp {
                 strikethrough,
             });
         }
-        let mut text = StyledText::new(line.text.clone());
+        let mut styled = StyledText::new(text.to_string());
         if !runs.is_empty() {
-            text = text.with_runs(runs);
+            styled = styled.with_runs(runs);
         }
-        let weak = cx.weak_entity();
+        styled
+    }
+
+    /// Build one rich panel row. `text` is the plain fallback; `spans` and
+    /// `style` carry the presentation. Sizing follows the VSCode preview's
+    /// proportions: 14px body text at 1.6 line height, 28/21/17px headings,
+    /// rules under H1/H2, and a 6px-radius code surface.
+    fn plugin_panel_line(
+        line: luban_plugin::runtime::PanelLine,
+        code_font_family: &SharedString,
+        base_font: &Font,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use luban_plugin::runtime::PanelLineStyle;
+
+        let theme = cx.theme().clone();
+        let colors = theme.colors;
+        let highlight = theme.highlight_theme.clone();
+        let syntax_foreground = highlight
+            .style
+            .editor_foreground
+            .unwrap_or(colors.foreground);
+
+        let tight = line.tight;
+        let mut base_color = colors.foreground;
+        let mut code_family = false;
+        let mut force_bold = false;
+        let mut element = div().px(px(8.0)).rounded_sm();
+        match line.style {
+            PanelLineStyle::Text => {
+                element = element.text_size(px(14.0)).line_height(relative(1.6));
+                element = if tight {
+                    element.py(px(0.0)).mb(px(0.0))
+                } else {
+                    element.py(px(2.0)).mb(px(10.0))
+                };
+            }
+            PanelLineStyle::Muted => {
+                base_color = colors.muted_foreground;
+                element = element.text_size(px(13.0)).line_height(relative(1.6));
+                element = if tight {
+                    element.py(px(0.0)).mb(px(0.0))
+                } else {
+                    element.py(px(2.0)).mb(px(10.0))
+                };
+            }
+            PanelLineStyle::H1 => {
+                force_bold = true;
+                element = element
+                    .text_size(px(28.0))
+                    .line_height(relative(1.25))
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(20.0))
+                    .pb(px(6.0))
+                    .mb(px(14.0))
+                    .border_b_1()
+                    .border_color(colors.border);
+            }
+            PanelLineStyle::H2 => {
+                force_bold = true;
+                element = element
+                    .text_size(px(21.0))
+                    .line_height(relative(1.3))
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(16.0))
+                    .pb(px(4.0))
+                    .mb(px(10.0))
+                    .border_b_1()
+                    .border_color(colors.border);
+            }
+            PanelLineStyle::H3 => {
+                force_bold = true;
+                element = element
+                    .text_size(px(17.0))
+                    .line_height(relative(1.35))
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(12.0))
+                    .pb(px(3.0))
+                    .mb(px(6.0));
+            }
+            PanelLineStyle::H4 => {
+                force_bold = true;
+                element = element
+                    .text_size(px(14.0))
+                    .line_height(relative(1.4))
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(10.0))
+                    .pb(px(2.0))
+                    .mb(px(4.0));
+            }
+            PanelLineStyle::H5 => {
+                force_bold = true;
+                element = element
+                    .text_size(px(12.5))
+                    .line_height(relative(1.4))
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(8.0))
+                    .pb(px(2.0))
+                    .mb(px(3.0));
+            }
+            PanelLineStyle::H6 => {
+                base_color = colors.muted_foreground;
+                force_bold = true;
+                element = element
+                    .text_size(px(12.0))
+                    .line_height(relative(1.4))
+                    .font_weight(FontWeight::BOLD)
+                    .pt(px(8.0))
+                    .pb(px(2.0))
+                    .mb(px(3.0));
+            }
+            PanelLineStyle::Code => {
+                base_color = syntax_foreground;
+                code_family = true;
+                element = element
+                    .text_size(px(12.5))
+                    .line_height(relative(1.5))
+                    .py(px(1.0));
+            }
+            PanelLineStyle::Quote => {
+                base_color = colors.muted_foreground;
+                element = element
+                    .text_size(px(14.0))
+                    .line_height(relative(1.6))
+                    .border_l(px(3.0))
+                    .border_color(colors.border)
+                    .pl(px(14.0 + f32::from(line.indent) * 16.0))
+                    .py(px(2.0));
+                if !tight {
+                    element = element.mb(px(8.0));
+                }
+            }
+            PanelLineStyle::List => {
+                element = element
+                    .text_size(px(14.0))
+                    .line_height(relative(1.6))
+                    .pl(px(18.0 + f32::from(line.indent) * 20.0))
+                    .py(px(2.0));
+                if !tight {
+                    element = element.mb(px(3.0));
+                }
+            }
+            PanelLineStyle::Table => {
+                code_family = true;
+                element = element
+                    .text_size(px(12.5))
+                    .line_height(relative(1.45))
+                    .py(px(1.0));
+            }
+            PanelLineStyle::Image => {
+                base_color = colors.muted_foreground;
+                element = element
+                    .text_size(px(13.0))
+                    .line_height(relative(1.6))
+                    .py(px(2.0))
+                    .mb(px(10.0));
+            }
+            PanelLineStyle::Rule => {
+                return div()
+                    .my(px(16.0))
+                    .child(div().h(px(2.0)).w_full().rounded_full().bg(colors.border))
+                    .into_any_element();
+            }
+        }
+        if !matches!(
+            line.style,
+            PanelLineStyle::Quote | PanelLineStyle::List | PanelLineStyle::Table
+        ) {
+            element = element.pl(px(8.0 + f32::from(line.indent) * 14.0));
+        }
+
+        let text = Self::panel_styled_text(
+            &line.text,
+            &line.spans,
+            base_font,
+            code_font_family,
+            colors,
+            &highlight,
+            base_color,
+            force_bold,
+            code_family,
+        );
         let element = element.child(text);
-        match line.command {
-            Some(command) => element
-                .cursor_pointer()
-                .hover(move |this| this.bg(colors.secondary))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        // v2: the panel stays open, scroll position is
-                        // preserved, editor focus is not stolen
-                        if !this.run_command_with_args(
-                            &command.id,
-                            command.args.clone(),
-                            window,
-                            cx,
-                        ) {
-                            this.set_status(
-                                tr_args(
-                                    "status.command_failed",
-                                    &[("command", command.id.clone())],
-                                ),
-                                cx,
-                            );
-                        }
-                    });
-                })
-                .into_any_element(),
-            None => element.into_any_element(),
+        Self::plugin_command_element(element, line.command, colors.secondary, cx)
+    }
+}
+
+/// Pick the code-card surface for the active syntax theme.
+///
+/// Syntax roles are colored for the theme's editor background. When that
+/// background clearly differs from the panel (a light syntax theme in a dark
+/// UI, or the reverse), using it keeps the roles readable; otherwise a subtle
+/// tint keeps light-theme code cards distinct from the page.
+fn panel_code_background(
+    highlight: &gpui_kit::component::highlighter::HighlightTheme,
+    colors: gpui_kit::component::theme::ThemeColor,
+) -> gpui_kit::Hsla {
+    if let Some(background) = highlight.style.editor_background {
+        if (background.l - colors.background.l).abs() > 0.12 {
+            return background;
         }
+    }
+    colors.secondary.opacity(0.6)
+}
+
+/// Resolve a Markdown image source to a local file the preview may read.
+///
+/// Only files inside the active document's directory (after canonicalization,
+/// so `..` and symlinks cannot escape it) with an image extension the GPUI
+/// image decoder supports are accepted. Remote URLs, `data:` URIs, missing
+/// files and out-of-tree paths return `None`, and the caller shows the alt
+/// text instead.
+fn resolve_panel_image_source(source: &str, document_dir: Option<&Path>) -> Option<PathBuf> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+    let lower = source.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || source.starts_with("//")
+    {
+        return None;
+    }
+    let root = document_dir?.canonicalize().ok()?;
+    let raw = PathBuf::from(source);
+    let candidate = if raw.is_absolute() {
+        raw
+    } else {
+        root.join(raw)
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return None;
+    }
+    let extension = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())?;
+    if !gpui_kit::Img::extensions()
+        .iter()
+        .any(|known| *known == extension)
+    {
+        return None;
+    }
+    Some(canonical)
+}
+
+#[cfg(test)]
+mod panel_image_tests {
+    use super::resolve_panel_image_source;
+    use std::fs;
+
+    #[test]
+    fn resolves_files_inside_the_document_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("docs");
+        fs::create_dir(&nested).unwrap();
+        let image = nested.join("logo.png");
+        fs::write(&image, b"not a real png").unwrap();
+        let resolved = resolve_panel_image_source("docs/logo.png", Some(dir.path()));
+        assert_eq!(resolved, Some(image.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn rejects_remote_escape_missing_and_non_image_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_image = outside.path().join("secret.png");
+        fs::write(&outside_image, b"x").unwrap();
+        assert_eq!(
+            resolve_panel_image_source("https://example.com/logo.png", Some(dir.path())),
+            None
+        );
+        assert_eq!(
+            resolve_panel_image_source("data:image/png;base64,xx", Some(dir.path())),
+            None
+        );
+        assert_eq!(
+            resolve_panel_image_source("../secret.png", Some(dir.path())),
+            None
+        );
+        assert_eq!(
+            resolve_panel_image_source("missing.png", Some(dir.path())),
+            None
+        );
+        let text_file = dir.path().join("readme.md");
+        fs::write(&text_file, b"text").unwrap();
+        assert_eq!(
+            resolve_panel_image_source("readme.md", Some(dir.path())),
+            None
+        );
+        assert_eq!(resolve_panel_image_source("logo.png", None), None);
     }
 }
