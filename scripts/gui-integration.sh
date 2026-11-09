@@ -261,19 +261,25 @@ if grep -qF "line 042" "$SAMPLE"; then
 fi
 
 step "the open dialog opens a second tab"
+# The picker focuses its list on open. Ctrl+L turns the breadcrumb row into the
+# address input; Enter there navigates to the file's directory and selects it
+# (an address entry never opens a file directly), so the following Enter opens
+# the selection. Retrying Enter is safe: before the listing selects the file it
+# only reports "select a file" and leaves the dialog open.
+key ctrl+o
+sleep 1
+key ctrl+l
+sleep 0.5
+key ctrl+a
+type_text "$SECOND"
+sleep 0.3
 OPENED=0
-for attempt in 1 2 3; do
-  key ctrl+o
-  sleep 1
-  key ctrl+a
-  type_text "$SECOND"
-  sleep 0.3
+for attempt in 1 2 3 4 5; do
   key Return
-  if wait_for_title_contains "second.txt" 5; then
+  if wait_for_title_contains "second.txt" 3; then
     OPENED=1
     break
   fi
-  key Escape
   sleep 0.3
 done
 [ "$OPENED" = "1" ] || fail "the built-in open dialog did not open second.txt"
