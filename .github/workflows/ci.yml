@@ -113,7 +113,9 @@ jobs:
 
   macos:
     name: macOS
-    runs-on: macos-14
+    # Match the release workflow: macos-14 jobs were being cancelled while
+    # still queued, while macos-15 obtained runners.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
