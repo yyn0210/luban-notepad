@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::localized::{valid_locale_tag, LocalizedText, MAX_LOCALES};
 use crate::permissions::PermissionSet;
 
 const KNOWN_FIELDS: &[&str] = &[
@@ -25,6 +26,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "events",
     "dependencies",
     "contributes",
+    "localizations",
     "activate",
     "deactivate",
 ];
@@ -82,10 +84,54 @@ pub struct PluginManifest {
     pub dependencies: Vec<PluginDependency>,
     #[serde(default)]
     pub contributes: Contributions,
+    /// Per-locale overrides for user-visible text. Older hosts ignore this
+    /// unknown top-level field and keep using the base strings, so adding
+    /// translations is an additive manifest change.
+    #[serde(default)]
+    pub localizations: BTreeMap<String, PluginLocalization>,
     #[serde(default)]
     pub activate: Option<String>,
     #[serde(default)]
     pub deactivate: Option<String>,
+}
+
+/// Translations for one locale. Every field is optional; missing fields fall
+/// back to the base manifest value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLocalization {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub commands: BTreeMap<String, LocalizedContribution>,
+    #[serde(default)]
+    pub status_bar: BTreeMap<String, LocalizedStatusBar>,
+    #[serde(default)]
+    pub settings: BTreeMap<String, LocalizedContribution>,
+    #[serde(default)]
+    pub panels: BTreeMap<String, LocalizedPanel>,
+}
+
+/// Localized command/menu/setting text keyed by contribution id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalizedContribution {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalizedStatusBar {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalizedPanel {
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,9 +304,7 @@ impl PluginManifest {
                 self.id
             ));
         }
-        if self.name.trim().is_empty() || self.name.chars().count() > 120 {
-            errors.push("plugin name must be 1-120 characters".to_string());
-        }
+        validate_text(&self.name, "plugin name", 120, true, &mut errors);
         if self.version.trim().is_empty() || semver::Version::parse(&self.version).is_err() {
             errors.push(format!("plugin version '{}' is not SemVer", self.version));
         }
@@ -278,12 +322,8 @@ impl PluginManifest {
                 ));
             }
         }
-        if self
-            .description
-            .as_ref()
-            .is_some_and(|description| description.chars().count() > 500)
-        {
-            errors.push("plugin description is longer than 500 characters".to_string());
+        if let Some(description) = &self.description {
+            validate_text(description, "plugin description", 500, false, &mut errors);
         }
         if let Some(message) = validate_main_path(&self.main) {
             errors.push(message);
@@ -316,6 +356,7 @@ impl PluginManifest {
             }
         }
         self.validate_contributions(&mut errors);
+        self.validate_localizations(&mut errors);
         self.validate_permissions(&mut errors);
 
         if errors.is_empty() {
@@ -334,11 +375,21 @@ impl PluginManifest {
             if !command_ids.insert(command.id.clone()) {
                 errors.push(format!("duplicate command id '{}'", command.id));
             }
-            if command.label.trim().is_empty() || command.label.chars().count() > 120 {
-                errors.push(format!(
-                    "command '{}' label must be 1-120 characters",
-                    command.id
-                ));
+            validate_text(
+                &command.label,
+                &format!("command '{}' label", command.id),
+                120,
+                true,
+                errors,
+            );
+            if let Some(description) = &command.description {
+                validate_text(
+                    description,
+                    &format!("command '{}' description", command.id),
+                    500,
+                    false,
+                    errors,
+                );
             }
             if !is_identifier(&command.entry) {
                 errors.push(format!(
@@ -380,6 +431,9 @@ impl PluginManifest {
                     menu.command
                 ));
             }
+            if let Some(label) = &menu.label {
+                validate_text(label, "menu label", 120, false, errors);
+            }
         }
 
         let mut status_ids = BTreeSet::new();
@@ -390,9 +444,13 @@ impl PluginManifest {
             if !status_ids.insert(item.id.clone()) {
                 errors.push(format!("duplicate status bar id '{}'", item.id));
             }
-            if item.text.chars().count() > 200 {
-                errors.push(format!("status bar '{}' text is too long", item.id));
-            }
+            validate_text(
+                &item.text,
+                &format!("status bar '{}' text", item.id),
+                200,
+                false,
+                errors,
+            );
             if let Some(command) = &item.command {
                 if !command_ids.contains(command) {
                     errors.push(format!(
@@ -411,8 +469,21 @@ impl PluginManifest {
             if !setting_keys.insert(setting.key.clone()) {
                 errors.push(format!("duplicate setting key '{}'", setting.key));
             }
-            if setting.label.trim().is_empty() {
-                errors.push(format!("setting '{}' has an empty label", setting.key));
+            validate_text(
+                &setting.label,
+                &format!("setting '{}' label", setting.key),
+                120,
+                true,
+                errors,
+            );
+            if let Some(description) = &setting.description {
+                validate_text(
+                    description,
+                    &format!("setting '{}' description", setting.key),
+                    500,
+                    false,
+                    errors,
+                );
             }
             if let Err(message) = validate_setting_schema(setting) {
                 errors.push(format!("setting '{}': {message}", setting.key));
@@ -427,9 +498,13 @@ impl PluginManifest {
             if !panel_ids.insert(panel.id.clone()) {
                 errors.push(format!("duplicate panel id '{}'", panel.id));
             }
-            if panel.title.trim().is_empty() {
-                errors.push(format!("panel '{}' has an empty title", panel.id));
-            }
+            validate_text(
+                &panel.title,
+                &format!("panel '{}' title", panel.id),
+                200,
+                true,
+                errors,
+            );
             if !is_identifier(&panel.entry) {
                 errors.push(format!(
                     "panel '{}' entry '{}' is not an identifier",
@@ -443,6 +518,160 @@ impl PluginManifest {
                         panel.id
                     ));
                 }
+            }
+        }
+    }
+
+    /// Validate the additive `localizations` table. It keys by declared
+    /// contribution ids, so a typo is reported instead of silently ignored.
+    fn validate_localizations(&self, errors: &mut Vec<String>) {
+        if self.localizations.len() > MAX_LOCALES {
+            errors.push(format!(
+                "manifest has more than {MAX_LOCALES} localizations"
+            ));
+        }
+        let command_ids: BTreeSet<&str> = self
+            .contributes
+            .commands
+            .iter()
+            .map(|command| command.id.as_str())
+            .collect();
+        let status_ids: BTreeSet<&str> = self
+            .contributes
+            .status_bar
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        let setting_keys: BTreeSet<&str> = self
+            .contributes
+            .settings
+            .iter()
+            .map(|setting| setting.key.as_str())
+            .collect();
+        let panel_ids: BTreeSet<&str> = self
+            .contributes
+            .panels
+            .iter()
+            .map(|panel| panel.id.as_str())
+            .collect();
+
+        for (tag, localization) in &self.localizations {
+            if !valid_locale_tag(tag) {
+                errors.push(format!("localization has an invalid locale tag '{tag}'"));
+            }
+            let mut has_text = false;
+            if let Some(name) = &localization.name {
+                has_text = true;
+                validate_text(
+                    name,
+                    &format!("localization '{tag}' name"),
+                    120,
+                    true,
+                    errors,
+                );
+            }
+            if let Some(description) = &localization.description {
+                has_text = true;
+                validate_text(
+                    description,
+                    &format!("localization '{tag}' description"),
+                    500,
+                    false,
+                    errors,
+                );
+            }
+            for (id, item) in &localization.commands {
+                if !command_ids.contains(id.as_str()) {
+                    errors.push(format!(
+                        "localization '{tag}' references unknown command '{id}'"
+                    ));
+                }
+                let what = format!("localization '{tag}' command '{id}'");
+                if item.label.is_none() && item.description.is_none() {
+                    errors.push(format!("{what} has no text"));
+                    continue;
+                }
+                has_text = true;
+                if let Some(label) = &item.label {
+                    validate_text(label, &format!("{what} label"), 120, true, errors);
+                }
+                if let Some(description) = &item.description {
+                    validate_text(
+                        description,
+                        &format!("{what} description"),
+                        500,
+                        false,
+                        errors,
+                    );
+                }
+            }
+            for (id, item) in &localization.status_bar {
+                if !status_ids.contains(id.as_str()) {
+                    errors.push(format!(
+                        "localization '{tag}' references unknown status bar '{id}'"
+                    ));
+                }
+                if let Some(text) = &item.text {
+                    has_text = true;
+                    validate_text(
+                        text,
+                        &format!("localization '{tag}' status bar '{id}' text"),
+                        200,
+                        false,
+                        errors,
+                    );
+                } else {
+                    errors.push(format!(
+                        "localization '{tag}' status bar '{id}' has no text"
+                    ));
+                }
+            }
+            for (key, item) in &localization.settings {
+                if !setting_keys.contains(key.as_str()) {
+                    errors.push(format!(
+                        "localization '{tag}' references unknown setting '{key}'"
+                    ));
+                }
+                let what = format!("localization '{tag}' setting '{key}'");
+                if item.label.is_none() && item.description.is_none() {
+                    errors.push(format!("{what} has no text"));
+                    continue;
+                }
+                has_text = true;
+                if let Some(label) = &item.label {
+                    validate_text(label, &format!("{what} label"), 120, true, errors);
+                }
+                if let Some(description) = &item.description {
+                    validate_text(
+                        description,
+                        &format!("{what} description"),
+                        500,
+                        false,
+                        errors,
+                    );
+                }
+            }
+            for (id, item) in &localization.panels {
+                if !panel_ids.contains(id.as_str()) {
+                    errors.push(format!(
+                        "localization '{tag}' references unknown panel '{id}'"
+                    ));
+                }
+                if let Some(title) = &item.title {
+                    has_text = true;
+                    validate_text(
+                        title,
+                        &format!("localization '{tag}' panel '{id}' title"),
+                        200,
+                        true,
+                        errors,
+                    );
+                } else {
+                    errors.push(format!("localization '{tag}' panel '{id}' has no title"));
+                }
+            }
+            if !has_text {
+                errors.push(format!("localization '{tag}' has no text"));
             }
         }
     }
@@ -504,6 +733,145 @@ impl PluginManifest {
             .map(|setting| (setting.key.clone(), default_setting_value(setting)))
             .collect()
     }
+
+    fn translations<F>(&self, get: F) -> BTreeMap<String, String>
+    where
+        F: Fn(&PluginLocalization) -> Option<&String>,
+    {
+        self.localizations
+            .iter()
+            .filter_map(|(tag, localization)| {
+                get(localization).map(|text| (tag.clone(), text.clone()))
+            })
+            .collect()
+    }
+
+    /// Plugin name with `localizations` applied.
+    pub fn localized_name(&self) -> LocalizedText {
+        LocalizedText::with_translations(
+            self.name.clone(),
+            self.translations(|localization| localization.name.as_ref()),
+        )
+    }
+
+    pub fn localized_description(&self) -> Option<LocalizedText> {
+        let base = self.description.as_deref().unwrap_or("");
+        let translations = self.translations(|localization| localization.description.as_ref());
+        (!base.trim().is_empty() || !translations.is_empty())
+            .then(|| LocalizedText::with_translations(base, translations))
+    }
+
+    pub fn localized_command_label(&self, id: &str) -> LocalizedText {
+        let base = self
+            .contributes
+            .commands
+            .iter()
+            .find(|command| command.id == id)
+            .map(|command| command.label.clone())
+            .unwrap_or_else(|| id.to_string());
+        LocalizedText::with_translations(
+            base,
+            self.translations(|localization| {
+                localization
+                    .commands
+                    .get(id)
+                    .and_then(|item| item.label.as_ref())
+            }),
+        )
+    }
+
+    pub fn localized_command_description(&self, id: &str) -> Option<LocalizedText> {
+        let base = self
+            .contributes
+            .commands
+            .iter()
+            .find(|command| command.id == id)
+            .and_then(|command| command.description.as_deref())
+            .unwrap_or("");
+        let translations = self.translations(|localization| {
+            localization
+                .commands
+                .get(id)
+                .and_then(|item| item.description.as_ref())
+        });
+        (!base.trim().is_empty() || !translations.is_empty())
+            .then(|| LocalizedText::with_translations(base, translations))
+    }
+
+    pub fn localized_status_text(&self, id: &str) -> LocalizedText {
+        let base = self
+            .contributes
+            .status_bar
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.text.clone())
+            .unwrap_or_default();
+        LocalizedText::with_translations(
+            base,
+            self.translations(|localization| {
+                localization
+                    .status_bar
+                    .get(id)
+                    .and_then(|item| item.text.as_ref())
+            }),
+        )
+    }
+
+    pub fn localized_setting_label(&self, key: &str) -> LocalizedText {
+        let base = self
+            .contributes
+            .settings
+            .iter()
+            .find(|setting| setting.key == key)
+            .map(|setting| setting.label.clone())
+            .unwrap_or_else(|| key.to_string());
+        LocalizedText::with_translations(
+            base,
+            self.translations(|localization| {
+                localization
+                    .settings
+                    .get(key)
+                    .and_then(|item| item.label.as_ref())
+            }),
+        )
+    }
+
+    pub fn localized_setting_description(&self, key: &str) -> Option<LocalizedText> {
+        let base = self
+            .contributes
+            .settings
+            .iter()
+            .find(|setting| setting.key == key)
+            .and_then(|setting| setting.description.as_deref())
+            .unwrap_or("");
+        let translations = self.translations(|localization| {
+            localization
+                .settings
+                .get(key)
+                .and_then(|item| item.description.as_ref())
+        });
+        (!base.trim().is_empty() || !translations.is_empty())
+            .then(|| LocalizedText::with_translations(base, translations))
+    }
+
+    pub fn localized_panel_title(&self, id: &str) -> LocalizedText {
+        let base = self
+            .contributes
+            .panels
+            .iter()
+            .find(|panel| panel.id == id)
+            .map(|panel| panel.title.clone())
+            .unwrap_or_else(|| id.to_string());
+        LocalizedText::with_translations(
+            base,
+            self.translations(|localization| {
+                localization
+                    .panels
+                    .get(id)
+                    .and_then(|item| item.title.as_ref())
+            }),
+        )
+    }
 }
 
 /// Validate a raw path for `main` without touching the filesystem.
@@ -553,6 +921,21 @@ pub fn default_setting_value(setting: &SettingContribution) -> Value {
                 .unwrap_or_default()
                 .to_string(),
         ),
+    }
+}
+
+/// Validate one user-visible base string.
+fn validate_text(
+    value: &str,
+    what: &str,
+    max_chars: usize,
+    required: bool,
+    errors: &mut Vec<String>,
+) {
+    if required && value.trim().is_empty() {
+        errors.push(format!("{what} must not be empty"));
+    } else if value.chars().count() > max_chars {
+        errors.push(format!("{what} must be at most {max_chars} characters"));
     }
 }
 
@@ -740,6 +1123,83 @@ mod tests {
         );
     }
 
+    const LOCALIZATIONS: &str = r#",
+        "localizations": {
+            "zh-CN": {
+                "name": "演示",
+                "description": "示例插件",
+                "commands": {
+                    "example.format": { "label": "格式化", "description": "格式化文档" }
+                },
+                "status_bar": { "example.status": { "text": "就绪" } },
+                "settings": { "uppercase": { "label": "大写" } },
+                "panels": { "example.panel": { "title": "演示面板" } }
+            }
+        }"#;
+
+    #[test]
+    fn parses_localized_manifest_text() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.lua"), "return {}").unwrap();
+        let manifest = PluginManifest::parse(&manifest_json(LOCALIZATIONS), dir.path()).unwrap();
+        assert_eq!(manifest.localized_name().resolve("zh-CN"), "演示");
+        assert_eq!(
+            manifest.localized_description().unwrap().resolve("zh-CN"),
+            "示例插件"
+        );
+        assert_eq!(
+            manifest
+                .localized_command_label("example.format")
+                .resolve("zh-CN"),
+            "格式化"
+        );
+        assert_eq!(
+            manifest
+                .localized_command_label("example.format")
+                .resolve("en"),
+            "Format"
+        );
+        assert_eq!(
+            manifest
+                .localized_status_text("example.status")
+                .resolve("zh-CN"),
+            "就绪"
+        );
+        assert_eq!(
+            manifest
+                .localized_setting_label("uppercase")
+                .resolve("zh-CN"),
+            "大写"
+        );
+        assert_eq!(
+            manifest
+                .localized_panel_title("example.panel")
+                .resolve("zh-CN"),
+            "演示面板"
+        );
+        // The base strings remain the source for every other locale.
+        assert_eq!(manifest.localized_name().resolve("ja"), "Demo");
+    }
+
+    #[test]
+    fn rejects_bad_localizations() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.lua"), "return {}").unwrap();
+        for extra in [
+            r#", "localizations": { "zh CN": { "name": "演示" } }"#,
+            r#", "localizations": { "zh-CN": {} }"#,
+            r#", "localizations": { "zh-CN": { "commands": { "missing.command": { "label": "x" } } } }"#,
+            r#", "localizations": { "zh-CN": { "commands": { "example.format": { "label": "" } } } }"#,
+            r#", "localizations": { "zh-CN": { "panels": { "example.panel": {} } } }"#,
+        ] {
+            let json = manifest_json(extra);
+            assert!(
+                PluginManifest::parse(&json, dir.path()).is_err(),
+                "expected rejection for {extra}"
+            );
+        }
+    }
+
     #[test]
     fn rejects_invalid_identity_and_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -782,7 +1242,7 @@ mod tests {
         let setting = SettingContribution {
             key: "count".into(),
             setting_type: SettingType::Number,
-            label: "Count".into(),
+            label: "Count".to_string(),
             description: None,
             default: Value::from(2),
             max_length: None,

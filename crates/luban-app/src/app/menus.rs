@@ -67,13 +67,14 @@ fn plugin_menu_groups(
         let group = group_index(&command.plugin_id, &mut groups);
         groups[group].commands.push(PluginMenuCommand {
             id: command.id,
-            label: command.label.clone(),
+            label: plugin_text(&command.label),
             enabled: command.when.enabled(command_context),
         });
     }
     for panel in panels {
         let group = group_index(&panel.plugin_id, &mut groups);
-        let title = normalize_menu_label(&panel.title);
+        let panel_title = plugin_text(&panel.title);
+        let title = normalize_menu_label(&panel_title);
         if groups[group]
             .commands
             .iter()
@@ -83,7 +84,7 @@ fn plugin_menu_groups(
         }
         groups[group].panels.push(PluginMenuPanel {
             id: panel.id.clone(),
-            title: panel.title.clone(),
+            title: panel_title,
         });
     }
     groups
@@ -168,7 +169,7 @@ impl LubanApp {
             |plugin_id| {
                 self.plugin_host
                     .manifest(plugin_id)
-                    .map(|manifest| manifest.name.clone())
+                    .map(|manifest| plugin_text(&manifest.localized_name()))
             },
         );
         let recent_items = recent.clone();
@@ -1863,9 +1864,9 @@ impl LubanApp {
             .map(|item| {
                 let text = self
                     .plugin_host
-                    .status_text(&item.plugin_id, &item.id)
-                    .unwrap_or(&item.text)
-                    .to_string();
+                    .dynamic_status_text(&item.plugin_id, &item.id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| plugin_text(&item.text));
                 (text, item.command)
             })
             .collect();
@@ -1876,9 +1877,9 @@ impl LubanApp {
             .map(|item| {
                 let text = self
                     .plugin_host
-                    .status_text(&item.plugin_id, &item.id)
-                    .unwrap_or(&item.text)
-                    .to_string();
+                    .dynamic_status_text(&item.plugin_id, &item.id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| plugin_text(&item.text));
                 (text, item.command)
             })
             .collect();
@@ -2174,12 +2175,13 @@ mod tests {
     use super::plugin_menu_groups;
     use crate::commands::{CommandContext, CommandWhen};
     use crate::plugin_host::{PluginCommand, PluginPanelSpec};
+    use luban_plugin::localized::LocalizedText;
     use luban_plugin::manifest::{PanelPlacement, PanelRefresh};
 
     fn command(plugin_id: &str, id: &'static str, in_menu: bool) -> PluginCommand {
         PluginCommand {
             id,
-            label: format!("{plugin_id}: {id}"),
+            label: LocalizedText::new(format!("{plugin_id}: {id}")),
             plugin_id: plugin_id.to_string(),
             entry: "main".to_string(),
             when: CommandWhen::Always,
@@ -2192,7 +2194,7 @@ mod tests {
         PluginPanelSpec {
             plugin_id: plugin_id.to_string(),
             id: id.to_string(),
-            title: title.to_string(),
+            title: LocalizedText::new(title),
             entry: "main".to_string(),
             placement: PanelPlacement::Right,
             width: None,
@@ -2268,6 +2270,47 @@ mod tests {
     }
 
     #[test]
+    fn plugin_menu_labels_follow_the_active_locale() {
+        let _guard = crate::i18n::test_lock();
+        let mut preview = command("json", "json.preview", true);
+        preview.label = LocalizedText::with_translations(
+            "JSON: Preview",
+            [("zh-CN".to_string(), "JSON：预览".to_string())],
+        );
+        let panels = vec![PluginPanelSpec {
+            plugin_id: "json".to_string(),
+            id: "json.inspector.panel".to_string(),
+            title: LocalizedText::with_translations(
+                "JSON Inspector",
+                [("zh-CN".to_string(), "JSON 检查器".to_string())],
+            ),
+            entry: "main".to_string(),
+            placement: PanelPlacement::Right,
+            width: None,
+            refresh: PanelRefresh::Manual,
+        }];
+        let name = LocalizedText::with_translations(
+            "JSON Preview",
+            [("zh-CN".to_string(), "JSON 预览".to_string())],
+        );
+
+        rust_i18n::set_locale("zh-CN");
+        let groups = plugin_menu_groups(&[preview.clone()], &panels, &context(), |_| {
+            Some(crate::i18n::plugin_text(&name))
+        });
+        assert_eq!(groups[0].commands[0].label, "JSON：预览");
+        assert_eq!(groups[0].panels[0].title, "JSON 检查器");
+
+        rust_i18n::set_locale("en");
+        let groups = plugin_menu_groups(&[preview], &panels, &context(), |_| {
+            Some(crate::i18n::plugin_text(&name))
+        });
+        assert_eq!(groups[0].name, "JSON Preview");
+        assert_eq!(groups[0].commands[0].label, "JSON: Preview");
+        assert_eq!(groups[0].panels[0].title, "JSON Inspector");
+    }
+
+    #[test]
     fn command_enabled_state_follows_when_condition() {
         let mut save = command("demo", "demo.save", true);
         save.when = CommandWhen::CanSave;
@@ -2279,9 +2322,9 @@ mod tests {
     #[test]
     fn hides_panels_that_duplicate_shown_command_labels() {
         let mut json_preview = command("json", "json.preview", true);
-        json_preview.label = "JSON: Preview".to_string();
+        json_preview.label = LocalizedText::new("JSON: Preview");
         let mut markdown_preview = command("markdown", "markdown.preview", true);
-        markdown_preview.label = "Markdown: Preview".to_string();
+        markdown_preview.label = LocalizedText::new("Markdown: Preview");
         let commands = vec![json_preview, markdown_preview];
         let panels = vec![
             panel("json", "json.preview.panel", "JSON Preview"),
@@ -2305,7 +2348,7 @@ mod tests {
     #[test]
     fn duplicate_panel_detection_ignores_case_and_punctuation() {
         let mut preview = command("demo", "demo.preview", true);
-        preview.label = "DEMO — preview!".to_string();
+        preview.label = LocalizedText::new("DEMO — preview!");
         let panels = vec![panel("demo", "demo.panel", "demo preview.")];
         let groups = plugin_menu_groups(&[preview], &panels, &context(), |_| None);
 

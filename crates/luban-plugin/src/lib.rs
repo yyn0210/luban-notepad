@@ -7,6 +7,7 @@
 //! callbacks through [`runtime::Host`].
 
 pub mod install;
+pub mod localized;
 pub mod manifest;
 pub mod permissions;
 pub mod registry;

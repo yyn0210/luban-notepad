@@ -1205,7 +1205,7 @@ impl LubanApp {
                 );
                 Row {
                     id: entry.id.clone(),
-                    name: entry.name().to_string(),
+                    name: plugin_text(&entry.name()),
                     version: entry.version().to_string(),
                     author: entry
                         .manifest
@@ -1215,7 +1215,8 @@ impl LubanApp {
                     description: entry
                         .manifest
                         .as_ref()
-                        .and_then(|manifest| manifest.description.clone())
+                        .and_then(|manifest| manifest.localized_description())
+                        .map(|description| plugin_text(&description))
                         .unwrap_or_default(),
                     state,
                     permissions: {
@@ -1493,13 +1494,18 @@ impl LubanApp {
                 let row_id = format!("plugin-setting-{plugin_id}-{}", setting.key);
                 let plugin_id2 = plugin_id.clone();
                 let key = setting.key.clone();
+                let setting_label = self
+                    .plugin_host
+                    .manifest(&plugin_id)
+                    .map(|manifest| plugin_text(&manifest.localized_setting_label(&setting.key)))
+                    .unwrap_or_else(|| setting.label.clone());
                 let field = match setting.setting_type {
                     luban_plugin::manifest::SettingType::Boolean => {
                         let checked = value.as_bool().unwrap_or(false);
                         let plugin_id3 = plugin_id2.clone();
                         let key3 = key.clone();
                         Checkbox::new(row_id)
-                            .label(setting.label.clone())
+                            .label(setting_label)
                             .checked(checked)
                             .on_click(cx.listener(move |this, checked, _, cx| {
                                 this.apply_plugin_setting(
@@ -1526,7 +1532,7 @@ impl LubanApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_sm().child(setting.label.clone()))
+                            .child(div().text_sm().child(setting_label.clone()))
                             .child(
                                 Button::new(format!("{row_id}-down"))
                                     .label("−")
@@ -1563,7 +1569,7 @@ impl LubanApp {
                         let plugin_enum = plugin_id2.clone();
                         let key_enum = key.clone();
                         Button::new(row_id)
-                            .label(format!("{}: {current_value}", setting.label))
+                            .label(format!("{setting_label}: {current_value}"))
                             .compact()
                             .dropdown_menu(move |menu, _window, _cx| {
                                 let mut menu = menu;
@@ -1603,7 +1609,7 @@ impl LubanApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_sm().child(setting.label.clone()))
+                            .child(div().text_sm().child(setting_label))
                             .child(Input::new(&input).h(px(28.)).flex_1())
                             .child(
                                 Button::new(format!("{row_id}-apply"))

@@ -4,6 +4,18 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+### 新增
+
+- 插件国际化：清单新增可选 `localizations`（按语言标签键控插件名称、描述、
+  命令标签/说明、状态栏文本、设置标签/说明和面板标题），Lua 面板标题与头部
+  按钮支持可选的 `title_i18n`/`label_i18n`；新增
+  `luban.i18n.locale()`、`luban.i18n.pick()` 与
+  `luban.features.localized_text`。翻译是加性字段，旧宿主会忽略并继续按基础
+  字符串加载。切换界面语言后插件菜单、命令面板、快捷键列表、插件管理器、
+  状态栏和已打开面板的标题/按钮立即跟随，无需重新加载插件。
+- 官方 Markdown Preview 与 JSON Preview 插件提供中英文清单文本和面板标题/
+  操作按钮，JSON 预览的 Fold All/JSONPath/Metadata 按钮随界面语言显示。
+
 ## [1.0.0-preview.19] — 2026-11-09
 
 ### 修复

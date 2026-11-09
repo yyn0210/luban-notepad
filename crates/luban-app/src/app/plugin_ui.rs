@@ -452,7 +452,9 @@ impl LubanApp {
     /// Reload the plugin host without needing a window handle, so background
     /// store completions can refresh plugins from the idle poll loop.
     pub fn reload_plugins_now(&mut self, cx: &mut Context<Self>) {
-        self.plugin_host = crate::plugin_host::PluginHost::load(&self.settings, self.safe_mode);
+        let locale = crate::i18n::active_locale();
+        self.plugin_host =
+            crate::plugin_host::PluginHost::load(&self.settings, self.safe_mode, &locale);
         for (plugin_id, values) in &self.plugin_host.settings {
             self.settings
                 .plugin_settings
@@ -846,6 +848,22 @@ impl LubanApp {
         self.render_plugin_panel_content(plugin_id, panel_id, watch, window, cx);
     }
 
+    /// Recompute the open panel after a UI-language switch so plugin-generated
+    /// titles and body text that used `luban.i18n.pick` pick up the new
+    /// language.
+    pub(super) fn refresh_open_plugin_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &self.plugin_panel else {
+            return;
+        };
+        let plugin_id = panel.plugin_id.clone();
+        let panel_id = panel.panel_id.clone();
+        self.refresh_plugin_panel(&plugin_id, &panel_id, window, cx);
+    }
+
     /// Pull edits into the document, then recompute a watched panel.
     fn refresh_watched_plugin_panel(
         &mut self,
@@ -1069,7 +1087,7 @@ impl LubanApp {
         let manifest_title = panel_spec
             .as_ref()
             .map(|panel| panel.title.clone())
-            .unwrap_or_else(|| panel_id.to_string());
+            .unwrap_or_else(|| luban_plugin::localized::LocalizedText::new(panel_id));
         let placement = panel_spec
             .as_ref()
             .map(|panel| panel.placement)
@@ -1094,7 +1112,7 @@ impl LubanApp {
             .value
             .as_ref()
             .and_then(|panel| panel.title.clone())
-            .filter(|title| !title.trim().is_empty());
+            .filter(|title| !title.is_blank());
         let truncated = call.value.as_ref().is_some_and(|panel| panel.truncated);
         let actions = call
             .value
@@ -1134,7 +1152,7 @@ impl LubanApp {
         let Some(panel) = &self.plugin_panel else {
             return div().into_any_element();
         };
-        let title = panel.title.clone();
+        let title = plugin_text(&panel.title);
         let lines = panel.lines.clone();
         let actions = panel.actions.clone();
         let empty = lines.is_empty();
@@ -1182,9 +1200,10 @@ impl LubanApp {
         let weak_action = cx.weak_entity();
         let action_buttons = actions.into_iter().enumerate().map(move |(index, action)| {
             let weak = weak_action.clone();
+            let label = plugin_text(&action.label);
             let command = action.command;
             Button::new(("plugin-panel-action", index))
-                .label(action.label)
+                .label(label)
                 .ghost()
                 .compact()
                 .on_click(move |_, window, cx| {

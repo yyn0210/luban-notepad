@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use luban_core::Settings;
 use luban_plugin::install::{self, InstallRecords};
+use luban_plugin::localized::LocalizedText;
 use luban_plugin::manifest::{
     CommandCondition, PanelPlacement, PanelRefresh, PluginManifest, SettingContribution,
     StatusAlignment,
@@ -25,7 +26,7 @@ use crate::commands::{CommandWhen, DynamicCommandSpec};
 #[derive(Clone, Debug)]
 pub struct PluginCommand {
     pub id: &'static str,
-    pub label: String,
+    pub label: LocalizedText,
     pub plugin_id: String,
     pub entry: String,
     pub when: CommandWhen,
@@ -46,7 +47,7 @@ fn contributes_to_plugins_menu(manifest: &PluginManifest, command_id: &str) -> b
 pub struct PluginStatusItem {
     pub plugin_id: String,
     pub id: String,
-    pub text: String,
+    pub text: LocalizedText,
     pub command: Option<&'static str>,
     pub alignment: StatusAlignment,
 }
@@ -55,7 +56,7 @@ pub struct PluginStatusItem {
 pub struct PluginPanelSpec {
     pub plugin_id: String,
     pub id: String,
-    pub title: String,
+    pub title: LocalizedText,
     pub entry: String,
     pub placement: PanelPlacement,
     pub width: Option<u16>,
@@ -114,7 +115,10 @@ pub(crate) fn route_run_command(id: &str, depth: u8, is_plugin_command: bool) ->
 }
 
 impl PluginHost {
-    pub fn load(settings: &Settings, safe_mode: bool) -> Self {
+    /// Discover, plan and activate plugins. `locale` is pushed into every
+    /// runtime before `activate` so a plugin that branches on
+    /// `luban.i18n.locale()` sees the startup language.
+    pub fn load(settings: &Settings, safe_mode: bool, locale: &str) -> Self {
         let root = luban_core::settings::plugins_dir();
         let mut errors = Vec::new();
         if let Err(error) = std::fs::create_dir_all(&root) {
@@ -140,7 +144,7 @@ impl PluginHost {
         let mut panels = Vec::new();
         let mut plugin_settings = BTreeMap::new();
         let mut schemas = BTreeMap::new();
-        let mut dynamic_status = BTreeMap::new();
+        let dynamic_status = BTreeMap::new();
 
         for id in plan.order.clone() {
             let Some(entry) = registry.get(&id) else {
@@ -177,6 +181,7 @@ impl PluginHost {
                         continue;
                     }
                 };
+            runtime.set_locale(locale);
             let activation = runtime.activate(input);
             for action in &activation.output.actions {
                 log::debug!("plugin '{id}' activation action: {action:?}");
@@ -193,7 +198,7 @@ impl PluginHost {
                     status_items.push(PluginStatusItem {
                         plugin_id: id.clone(),
                         id: item.id.clone(),
-                        text: item.text.clone(),
+                        text: manifest.localized_status_text(&item.id),
                         command: Some(leaked),
                         alignment: item.alignment,
                     });
@@ -201,18 +206,17 @@ impl PluginHost {
                     status_items.push(PluginStatusItem {
                         plugin_id: id.clone(),
                         id: item.id.clone(),
-                        text: item.text.clone(),
+                        text: manifest.localized_status_text(&item.id),
                         command: None,
                         alignment: item.alignment,
                     });
                 }
-                dynamic_status.insert((id.clone(), item.id.clone()), item.text.clone());
             }
             for panel in &manifest.contributes.panels {
                 panels.push(PluginPanelSpec {
                     plugin_id: id.clone(),
                     id: panel.id.clone(),
-                    title: panel.title.clone(),
+                    title: manifest.localized_panel_title(&panel.id),
                     entry: panel.entry.clone(),
                     placement: panel.placement,
                     width: panel.width,
@@ -234,7 +238,7 @@ impl PluginHost {
                 let leaked: &'static str = Box::leak(command.id.clone().into_boxed_str());
                 commands.push(PluginCommand {
                     id: leaked,
-                    label: command.label.clone(),
+                    label: manifest.localized_command_label(&command.id),
                     plugin_id: id.clone(),
                     entry: command.entry.clone(),
                     when: match command.when {
@@ -513,16 +517,20 @@ impl PluginHost {
         }
     }
 
-    pub fn status_text(&self, plugin_id: &str, id: &str) -> Option<&str> {
+    /// Text a plugin wrote with `luban.status.set`. Manifest text is kept as
+    /// [`LocalizedText`] and resolved by the status bar at render time.
+    pub fn dynamic_status_text(&self, plugin_id: &str, id: &str) -> Option<&str> {
         self.dynamic_status
             .get(&(plugin_id.to_string(), id.to_string()))
             .map(String::as_str)
-            .or_else(|| {
-                self.status_items
-                    .iter()
-                    .find(|item| item.plugin_id == plugin_id && item.id == id)
-                    .map(|item| item.text.as_str())
-            })
+    }
+
+    /// Push the active UI language into every live Lua state so
+    /// `luban.i18n.locale()` follows a language switch.
+    pub fn set_locale(&mut self, locale: &str) {
+        for runtime in self.runtimes.values_mut() {
+            runtime.set_locale(locale);
+        }
     }
 
     pub fn set_status(&mut self, plugin_id: &str, id: &str, text: String) {
@@ -635,6 +643,7 @@ mod tests {
                     })
                     .collect(),
                 contributes: Default::default(),
+                localizations: Default::default(),
                 activate: None,
                 deactivate: None,
             }),
@@ -1112,7 +1121,7 @@ mod tests {
         ] {
             host.commands.push(PluginCommand {
                 id: Box::leak(command_id.to_string().into_boxed_str()),
-                label: "Chain".to_string(),
+                label: LocalizedText::new("Chain"),
                 plugin_id: plugin_id.to_string(),
                 entry: entry.to_string(),
                 when: CommandWhen::Always,

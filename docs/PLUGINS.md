@@ -101,6 +101,9 @@ Luban Notepad 的插件由一个 JSON 清单、一个沙箱化 Lua 入口和若�
   对应 API。未知权限会被忽略并记录警告。
 - `activate` / `deactivate`：插件表中的函数名，可选。
 - `contributes`：命令、菜单、状态栏、设置、面板贡献点，结构与 v1 相同。
+- 用户可见文本的基础字段保持字符串；翻译放在顶层可选 `localizations`
+  表中（按语言标签键控，见“国际化”）。旧宿主会忽略这个未知字段，继续按
+  基础字符串加载。
 
 ## Lua 入口
 
@@ -197,6 +200,7 @@ return M
 | `luban.command.run(id, args?)` | 运行任意命令；`args` 传给目标插件命令入口；链深最多 4，见“command.run”。 |
 | `luban.events.on(name, fn)` / `luban.events.off(name)` | `fn` 为函数值；`on` 仅限清单 `events` 声明过的事件，每插件最多 32 个处理器；`off` 移除该事件全部处理器。 |
 | `luban.timer.after(id, ms, fn)` / `luban.timer.every(id, ms, fn)` / `luban.timer.cancel(id)` | 单次/循环定时器，见“定时器”。 |
+| `luban.i18n.locale()` / `luban.i18n.pick(value)` | 当前界面语言标签（如 `zh-CN`）；`pick` 从字符串或语言表按同一回退规则取值，见“国际化”。 |
 
 文档 API 只对普通、可编辑全文的文本文档有效。大文件、磁盘引擎、部分范围、
 非文本文档和只读差异标签抛出 "unsupported document" 错误，不会修改内容。
@@ -206,6 +210,121 @@ return M
 `luban.fs` 的允许范围：所有已打开工作区根、当前活动文档所在目录（没有工作区
 时）和插件自己的数据目录。路径在写入前规范化；超出范围的路径抛出
 "path outside allowed roots" 错误。
+
+## 国际化
+
+翻译是加性能力：基础字段继续写默认（通常是英文）字符串，翻译放在清单顶层
+`localizations` 中。旧宿主不认识这个字段，会忽略它并按基础字符串加载，因此
+给已有插件补翻译不会破坏旧版本。
+
+```json
+{
+  "name": "JSON Preview",
+  "description": "Tree-style JSON preview.",
+  "contributes": {
+    "commands": [
+      { "id": "json.preview", "label": "JSON: Preview", "entry": "open_preview" }
+    ],
+    "panels": [
+      { "id": "json.preview.panel", "title": "JSON Preview", "entry": "render" }
+    ],
+    "settings": [
+      { "key": "indent", "type": "number", "label": "Indent width", "default": 2 }
+    ],
+    "status_bar": [
+      { "id": "json.status", "text": "JSON" }
+    ]
+  },
+  "localizations": {
+    "zh-CN": {
+      "name": "JSON 预览",
+      "description": "树形 JSON 预览。",
+      "commands": {
+        "json.preview": {
+          "label": "JSON：预览",
+          "description": "打开或刷新 JSON 预览"
+        }
+      },
+      "panels": {
+        "json.preview.panel": { "title": "JSON 预览" }
+      },
+      "settings": {
+        "indent": { "label": "缩进宽度", "description": "每层嵌套的空格数。" }
+      },
+      "status_bar": {
+        "json.status": { "text": "JSON" }
+      }
+    }
+  }
+}
+```
+
+可本地化的清单字段：
+
+| 位置 | 字段 |
+| --- | --- |
+| `localizations.<locale>` | `name`、`description` |
+| `.commands.<command-id>` | `label`、`description` |
+| `.panels.<panel-id>` | `title` |
+| `.settings.<setting-key>` | `label`、`description` |
+| `.status_bar.<item-id>` | `text` |
+
+解析时按当前界面语言回退：
+
+1. 与语言标签完全匹配（忽略大小写，`zh_CN` 与 `zh-CN` 等价）；
+2. 同一主语言（请求 `zh-CN` 时匹配 `zh`，请求 `zh` 时匹配 `zh-CN`）；
+3. `en`（没有英文翻译时使用基础字符串）；
+4. 第一个非空翻译。
+
+每个翻译分别参与校验（长度上限与基础字段一致），语言标签只允许字母、数字、
+`-` 和 `_`，单个清单最多 16 种语言。`localizations` 里的 ID/key 必须对应已
+声明的贡献点，拼错会拒绝加载。语言切换后菜单、命令面板、快捷键列表、插件
+管理器、状态栏和已打开面板的标题/按钮会在下一次渲染时自动跟随，不需要重新
+加载插件。
+
+面板运行时的标题和头部按钮使用同样思路：基础字符串 + 可选 `*_i18n` 表。
+
+```lua
+return {
+  title = "Parse result",
+  title_i18n = { ["zh-CN"] = "解析结果" },
+  lines = { ... },
+  actions = {
+    {
+      label = "Fold All",
+      label_i18n = { ["zh-CN"] = "全部折叠" },
+      command = { id = "json.fold.toggle-all" },
+    },
+  },
+}
+```
+
+旧宿主读取 `title`/`label` 并忽略 `*_i18n`。新宿主也接受直接用语言表代替
+基础字符串（`title = { ["zh-CN"] = "..." }`），但这种写法在旧宿主上不兼容，
+不建议使用。
+
+面板正文行（`text`/`spans`/`cells`）是插件生成的内容，宿主不做自动翻译；
+插件可以用 `luban.i18n.locale()` 判断当前语言，或用 `luban.i18n.pick` 选择
+文案：
+
+```lua
+local function pick(english, chinese)
+  if luban.i18n and luban.i18n.pick then
+    return luban.i18n.pick({ en = english, ["zh-CN"] = chinese })
+  end
+  return english
+end
+
+local empty = pick("No matches.", "没有匹配项。")
+```
+
+`luban.i18n.pick` 接受字符串（原样返回）、语言表（按上面的回退规则解析）和
+`nil`（返回 `nil`）；其他类型抛错。语言标签可在运行时切换，因此不要把它缓存
+在模块级变量里，除非你在 `activate` 或每次分发时重新读取。
+
+宿主能力表 `luban.features.localized_text = true` 表示支持 `localizations`、
+`*_i18n` 与 `luban.i18n`；老宿主没有这个字段，调用前先判断
+`luban.i18n` 是否存在。
 
 ## 错误约定
 
@@ -375,6 +494,7 @@ luban.timer.cancel(id)          -- remove; unknown ids are a no-op
 | `panel_tables` | 面板支持 `cells` 结构化表格行 |
 | `panel_tight_lines` | 面板识别 `tight` 续行标志 |
 | `panel_images` | 面板渲染 `style = "image"` 的本地图片行 |
+| `localized_text` | 清单支持 `localizations`、面板支持 `*_i18n`，并提供 `luban.i18n` |
 
 `command` 统一为 `{ id, args }` 表（字符串形态已移除）：`id` 是要执行的命令，
 `args` 是 JSON 兼容的 Lua 表，宿主作为目标命令入口的第二参数传入。规则：
@@ -389,16 +509,27 @@ luban.timer.cancel(id)          -- remove; unknown ids are a no-op
 
 ```lua
 return {
-  title = "解析结果",
+  title = "Parse result",
+  title_i18n = { ["zh-CN"] = "解析结果" },
   lines = { ... },
   actions = {
-    { label = "折叠", command = { id = "json.fold.toggle-all" } },
-    { label = "元数据", command = { id = "json.metadata" } },
+    {
+      label = "Fold All",
+      label_i18n = { ["zh-CN"] = "全部折叠" },
+      command = { id = "json.fold.toggle-all" },
+    },
+    {
+      label = "Metadata",
+      label_i18n = { ["zh-CN"] = "元数据" },
+      command = { id = "json.metadata" },
+    },
   },
 }
 ```
 
-最多 8 个操作，`label` 不超过 64 字节，`command` 同样是 `{ id, args }` 表。
+最多 8 个操作，`label` 及每个翻译不超过 64 字节，`command` 同样是
+`{ id, args }` 表。`title_i18n`/`label_i18n` 可选；旧宿主会忽略它们并显示
+基础字符串。
 
 span 的 `style` 是空格分隔的标志：`bold`、`italic`、`underline`、`strike`、
 `code`、`link`、`muted`；`role` 使用 `luban.syntax.highlight` 返回的语义角色，

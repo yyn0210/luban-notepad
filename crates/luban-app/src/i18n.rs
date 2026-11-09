@@ -15,6 +15,16 @@ pub fn tr_args(key: &str, args: &[(&str, String)]) -> String {
     rust_i18n::replace_patterns(&template, &names, &values)
 }
 
+/// Resolve plugin-provided text for the active UI language.
+pub fn plugin_text(text: &luban_plugin::localized::LocalizedText) -> String {
+    text.resolve(rust_i18n::locale().deref()).to_string()
+}
+
+/// Active locale tag, for pushing into live plugin runtimes.
+pub fn active_locale() -> String {
+    rust_i18n::locale().to_string()
+}
+
 /// Resolve and apply the UI language. Returns the effective locale tag.
 pub fn apply_language(preference: &str) -> &'static str {
     let locale = luban_core::i18n::resolve(preference);

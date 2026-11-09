@@ -23,11 +23,13 @@ pub struct PluginEntry {
 }
 
 impl PluginEntry {
-    pub fn name(&self) -> &str {
-        self.manifest
-            .as_ref()
-            .map(|manifest| manifest.name.as_str())
-            .unwrap_or(&self.id)
+    /// Display name carried by the manifest with any `localizations` applied.
+    /// Falls back to the directory id when the manifest failed to load.
+    pub fn name(&self) -> crate::localized::LocalizedText {
+        match &self.manifest {
+            Some(manifest) => manifest.localized_name(),
+            None => crate::localized::LocalizedText::new(self.id.clone()),
+        }
     }
 
     pub fn version(&self) -> &str {

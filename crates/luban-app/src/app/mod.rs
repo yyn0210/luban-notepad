@@ -76,7 +76,7 @@ use crate::huge_file::{
 };
 use crate::huge_gutter::{self, HugeGutterProps};
 use crate::huge_scrollbar::{self, HugeScrollbarProps};
-use crate::i18n::{active_language_name, tr, tr_args};
+use crate::i18n::{active_language_name, plugin_text, tr, tr_args};
 use crate::large_file::{LargeFilePanel, RangeField};
 use crate::logging;
 use crate::macro_ui::MacroUiState;
@@ -213,7 +213,7 @@ struct DiffTask {
 struct PluginPanelState {
     plugin_id: String,
     panel_id: String,
-    title: String,
+    title: luban_plugin::localized::LocalizedText,
     placement: luban_plugin::manifest::PanelPlacement,
     /// Preferred width in points: the width the user dragged to, or the
     /// remembered/manifest width until the panel is resized.
@@ -744,7 +744,9 @@ impl LubanApp {
             })
             .collect();
         language::set_user_languages(user_languages);
-        let mut plugin_host = crate::plugin_host::PluginHost::load(&settings, options.safe_mode);
+        let plugin_locale = luban_core::i18n::resolve(&settings.ui_language);
+        let mut plugin_host =
+            crate::plugin_host::PluginHost::load(&settings, options.safe_mode, plugin_locale);
         for (plugin_id, values) in &plugin_host.settings {
             settings
                 .plugin_settings
@@ -3506,6 +3508,9 @@ impl LubanApp {
         self.workspace_settings.apply_to(&mut self.settings);
         self.settings.validate();
         crate::i18n::apply_language(&self.settings.ui_language);
+        self.plugin_host
+            .set_locale(crate::i18n::active_locale().as_str());
+        self.refresh_open_plugin_panel(window, cx);
         self.apply_settings_impl(window, cx, false);
         self.set_status(
             tr_args("settings.imported", &[("path", path.display().to_string())]),
@@ -3529,6 +3534,9 @@ impl LubanApp {
         self.workspace_settings.apply_to(&mut self.settings);
         self.settings.validate();
         crate::i18n::apply_language(&self.settings.ui_language);
+        self.plugin_host
+            .set_locale(crate::i18n::active_locale().as_str());
+        self.refresh_open_plugin_panel(window, cx);
         self.apply_settings_impl(window, cx, false);
         self.set_status(tr("settings.reset_done"), cx);
         cx.notify();
@@ -4723,6 +4731,9 @@ impl LubanApp {
     fn set_ui_language(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.ui_language = value.to_string();
         crate::i18n::apply_language(value);
+        self.plugin_host
+            .set_locale(crate::i18n::active_locale().as_str());
+        self.refresh_open_plugin_panel(window, cx);
         self.commit_settings();
         for tab in &mut self.tabs {
             if tab.doc.path.is_some() {
@@ -6509,7 +6520,7 @@ impl LubanApp {
             .plugin_commands
             .iter()
             .filter_map(|id| self.plugin_host.command(id))
-            .map(|command| (command.label.clone(), command.when.enabled(&context)))
+            .map(|command| (plugin_text(&command.label), command.when.enabled(&context)))
             .collect();
         let snippet_rows = self.snippet_picker_rows.clone();
         let weak_confirm = cx.weak_entity();
@@ -6821,7 +6832,7 @@ impl LubanApp {
         rows.extend(self.plugin_host.commands.iter().map(|command| {
             (
                 command.id,
-                command.label.clone(),
+                plugin_text(&command.label),
                 keymap.binding_text(command.id).unwrap_or("—").to_string(),
                 overrides.get(command.id).cloned(),
             )
@@ -7443,7 +7454,7 @@ impl LubanApp {
             .filter_map(|command| {
                 self.keymap
                     .binding_text(command.id)
-                    .map(|binding| (command.label.clone(), binding.to_string()))
+                    .map(|binding| (plugin_text(&command.label), binding.to_string()))
             })
             .collect();
         let sections = groups
@@ -8225,7 +8236,7 @@ mod plugin_panel_tests {
         app.plugin_panel = Some(PluginPanelState {
             plugin_id: "markdown.preview".to_string(),
             panel_id: "markdown.preview.panel".to_string(),
-            title: "Preview".to_string(),
+            title: luban_plugin::localized::LocalizedText::new("Preview"),
             placement: luban_plugin::manifest::PanelPlacement::Right,
             width,
             lines: Vec::new(),

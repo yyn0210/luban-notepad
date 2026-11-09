@@ -16,6 +16,7 @@ use std::rc::Rc;
 use mlua::{HookTriggers, IntoLuaMulti, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use serde_json::{Map, Value as JsonValue};
 
+use crate::localized::{valid_locale_tag, LocalizedText, MAX_LOCALES};
 use crate::manifest::{PluginManifest, SettingContribution};
 use crate::permissions::PermissionSet;
 
@@ -31,6 +32,8 @@ const MAX_PANEL_CELLS: usize = 32;
 const MAX_PANEL_CELL_WEIGHT: u8 = 32;
 const MAX_PANEL_ACTIONS: usize = 8;
 const MAX_PANEL_ACTION_LABEL_BYTES: usize = 64;
+/// Upper bound on one panel title translation.
+const MAX_PANEL_TITLE_BYTES: usize = 1024;
 const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_ROLE_BYTES: usize = 32;
 /// Maximum length for plugin-supplied resource ids (panels, commands).
@@ -153,7 +156,7 @@ impl<T> RuntimeCall<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelContent {
-    pub title: Option<String>,
+    pub title: Option<LocalizedText>,
     pub lines: Vec<PanelLine>,
     pub truncated: bool,
     /// Optional flat action bar rendered in the panel header.
@@ -171,7 +174,7 @@ pub struct PanelCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelAction {
-    pub label: String,
+    pub label: LocalizedText,
     pub command: PanelCommand,
 }
 
@@ -412,6 +415,9 @@ pub struct PluginRuntime {
     /// [`Self::fire_timer`]. Entries live here, not in the Lua VM, so
     /// rebuilding the VM clears them.
     timers: Rc<RefCell<BTreeMap<String, TimerEntry>>>,
+    /// Active UI language tag, shared with the `luban.i18n` closures. The host
+    /// updates it when the user switches languages.
+    locale: Rc<RefCell<String>>,
     /// Consecutive failed dispatches; any successful dispatch resets it.
     /// The host quarantines the plugin when [`Self::should_quarantine`].
     consecutive_failures: Cell<u32>,
@@ -574,8 +580,15 @@ impl PluginRuntime {
         state.borrow_mut().permissions = permissions.clone();
         let event_handlers = Rc::new(RefCell::new(BTreeMap::new()));
         let timers = Rc::new(RefCell::new(BTreeMap::new()));
-        install_luban_table(&lua, state.clone(), event_handlers.clone(), timers.clone())
-            .map_err(|error| format!("cannot initialize plugin API: {error}"))?;
+        let locale = Rc::new(RefCell::new(String::from("en")));
+        install_luban_table(
+            &lua,
+            state.clone(),
+            event_handlers.clone(),
+            timers.clone(),
+            locale.clone(),
+        )
+        .map_err(|error| format!("cannot initialize plugin API: {error}"))?;
         let handler_limit_hit = limit_hit.clone();
         // Rust-raised v2 API errors (`Err(mlua::Error::RuntimeError(..))` from
         // the closures below) reach this handler as mlua WrappedFailure
@@ -628,12 +641,20 @@ impl PluginRuntime {
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
             event_handlers,
             timers,
+            locale,
             consecutive_failures: Cell::new(0),
         })
     }
 
     pub fn manifest(&self) -> &PluginManifest {
         &self.manifest
+    }
+
+    /// Update the language `luban.i18n.locale()` reports. Manifest and panel
+    /// text resolve at render time, so only plugin code that branches on the
+    /// locale needs this.
+    pub fn set_locale(&mut self, locale: &str) {
+        *self.locale.borrow_mut() = locale.to_string();
     }
 
     pub fn permissions(&self) -> &PermissionSet {
@@ -753,6 +774,7 @@ impl PluginRuntime {
             state.clone(),
             self.event_handlers.clone(),
             self.timers.clone(),
+            self.locale.clone(),
         )
         .and_then(|()| context_table(&self.lua, &state, None))
         {
@@ -910,6 +932,7 @@ impl PluginRuntime {
             state.clone(),
             self.event_handlers.clone(),
             self.timers.clone(),
+            self.locale.clone(),
         )
         .and_then(|()| context_table(&self.lua, &state, None))
         {
@@ -1020,6 +1043,7 @@ impl PluginRuntime {
             state.clone(),
             self.event_handlers.clone(),
             self.timers.clone(),
+            self.locale.clone(),
         )
         .and_then(|()| context_table(&self.lua, &state, command_id))
         {
@@ -1191,6 +1215,7 @@ fn install_luban_table(
     state: Rc<RefCell<CallState>>,
     events_registry: Rc<RefCell<BTreeMap<String, Vec<mlua::Function>>>>,
     timers: Rc<RefCell<BTreeMap<String, TimerEntry>>>,
+    locale: Rc<RefCell<String>>,
 ) -> mlua::Result<()> {
     let luban = lua.create_table()?;
     luban.set("version", 2)?;
@@ -1201,7 +1226,29 @@ fn install_luban_table(
     features.set("panel_tables", true)?;
     features.set("panel_tight_lines", true)?;
     features.set("panel_images", true)?;
+    features.set("localized_text", true)?;
     luban.set("features", features)?;
+
+    let i18n = lua.create_table()?;
+    let locale_cell = locale.clone();
+    i18n.set(
+        "locale",
+        lua.create_function(move |_, ()| Ok(locale_cell.borrow().clone()))?,
+    )?;
+    i18n.set(
+        "pick",
+        lua.create_function(move |lua, value: Value| match value {
+            Value::Nil => Ok(Value::Nil),
+            other => {
+                let text =
+                    parse_lua_localized(other, "i18n.pick").map_err(mlua::Error::RuntimeError)?;
+                Ok(Value::String(
+                    lua.create_string(text.resolve(&locale.borrow()))?,
+                ))
+            }
+        })?,
+    )?;
+    luban.set("i18n", i18n)?;
 
     let log_plugin_id = state.borrow().plugin.id.clone();
     luban.set(
@@ -1985,6 +2032,124 @@ fn json_to_lua(lua: &Lua, value: &JsonValue) -> mlua::Result<Value> {
     })
 }
 
+/// Parse a panel/API string that may also be a locale table:
+/// `{ en = "...", ["zh-CN"] = "..." }`.
+fn parse_lua_localized(value: Value, what: &str) -> Result<LocalizedText, String> {
+    match value {
+        Value::String(text) => Ok(LocalizedText::new(
+            text.to_str()
+                .map_err(|error| error.to_string())?
+                .to_string(),
+        )),
+        Value::Table(table) => {
+            let mut values = BTreeMap::new();
+            for pair in table.pairs::<Value, Value>() {
+                let (key, value) = pair.map_err(|error| format!("{what}: {error}"))?;
+                let Value::String(key) = key else {
+                    return Err(format!("{what} locale keys must be strings"));
+                };
+                let Value::String(value) = value else {
+                    return Err(format!("{what} locale values must be strings"));
+                };
+                let key = key
+                    .to_str()
+                    .map_err(|error| format!("{what} locale: {error}"))?
+                    .to_string();
+                let text = value
+                    .to_str()
+                    .map_err(|error| format!("{what} locale value: {error}"))?
+                    .to_string();
+                if !valid_locale_tag(&key) {
+                    return Err(format!("{what} has an invalid locale tag '{key}'"));
+                }
+                if values.len() >= MAX_LOCALES {
+                    return Err(format!("{what} has more than {MAX_LOCALES} translations"));
+                }
+                values.insert(key, text);
+            }
+            if values.is_empty() {
+                return Err(format!("{what} has no translations"));
+            }
+            Ok(LocalizedText::Localized(values))
+        }
+        _ => Err(format!("{what} must be a string or a locale table")),
+    }
+}
+
+/// Parse an additive `*_i18n` table as locale -> text. `nil` is an empty map,
+/// so a plugin that only ships the base string needs no extra key.
+fn parse_translation_map(value: Value, what: &str) -> Result<BTreeMap<String, String>, String> {
+    let Value::Table(table) = value else {
+        if matches!(value, Value::Nil) {
+            return Ok(BTreeMap::new());
+        }
+        return Err(format!("{what} translations must be a table"));
+    };
+    let mut values = BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair.map_err(|error| format!("{what} translations: {error}"))?;
+        let Value::String(key) = key else {
+            return Err(format!("{what} locale keys must be strings"));
+        };
+        let Value::String(value) = value else {
+            return Err(format!("{what} locale values must be strings"));
+        };
+        let key = key
+            .to_str()
+            .map_err(|error| format!("{what} locale: {error}"))?
+            .to_string();
+        let text = value
+            .to_str()
+            .map_err(|error| format!("{what} locale value: {error}"))?
+            .to_string();
+        if !valid_locale_tag(&key) {
+            return Err(format!("{what} has an invalid locale tag '{key}'"));
+        }
+        if values.len() >= MAX_LOCALES {
+            return Err(format!("{what} has more than {MAX_LOCALES} translations"));
+        }
+        values.insert(key, text);
+    }
+    Ok(values)
+}
+
+/// Parse a user-visible panel field. The backward-compatible form is a base
+/// string plus an optional `*_i18n` table; a locale table in place of the base
+/// string is also accepted for convenience.
+fn parse_localized_field(
+    base: Value,
+    translations: Value,
+    what: &str,
+    max_bytes: usize,
+    required: bool,
+) -> Result<LocalizedText, String> {
+    let text = match base {
+        Value::Table(_) => parse_lua_localized(base, what)?,
+        Value::String(base) => {
+            let base = base
+                .to_str()
+                .map_err(|error| error.to_string())?
+                .to_string();
+            let translations = parse_translation_map(translations, what)?;
+            LocalizedText::with_translations(base, translations)
+        }
+        Value::Nil => {
+            let translations = parse_translation_map(translations, what)?;
+            if translations.is_empty() {
+                return Err(format!("{what} is required"));
+            }
+            LocalizedText::Localized(translations)
+        }
+        _ => return Err(format!("{what} must be a string or a locale table")),
+    };
+    for (_, value) in text.values() {
+        if (required && value.trim().is_empty()) || value.len() > max_bytes {
+            return Err(format!("{what} is empty or too long"));
+        }
+    }
+    Ok(text)
+}
+
 fn parse_panel(value: Value) -> Result<PanelContent, String> {
     match value {
         Value::String(text) => Ok(PanelContent {
@@ -1998,7 +2163,19 @@ fn parse_panel(value: Value) -> Result<PanelContent, String> {
             actions: Vec::new(),
         }),
         Value::Table(table) => {
-            let title: Option<String> = table.get("title").ok().flatten();
+            let title_value = table.get::<Value>("title").unwrap_or(Value::Nil);
+            let title_i18n = table.get::<Value>("title_i18n").unwrap_or(Value::Nil);
+            let title = if matches!(&title_value, Value::Nil) && matches!(&title_i18n, Value::Nil) {
+                None
+            } else {
+                Some(parse_localized_field(
+                    title_value,
+                    title_i18n,
+                    "panel title",
+                    MAX_PANEL_TITLE_BYTES,
+                    false,
+                )?)
+            };
             let actions = parse_panel_actions(table.get("actions").unwrap_or(Value::Nil))?;
             let lines_value: Value = table.get("lines").unwrap_or(Value::Nil);
             let lines = if matches!(lines_value, Value::Nil) {
@@ -2087,12 +2264,17 @@ fn parse_panel_actions(value: Value) -> Result<Vec<PanelAction>, String> {
         let Value::Table(action) = value else {
             return Err("panel actions must be tables".to_string());
         };
-        let label: String = action
-            .get("label")
+        let label_value = action
+            .get::<Value>("label")
             .map_err(|error| format!("panel action label: {error}"))?;
-        if label.is_empty() || label.len() > MAX_PANEL_ACTION_LABEL_BYTES {
-            return Err("panel action label is empty or too long".to_string());
-        }
+        let label_i18n = action.get::<Value>("label_i18n").unwrap_or(Value::Nil);
+        let label = parse_localized_field(
+            label_value,
+            label_i18n,
+            "panel action label",
+            MAX_PANEL_ACTION_LABEL_BYTES,
+            true,
+        )?;
         // Unlike the line path (which treats a missing/nil command as "plain
         // line"), an action without a readable command is a programming
         // error: propagate read failures instead of swallowing them.
@@ -2635,7 +2817,10 @@ mod tests {
         assert!(call.is_ok(), "{:?}", call.error);
         let panel = runtime.call_panel("list", input(&manifest, dir.path()));
         let panel = panel.value.unwrap();
-        assert_eq!(panel.title.as_deref(), Some("Demo"));
+        assert_eq!(
+            panel.title.as_ref().map(|title| title.resolve("en")),
+            Some("Demo")
+        );
         assert_eq!(panel.lines.len(), 2);
         assert_eq!(
             panel.lines[1].command,
@@ -2645,7 +2830,7 @@ mod tests {
             })
         );
         assert_eq!(panel.actions.len(), 2);
-        assert_eq!(panel.actions[0].label, "Refresh");
+        assert_eq!(panel.actions[0].label.resolve("en"), "Refresh");
         assert_eq!(
             panel.actions[1].command,
             PanelCommand {
@@ -2665,6 +2850,93 @@ mod tests {
         );
         assert!(call.is_ok(), "{:?}", call.error);
         assert_eq!(call.output.actions, vec![HostAction::Notify("7".into())]);
+    }
+
+    #[test]
+    fn panel_titles_and_actions_accept_additive_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        title = "Preview",
+                        title_i18n = { ["zh-CN"] = "预览" },
+                        lines = { "one" },
+                        actions = {
+                            {
+                                label = "Fold All",
+                                label_i18n = { ["zh-CN"] = "全部折叠" },
+                                command = { id = "test.run" },
+                            },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.set_locale("zh-CN");
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(panel.title.as_ref().unwrap().resolve("zh-CN"), "预览");
+        assert_eq!(panel.title.as_ref().unwrap().resolve("en"), "Preview");
+        assert_eq!(panel.actions[0].label.resolve("zh-CN"), "全部折叠");
+        assert_eq!(panel.actions[0].label.resolve("en"), "Fold All");
+    }
+
+    #[test]
+    fn panel_titles_and_actions_accept_inline_locale_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                list = function(ctx)
+                    return {
+                        title = { en = "Preview", ["zh-CN"] = "预览" },
+                        lines = { "one" },
+                        actions = {
+                            {
+                                label = { en = "Fold All", ["zh-CN"] = "全部折叠" },
+                                command = { id = "test.run" },
+                            },
+                        },
+                    }
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.set_locale("zh-CN");
+        let panel = runtime.call_panel("list", input(&manifest, dir.path()));
+        let panel = panel.value.unwrap();
+        assert_eq!(panel.title.unwrap().resolve("zh-CN"), "预览");
+        assert_eq!(panel.actions[0].label.resolve("zh-CN"), "全部折叠");
+    }
+
+    #[test]
+    fn luban_i18n_reports_the_host_locale_and_picks_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_plugin(
+            dir.path(),
+            r#"return {
+                run = function(ctx)
+                    luban.notify(
+                        luban.i18n.locale() .. ":" ..
+                        luban.i18n.pick({ en = "Hello", ["zh-CN"] = "你好" })
+                    )
+                end
+            }"#,
+        );
+        let mut runtime =
+            PluginRuntime::new(&manifest, dir.path(), manifest.permissions()).unwrap();
+        runtime.set_locale("zh-CN");
+        let call = runtime.call_command("run", "test.run", None, input(&manifest, dir.path()));
+        assert!(call.is_ok(), "{:?}", call.error);
+        assert_eq!(
+            call.output.actions,
+            vec![HostAction::Notify("zh-CN:你好".into())]
+        );
     }
 
     #[test]
