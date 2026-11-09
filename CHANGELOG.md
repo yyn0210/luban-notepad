@@ -4,6 +4,8 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+## [1.0.0-preview.20] — 2026-11-09
+
 ### 新增
 
 - 插件国际化：清单新增可选 `localizations`（按语言标签键控插件名称、描述、
