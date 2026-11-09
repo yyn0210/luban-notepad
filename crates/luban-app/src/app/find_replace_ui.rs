@@ -50,7 +50,6 @@ impl LubanApp {
     }
     pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.find.open = true;
-        self.find.show_replace = replace;
         self.find.dirty = true;
         if self.find.in_selection && self.find.scope.is_none() {
             let (a, b) = self.active_selection();
@@ -58,16 +57,31 @@ impl LubanApp {
                 self.find.scope = Some((a, b));
             }
         }
-        self.find
-            .query
-            .update(cx, |state, cx| state.focus(window, cx));
-        cx.notify();
+        self.switch_find_tab(
+            if replace {
+                crate::find::FindTab::Replace
+            } else {
+                crate::find::FindTab::Find
+            },
+            window,
+            cx,
+        );
     }
     pub fn find_next(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // "Find Next" follows the Backward direction checkbox; "Find Previous"
+        // always goes backward. F3 / Shift+F3 keep working from the editor.
+        let forward = if forward { !self.find.backward } else { false };
         if self.active_doc().is_some_and(Document::is_huge) {
             self.huge_find_next(forward, window, cx);
             return;
         }
+        let query_was_focused = self.find.query.read(cx).focus_handle(cx).is_focused(window);
+        let replacement_was_focused = self
+            .find
+            .replacement
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
         self.sync_active(window, cx);
         let query = self.find.query_text(cx);
         if query.is_empty() {
@@ -137,6 +151,7 @@ impl LubanApp {
         self.release_active_text();
         match found {
             Some(matched) => {
+                self.find.status_sticky = false;
                 if large {
                     self.find.current = None;
                     self.find.status = tr("find.match_found");
@@ -159,10 +174,22 @@ impl LubanApp {
                 self.find.generation = self.find.generation.wrapping_add(1);
                 self.select_char_range(matched.start, matched.end, window, cx);
                 self.focus_editor = true;
+                // Keep the modeless window usable for repeated Enter/F3 while
+                // still revealing the match in the editor.
+                if query_was_focused {
+                    self.find
+                        .query
+                        .update(cx, |state, cx| state.focus(window, cx));
+                } else if replacement_was_focused {
+                    self.find
+                        .replacement
+                        .update(cx, |state, cx| state.focus(window, cx));
+                }
                 self.record_navigation(cx);
                 cx.notify();
             }
             None => {
+                self.find.status_sticky = false;
                 self.find.status = tr("find.no_matches");
                 cx.notify();
             }
@@ -173,6 +200,12 @@ impl LubanApp {
             self.huge_replace_one(window, cx);
             return;
         }
+        let replacement_was_focused = self
+            .find
+            .replacement
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
         self.sync_active(window, cx);
         let query = self.find.query_text(cx);
         let replacement = self.find.replacement_text(cx);
@@ -248,6 +281,12 @@ impl LubanApp {
             self.replace_document_text(new_text, new_cursor, new_cursor, window, cx);
         }
         self.find.status = tr("find.replaced_one");
+        self.find.status_sticky = true;
+        if replacement_was_focused {
+            self.find
+                .replacement
+                .update(cx, |state, cx| state.focus(window, cx));
+        }
     }
     /// Apply small targeted replacements directly to a large editor buffer.
     /// Edits run back to front so earlier character positions stay valid.
@@ -299,58 +338,13 @@ impl LubanApp {
         tab.needs_sync = false;
         new_total
     }
+    /// Replace all matches in the active document. The Replace tab shows a
+    /// live before/after list, so the edit applies immediately like Notepad--
+    /// and remains undoable through the editor history.
     pub fn replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_doc().is_some_and(Document::is_huge) {
-            self.huge_replace_all(window, cx);
-            return;
-        }
-        self.sync_active(window, cx);
-        let query = self.find.query_text(cx);
-        let replacement = self.find.replacement_text(cx);
-        if query.is_empty() {
-            return;
-        }
-        self.settings.record_search(&query);
-        self.settings.record_replacement(&replacement);
-        self.commit_settings();
-        if !self.ensure_active_text(cx) {
-            return;
-        }
-        let preview = {
-            let text = self
-                .tabs
-                .get(self.active)
-                .map(|tab| tab.doc.text.as_str())
-                .unwrap_or("");
-            self.find
-                .engine(&query)
-                .preview_replace(text, &replacement, self.find.scope, 5)
-        };
-        self.release_active_text();
-        match preview {
-            Ok(preview) => {
-                self.replace_preview = Some(ReplacePreviewState { preview });
-                cx.notify();
-            }
-            Err(err) => {
-                self.find.error = Some(err);
-                cx.notify();
-            }
-        }
-    }
-    pub(super) fn confirm_replace_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let empty = self
-            .replace_preview
-            .as_ref()
-            .is_some_and(|state| state.preview.count == 0);
-        self.replace_preview = None;
-        if empty {
-            cx.notify();
-            return;
-        }
         self.apply_replace_all(window, cx);
     }
-    fn apply_replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_doc().is_some_and(Document::is_huge) {
             self.huge_replace_all(window, cx);
             return;
@@ -387,6 +381,7 @@ impl LubanApp {
             if edits.is_empty() {
                 self.release_active_text();
                 self.find.status = tr_args("find.replaced_other", &[("count", "0".to_string())]);
+                self.find.status_sticky = true;
                 cx.notify();
                 return;
             }
@@ -394,6 +389,7 @@ impl LubanApp {
             self.release_active_text();
             self.apply_large_edits(&edits, cursor, old_total, window, cx);
             self.find.status = tr_args("find.replaced_other", &[("count", count.to_string())]);
+            self.find.status_sticky = true;
             cx.notify();
             return;
         }
@@ -417,6 +413,7 @@ impl LubanApp {
                 self.find.dirty = true;
                 self.replace_document_text(new_text, cursor, cursor, window, cx);
                 self.find.status = tr_args("find.replaced_other", &[("count", count.to_string())]);
+                self.find.status_sticky = true;
                 cx.notify();
             }
             Err(err) => {
@@ -426,16 +423,87 @@ impl LubanApp {
             }
         }
     }
+
+    /// Replace every match in every editable open document, like Notepad--'s
+    /// "Replace All in All Opened Documents".
+    pub(super) fn replace_in_open_documents(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_active(window, cx);
+        let query = self.find.query_text(cx);
+        let replacement = self.find.replacement_text(cx);
+        if query.is_empty() {
+            self.find.status = tr("find.empty_query");
+            cx.notify();
+            return;
+        }
+        self.settings.record_search(&query);
+        self.settings.record_replacement(&replacement);
+        self.commit_settings();
+        let engine = self.find.engine(&query);
+        if let Some(error) = engine.error() {
+            self.find.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let mut jobs: Vec<(usize, String)> = Vec::new();
+        let mut undo = ReplaceUndo::default();
+        let mut total = 0usize;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.doc.read_only
+                || tab.doc.is_huge()
+                || tab.large_file
+                || tab.doc.is_non_text()
+                || tab.doc.partial_range().is_some()
+            {
+                continue;
+            }
+            let Ok((new_text, count)) = engine.replace_all(&tab.doc.text, &replacement, None)
+            else {
+                continue;
+            };
+            if count == 0 {
+                continue;
+            }
+            undo.entries.push(UndoEntry {
+                tab_id: Some(tab.id),
+                path: tab.doc.path.clone(),
+                text: tab.doc.text.clone(),
+                modified: tab.doc.is_modified(),
+                cursor: tab.doc.cursor,
+                anchor: tab.doc.anchor,
+                was_open: true,
+            });
+            jobs.push((index, new_text));
+            total += count;
+        }
+        let files = jobs.len();
+        for (index, new_text) in jobs {
+            self.apply_replacement_to_tab(index, new_text, window, cx);
+        }
+        self.replace_state.undo = Some(undo);
+        self.find.dirty = true;
+        self.find.status = if total == 0 {
+            tr("find.no_matches")
+        } else {
+            tr_args(
+                "find.replaced_open_docs",
+                &[("files", files.to_string()), ("total", total.to_string())],
+            )
+        };
+        self.find.status_sticky = true;
+        cx.notify();
+    }
     pub fn open_workspace_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_in_files.workspace = !self.workspace_roots.is_empty();
         self.find_in_files.show_replace = true;
         self.find_in_files.respect_gitignore = self.settings.respect_gitignore;
-        self.find_in_files.open = true;
+        self.find.open = true;
+        self.switch_find_tab(crate::find::FindTab::FindInFiles, window, cx);
         self.find_in_files
             .replacement
-            .update(cx, |input, cx| input.focus(window, cx));
-        self.find_in_files
-            .query
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
@@ -885,7 +953,7 @@ impl LubanApp {
         cx.notify();
     }
     pub fn open_find_in_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.find_in_files.open = true;
+        self.find.open = true;
         self.find_in_files.respect_gitignore = self.settings.respect_gitignore;
         if self.find_in_files.folder.read(cx).value().is_empty() {
             let folder = self
@@ -904,10 +972,7 @@ impl LubanApp {
                 .folder
                 .update(cx, |state, cx| state.set_value(value, window, cx));
         }
-        self.find_in_files
-            .query
-            .update(cx, |state, cx| state.focus(window, cx));
-        cx.notify();
+        self.switch_find_tab(crate::find::FindTab::FindInFiles, window, cx);
     }
     pub fn start_find_in_files(&mut self, cx: &mut Context<Self>) {
         let query = self.find_in_files.query_text(cx);
@@ -1160,7 +1225,7 @@ impl LubanApp {
             self.find.generation = self.find.generation.wrapping_add(1);
             if query.is_empty() {
                 self.find.status.clear();
-            } else {
+            } else if !self.find.status_sticky {
                 self.find.status = tr("find.large_file_hint");
             }
             return;
@@ -1173,458 +1238,7 @@ impl LubanApp {
         self.find.refresh(text, &query);
         self.find.dirty = false;
     }
-    pub(super) fn render_find_bar(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let weak = cx.weak_entity();
-        let query_input = self.find.query.clone();
-        let replacement_input = self.find.replacement.clone();
-        let error = self.find.error.clone();
-        let status = self.find.status.clone();
-        let show_replace = self.find.show_replace;
-        let weak_prev = weak.clone();
-        let weak_next = weak.clone();
-        let weak_all_find = weak.clone();
-        let weak_mark_all = weak.clone();
-        let weak_close = weak.clone();
-        let mut bar = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(cx.theme().colors.border)
-            .bg(cx.theme().colors.secondary)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(Input::new(&query_input).w_full().h(px(28.))),
-                    )
-                    .child(
-                        Button::new("find-prev")
-                            .label(tr("find.previous"))
-                            .ghost()
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_prev
-                                    .update(cx, |this, cx| this.find_next(false, window, cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("find-next")
-                            .label(tr("find.next"))
-                            .ghost()
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_next
-                                    .update(cx, |this, cx| this.find_next(true, window, cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("find-all")
-                            .label(tr("find.find_all"))
-                            .ghost()
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_all_find.update(cx, |this, cx| {
-                                    if this.active_doc().is_some_and(Document::is_huge) {
-                                        this.huge_find_all(window, cx);
-                                    } else {
-                                        let query = this.find.query_text(cx);
-                                        if this.ensure_active_text(cx) {
-                                            let text = std::mem::take(
-                                                &mut this.tabs[this.active].doc.text,
-                                            );
-                                            this.find.refresh(&text, &query);
-                                            this.tabs[this.active].doc.text = text;
-                                            this.release_active_text();
-                                        }
-                                        this.find.dirty = false;
-                                        cx.notify();
-                                    }
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("find-mark-all")
-                            .label(tr("find.mark_all"))
-                            .ghost()
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_mark_all.update(cx, |this, cx| {
-                                    this.mark_find_all(window, cx);
-                                });
-                            }),
-                    )
-                    .child({
-                        let weak_history = weak.clone();
-                        let query = query_input.clone();
-                        let history = self.settings.search_history.clone();
-                        Button::new("find-history")
-                            .label(tr("find.history"))
-                            .ghost()
-                            .compact()
-                            .dropdown_menu(move |mut menu, window, _cx| {
-                                if history.is_empty() {
-                                    menu = menu.item(
-                                        PopupMenuItem::new(tr("find.no_history")).disabled(true),
-                                    );
-                                }
-                                for entry in &history {
-                                    let value = entry.clone();
-                                    let query = query.clone();
-                                    let weak = weak_history.clone();
-                                    menu = menu.item(PopupMenuItem::new(entry.clone()).on_click(
-                                        move |_, window, cx| {
-                                            let value = value.clone();
-                                            let _ = weak.update(cx, |this, cx| {
-                                                query.update(cx, |input, cx| {
-                                                    input.set_value(value, window, cx)
-                                                });
-                                                this.find.dirty = true;
-                                                cx.notify();
-                                            });
-                                        },
-                                    ));
-                                }
-                                let weak_clear = weak_history.clone();
-                                menu = menu.separator().item(
-                                    PopupMenuItem::new(tr("find.clear_history")).on_click(
-                                        move |_, _, cx| {
-                                            let _ = weak_clear.update(cx, |this, cx| {
-                                                this.clear_search_history(cx);
-                                            });
-                                        },
-                                    ),
-                                );
-                                Self::fit_menu(menu, window)
-                            })
-                    })
-                    .child(
-                        Button::new("find-close")
-                            .label(tr("common.close"))
-                            .ghost()
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_close.update(cx, |this, cx| {
-                                    this.find.open = false;
-                                    this.cancel_huge_search();
-                                    this.find.clear();
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        Checkbox::new("find-case")
-                            .label(tr("find.match_case"))
-                            .checked(self.find.match_case)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find.match_case = *checked;
-                                this.find.dirty = true;
-                                this.find.scope = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("find-word")
-                            .label(tr("find.whole_word"))
-                            .checked(self.find.whole_word)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find.whole_word = *checked;
-                                this.find.dirty = true;
-                                this.find.scope = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("find-regex")
-                            .label(tr("find.regex"))
-                            .checked(self.find.regex)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find.regex = *checked;
-                                this.find.dirty = true;
-                                this.find.scope = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("find-enhanced-regex")
-                            .label(tr("find.enhanced_regex"))
-                            .checked(self.find.enhanced_regex)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find.enhanced_regex = *checked;
-                                this.find.dirty = true;
-                                this.find.scope = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("find-dotall")
-                            .label(tr("find.dot_newline"))
-                            .checked(self.find.dot_matches_newline)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find.dot_matches_newline = *checked;
-                                this.find.dirty = true;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("find-sel")
-                            .label(tr("find.in_selection"))
-                            .checked(self.find.in_selection)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.find.in_selection = *checked;
-                                this.find.scope = if *checked {
-                                    let (a, b) = this.active_selection();
-                                    (a != b).then_some((a, b))
-                                } else {
-                                    None
-                                };
-                                this.find.dirty = true;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        if show_replace {
-            let weak_replace = weak.clone();
-            let weak_all = weak.clone();
-            bar = bar.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(Input::new(&replacement_input).w_full().h(px(28.))),
-                    )
-                    .child({
-                        let weak_history = weak.clone();
-                        let replacement = replacement_input.clone();
-                        let history = self.settings.replace_history.clone();
-                        Button::new("replace-history")
-                            .label(tr("find.history"))
-                            .ghost()
-                            .compact()
-                            .dropdown_menu(move |mut menu, window, _cx| {
-                                if history.is_empty() {
-                                    menu = menu.item(
-                                        PopupMenuItem::new(tr("find.no_history")).disabled(true),
-                                    );
-                                }
-                                for entry in &history {
-                                    let value = entry.clone();
-                                    let replacement = replacement.clone();
-                                    let weak = weak_history.clone();
-                                    menu = menu.item(PopupMenuItem::new(entry.clone()).on_click(
-                                        move |_, window, cx| {
-                                            let value = value.clone();
-                                            let _ = weak.update(cx, |this, cx| {
-                                                replacement.update(cx, |input, cx| {
-                                                    input.set_value(value, window, cx)
-                                                });
-                                                this.find.dirty = true;
-                                                cx.notify();
-                                            });
-                                        },
-                                    ));
-                                }
-                                let weak_clear = weak_history.clone();
-                                menu = menu.separator().item(
-                                    PopupMenuItem::new(tr("find.clear_history")).on_click(
-                                        move |_, _, cx| {
-                                            let _ = weak_clear.update(cx, |this, cx| {
-                                                this.clear_search_history(cx);
-                                            });
-                                        },
-                                    ),
-                                );
-                                Self::fit_menu(menu, window)
-                            })
-                    })
-                    .child(
-                        Button::new("replace-one")
-                            .label(tr("find.replace"))
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ = weak_replace
-                                    .update(cx, |this, cx| this.replace_one(window, cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("replace-all")
-                            .label(tr("find.replace_all"))
-                            .compact()
-                            .on_click(move |_, window, cx| {
-                                let _ =
-                                    weak_all.update(cx, |this, cx| this.replace_all(window, cx));
-                            }),
-                    ),
-            );
-        }
-        if !self.find.huge_results.is_empty() {
-            let results = self.find.huge_results.clone();
-            let mut list = div()
-                .id("find-huge-results")
-                .max_h(px(150.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .text_xs();
-            for (index, hit) in results.iter().take(200).enumerate() {
-                let hit = *hit;
-                let weak_row = weak.clone();
-                list = list.child(
-                    div()
-                        .id(("find-huge-result", index))
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(cx.theme().colors.secondary))
-                        .child(tr_args(
-                            "find.huge_result",
-                            &[("line", hit.line.to_string())],
-                        ))
-                        .on_click(move |_, window, cx| {
-                            let _ = weak_row.update(cx, |this, cx| {
-                                this.huge_find_jump(hit, window, cx);
-                            });
-                        }),
-                );
-            }
-            bar = bar.child(list);
-        }
-        if let Some(error) = error {
-            bar = bar.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().colors.danger)
-                    .child(error),
-            );
-        } else if !status.is_empty() {
-            bar = bar.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().colors.muted_foreground)
-                    .child(status),
-            );
-        }
-        let _ = window;
-        bar.into_any_element()
-    }
-    pub(super) fn render_replace_preview(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(state) = &self.replace_preview else {
-            return div().into_any_element();
-        };
-        let count = state.preview.count;
-        let mut samples = Vec::new();
-        for (before, after) in &state.preview.samples {
-            samples.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().colors.border)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().colors.muted_foreground)
-                            .child(textutil::preview(before, 160)),
-                    )
-                    .child(div().text_sm().child(textutil::preview(after, 160)))
-                    .into_any_element(),
-            );
-        }
-        let content = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_5()
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(tr("find.preview_title")),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().colors.muted_foreground)
-                    .child(tr_args(
-                        "find.preview_count",
-                        &[("count", count.to_string())],
-                    )),
-            )
-            .child(
-                div()
-                    .id("replace-preview-list")
-                    .flex()
-                    .flex_col()
-                    .max_h(px(260.))
-                    .overflow_y_scroll()
-                    .children(samples),
-            )
-            .child(if count == 0 {
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(
-                        Button::new("replace-preview-cancel")
-                            .label(tr("common.close"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.replace_preview = None;
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("replace-preview-cancel")
-                            .label(tr("common.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.replace_preview = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("replace-preview-confirm")
-                            .label(tr("find.replace_all"))
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.confirm_replace_preview(window, cx);
-                            })),
-                    )
-                    .into_any_element()
-            })
-            .into_any_element();
-        self.overlay_card(520.0, None, cx, content)
-    }
-    pub(super) fn render_find_in_files(
+    pub(super) fn render_find_in_files_body(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1655,7 +1269,6 @@ impl LubanApp {
         let count = self.find_in_files.results.len();
         let weak_search = weak.clone();
         let weak_cancel = weak.clone();
-        let weak_close = weak.clone();
         let weak_settings_filter = weak.clone();
         let weak_toggle_group = weak.clone();
         let weak_result = weak.clone();
@@ -1691,7 +1304,7 @@ impl LubanApp {
                             .flex_1()
                             .min_w(px(0.))
                             .truncate()
-                            .text_sm()
+                            .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .child(group_relative),
                     )
@@ -1738,7 +1351,7 @@ impl LubanApp {
                         )
                         .child(
                             div()
-                                .text_sm()
+                                .text_xs()
                                 .child(textutil::preview(&matched.line_text, 300)),
                         )
                         .on_click(move |_, window, cx| {
@@ -1787,6 +1400,7 @@ impl LubanApp {
                 Checkbox::new("ff-workspace")
                     .label(tr("ff.workspace"))
                     .checked(workspace && has_workspace)
+                    .xsmall()
                     .disabled(!has_workspace)
                     .on_click(cx.listener(|this, checked, _, cx| {
                         this.find_in_files.workspace = *checked;
@@ -1800,6 +1414,7 @@ impl LubanApp {
                 Checkbox::new("ff-gitignore")
                     .label(tr("ff.respect_gitignore"))
                     .checked(respect_gitignore)
+                    .xsmall()
                     .on_click(cx.listener(|this, checked, _, cx| {
                         this.find_in_files.respect_gitignore = *checked;
                         cx.notify();
@@ -1808,7 +1423,7 @@ impl LubanApp {
             .child(
                 Button::new("ff-use-settings")
                     .label(tr("ff.use_workspace_filter"))
-                    .compact()
+                    .xsmall()
                     .on_click(move |_, window, cx| {
                         let _ = weak_settings_filter.update(cx, |this, cx| {
                             let include = this.settings.search_include.clone();
@@ -1844,6 +1459,7 @@ impl LubanApp {
                 Checkbox::new(id)
                     .label(tr(label_key))
                     .checked(checked)
+                    .xsmall()
                     .on_click(cx.listener(move |this, checked, _, cx| {
                         match field {
                             0 => this.find_in_files.match_case = *checked,
@@ -1866,7 +1482,7 @@ impl LubanApp {
                 Button::new("ff-search")
                     .label(tr(if running { "ff.searching" } else { "ff.search" }))
                     .primary()
-                    .compact()
+                    .small()
                     .on_click(move |_, _, cx| {
                         let _ = weak_search.update(cx, |this, cx| this.start_find_in_files(cx));
                     }),
@@ -1874,33 +1490,42 @@ impl LubanApp {
             .child(
                 Button::new("ff-cancel")
                     .label(tr("common.cancel"))
-                    .compact()
+                    .small()
                     .on_click(move |_, _, cx| {
                         let _ = weak_cancel.update(cx, |this, cx| this.cancel_find_in_files(cx));
                     }),
-            );
+            )
+            .child({
+                let weak_close = weak.clone();
+                Button::new("ff-close")
+                    .label(tr("common.close"))
+                    .small()
+                    .on_click(move |_, window, cx| {
+                        let _ = weak_close.update(cx, |this, cx| {
+                            this.close_find_window(window, cx);
+                        });
+                    })
+            });
         let mut replace_row = div().flex().items_center().gap_2();
-        replace_row = replace_row
-            .child(Input::new(&replacement).h(px(30.)))
-            .child(
-                Button::new("ff-toggle-replace")
-                    .label(tr(if show_replace {
-                        "ff.hide_replace"
-                    } else {
-                        "ff.show_replace"
-                    }))
-                    .compact()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.find_in_files.show_replace = !this.find_in_files.show_replace;
-                        cx.notify();
-                    })),
-            );
+        replace_row = replace_row.child(Input::new(&replacement).small()).child(
+            Button::new("ff-toggle-replace")
+                .label(tr(if show_replace {
+                    "ff.hide_replace"
+                } else {
+                    "ff.show_replace"
+                }))
+                .xsmall()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.find_in_files.show_replace = !this.find_in_files.show_replace;
+                    cx.notify();
+                })),
+        );
         if show_replace {
             replace_row = replace_row
                 .child(
                     Button::new("ff-preview")
                         .label(tr("ff.preview_replace"))
-                        .compact()
+                        .xsmall()
                         .on_click(move |_, window, cx| {
                             let _ = weak_preview.update(cx, |this, cx| {
                                 this.start_workspace_replace_preview(window, cx);
@@ -1910,7 +1535,7 @@ impl LubanApp {
                 .child(
                     Button::new("ff-replace-all")
                         .label(tr("ff.replace_all"))
-                        .compact()
+                        .xsmall()
                         .on_click(move |_, window, cx| {
                             let _ = weak_replace.update(cx, |this, cx| {
                                 this.confirm_workspace_replace(window, cx);
@@ -1920,7 +1545,7 @@ impl LubanApp {
                 .child(
                     Button::new("ff-undo-replace")
                         .label(tr("ff.undo_replace"))
-                        .compact()
+                        .xsmall()
                         .disabled(!has_undo || replacing)
                         .on_click(move |_, window, cx| {
                             let _ = weak_undo.update(cx, |this, cx| {
@@ -1930,59 +1555,36 @@ impl LubanApp {
                 );
         }
         let content = div()
+            .size_full()
             .flex()
             .flex_col()
             .gap_2()
-            .p_4()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(tr("ff.title")),
-                    )
-                    .child(
-                        Button::new("ff-close")
-                            .label(tr("common.close"))
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_close.update(cx, |this, cx| {
-                                    this.cancel_find_in_files(cx);
-                                    this.find_in_files.open = false;
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .child(Input::new(&query).h(px(30.)))
+            .p_3()
+            .child(Input::new(&query).small())
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(Input::new(&include).h(px(30.))))
-                    .child(div().flex_1().child(Input::new(&exclude).h(px(30.)))),
+                    .child(div().flex_1().child(Input::new(&include).small()))
+                    .child(div().flex_1().child(Input::new(&exclude).small())),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(Input::new(&folder).h(px(30.))))
+                    .child(div().flex_1().child(Input::new(&folder).small()))
                     .child(
                         Button::new("ff-browse")
                             .label(tr("ff.browse"))
-                            .compact()
+                            .xsmall()
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.choose_find_in_files_folder(window, cx);
                             })),
                     ),
             )
-            .child(Input::new(&masks).h(px(30.)))
+            .child(Input::new(&masks).small())
             .child(options)
             .child(replace_row)
             .when(error.is_some(), |this| {
@@ -2045,7 +1647,7 @@ impl LubanApp {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .max_h(px(180.))
+                        .max_h(px(140.))
                         .overflow_y_scroll()
                         .border_1()
                         .border_color(cx.theme().colors.border)
@@ -2068,12 +1670,12 @@ impl LubanApp {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(0.))
+                    .min_h(px(70.))
                     .overflow_y_scroll()
                     .children(result_rows),
             )
             .into_any_element();
         let _ = window;
-        self.overlay_card(860.0, Some(640.0), cx, content)
+        content
     }
 }

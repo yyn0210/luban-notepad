@@ -6,34 +6,151 @@ use std::sync::Arc;
 use gpui_kit::component::input::InputState;
 use gpui_kit::{AppContext as _, Context, Entity, Window};
 use luban_core::search::{Match, SearchEngine, SearchOptions};
+use luban_core::settings::FindWindowPlacement;
 use luban_core::workspace::FileMatch;
 
 use crate::app::LubanApp;
 use crate::i18n::{tr, tr_args};
 
 pub const MAX_HIGHLIGHTS: usize = 20_000;
+/// Upper bound for the search-results list inside the floating window.
+pub const MAX_ALL_RESULTS: usize = 5_000;
+
+/// Pages of the floating find/replace window, mirroring Notepad--.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FindTab {
+    #[default]
+    Find,
+    Replace,
+    FindInFiles,
+    Mark,
+}
+
+impl FindTab {
+    pub const ALL: [FindTab; 4] = [
+        FindTab::Find,
+        FindTab::Replace,
+        FindTab::FindInFiles,
+        FindTab::Mark,
+    ];
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            FindTab::Find => "find.tab.find",
+            FindTab::Replace => "find.tab.replace",
+            FindTab::FindInFiles => "find.tab.in_files",
+            FindTab::Mark => "find.tab.mark",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            FindTab::Find => 0,
+            FindTab::Replace => 1,
+            FindTab::FindInFiles => 2,
+            FindTab::Mark => 3,
+        }
+    }
+}
+
+/// Search mode radio group: Notepad--'s Normal / Regular expression / Extend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Normal,
+    Regex,
+    Extend,
+}
+
+impl SearchMode {
+    pub fn label_key(self) -> &'static str {
+        match self {
+            SearchMode::Normal => "find.mode.normal",
+            SearchMode::Regex => "find.mode.regex",
+            SearchMode::Extend => "find.mode.extend",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            SearchMode::Normal => 0,
+            SearchMode::Regex => 1,
+            SearchMode::Extend => 2,
+        }
+    }
+}
+
+/// One row in the results list of the floating window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FindResultItem {
+    pub matched: Match,
+    pub line: usize,
+    pub column: usize,
+    pub preview: String,
+}
+
+/// Persistent mark-all state for one document. Matches are recomputed from the
+/// query when the document changes so marks follow edits.
+#[derive(Clone, Debug)]
+pub struct MarkHighlight {
+    pub query: String,
+    pub options: SearchOptions,
+    pub matches: Vec<Match>,
+    /// Document revision the matches were computed for.
+    pub revision: u64,
+}
 
 pub struct FindPanel {
     pub open: bool,
-    pub show_replace: bool,
+    pub tab: FindTab,
     pub query: Entity<InputState>,
     pub replacement: Entity<InputState>,
     pub match_case: bool,
     pub whole_word: bool,
     pub regex: bool,
+    /// Notepad-- "Extend" mode: `\n`, `\r`, `\t`, `\0` and `\xHH` are expanded
+    /// in the query before searching.
+    pub extended: bool,
     pub enhanced_regex: bool,
     pub in_selection: bool,
     pub dot_matches_newline: bool,
+    pub backward: bool,
+    pub wrap_around: bool,
     pub matches: Vec<Match>,
     pub current: Option<usize>,
     pub error: Option<String>,
     pub dirty: bool,
+    /// Keep the current status line after a live refresh. Set by replace,
+    /// count, find-all and clipboard actions so their result stays visible
+    /// until the query or options change.
+    pub status_sticky: bool,
     pub scope: Option<(usize, usize)>,
     pub highlighted_revision: u64,
     /// Bumped whenever the match set or current match changes, so decorations
     /// can skip rebuilding on unrelated renders.
     pub generation: u64,
     pub status: String,
+    /// Rows produced by an explicit "Find All in Current Document".
+    pub all_results: Vec<FindResultItem>,
+    pub all_results_limited: bool,
+    /// Floating window geometry in window-relative points.
+    pub window_x: f32,
+    pub window_y: f32,
+    pub window_width: f32,
+    pub window_height: f32,
+    pub window_placed: bool,
+    /// Pointer offset from the window origin while the title bar is dragged.
+    pub drag_offset: Option<(f32, f32)>,
+    /// Pointer origin and size captured when resize starts.
+    pub resize_origin: Option<(f32, f32, f32, f32)>,
+    /// Mark tab: independent query and options, like Notepad--.
+    pub mark_query: Entity<InputState>,
+    pub mark_match_case: bool,
+    pub mark_whole_word: bool,
+    pub mark_regex: bool,
+    pub mark_extended: bool,
+    pub mark_enhanced_regex: bool,
+    pub mark_status: String,
     /// Global matches collected by an explicit Find All on a disk-engine tab.
     pub huge_results: Vec<luban_core::disk_engine::SearchHit>,
     pub huge_limit: usize,
@@ -41,34 +158,91 @@ pub struct FindPanel {
 }
 
 impl FindPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<LubanApp>) -> Self {
+    pub fn new(
+        placement: &FindWindowPlacement,
+        window: &mut Window,
+        cx: &mut Context<LubanApp>,
+    ) -> Self {
         let query =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr("find.query_placeholder")));
         let replacement = cx
             .new(|cx| InputState::new(window, cx).placeholder(tr("find.replacement_placeholder")));
+        let mark_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("find.mark_placeholder")));
         Self {
             open: false,
-            show_replace: false,
+            tab: FindTab::Find,
             query,
             replacement,
             match_case: false,
             whole_word: false,
             regex: false,
+            extended: false,
             enhanced_regex: false,
             in_selection: false,
             dot_matches_newline: false,
+            backward: false,
+            wrap_around: true,
             matches: Vec::new(),
             current: None,
             error: None,
             dirty: true,
+            status_sticky: false,
             scope: None,
             highlighted_revision: u64::MAX,
             generation: 0,
             status: String::new(),
+            all_results: Vec::new(),
+            all_results_limited: false,
+            window_x: placement.x.unwrap_or(0.0),
+            window_y: placement.y.unwrap_or(0.0),
+            window_width: placement.width,
+            window_height: placement.height,
+            window_placed: placement.x.is_some() && placement.y.is_some(),
+            drag_offset: None,
+            resize_origin: None,
+            mark_query,
+            mark_match_case: false,
+            mark_whole_word: false,
+            mark_regex: false,
+            mark_extended: false,
+            mark_enhanced_regex: false,
+            mark_status: String::new(),
             huge_results: Vec::new(),
             huge_limit: 5000,
             huge_truncated: false,
         }
+    }
+
+    pub fn mode(&self) -> SearchMode {
+        if self.extended {
+            SearchMode::Extend
+        } else if self.regex {
+            SearchMode::Regex
+        } else {
+            SearchMode::Normal
+        }
+    }
+
+    /// Switch the search mode, keeping the mode flags mutually consistent.
+    pub fn set_mode(&mut self, mode: SearchMode) {
+        self.regex = mode == SearchMode::Regex;
+        self.extended = mode == SearchMode::Extend;
+    }
+
+    pub fn mark_mode(&self) -> SearchMode {
+        if self.mark_extended {
+            SearchMode::Extend
+        } else if self.mark_regex {
+            SearchMode::Regex
+        } else {
+            SearchMode::Normal
+        }
+    }
+
+    pub fn set_mark_mode(&mut self, mode: SearchMode) {
+        self.mark_regex = mode == SearchMode::Regex;
+        self.mark_extended = mode == SearchMode::Extend;
     }
 
     pub fn options(&self) -> SearchOptions {
@@ -78,8 +252,20 @@ impl FindPanel {
             regex: self.regex,
             enhanced_regex: self.enhanced_regex,
             dot_matches_newline: self.dot_matches_newline,
-            wrap_around: true,
+            wrap_around: self.wrap_around,
             in_selection: self.in_selection,
+        }
+    }
+
+    pub fn mark_options(&self) -> SearchOptions {
+        SearchOptions {
+            match_case: self.mark_match_case,
+            whole_word: self.mark_whole_word,
+            regex: self.mark_regex,
+            enhanced_regex: self.mark_enhanced_regex,
+            dot_matches_newline: false,
+            wrap_around: true,
+            in_selection: false,
         }
     }
 
@@ -91,8 +277,20 @@ impl FindPanel {
         self.replacement.read(cx).value().to_string()
     }
 
+    pub fn mark_query_text(&self, cx: &gpui_kit::App) -> String {
+        self.mark_query.read(cx).value().to_string()
+    }
+
+    fn pattern_for(&self, query: &str, extended: bool) -> String {
+        if extended {
+            luban_core::search::expand_extended(query)
+        } else {
+            query.to_string()
+        }
+    }
+
     pub fn engine(&self, query: &str) -> SearchEngine {
-        SearchEngine::new(query, self.options())
+        SearchEngine::new(self.pattern_for(query, self.extended), self.options())
     }
 
     pub fn effective_scope(
@@ -116,6 +314,8 @@ impl FindPanel {
     pub fn refresh(&mut self, text: &str, query: &str) {
         self.error = None;
         self.generation = self.generation.wrapping_add(1);
+        self.all_results.clear();
+        self.all_results_limited = false;
         if query.is_empty() {
             self.matches.clear();
             self.current = None;
@@ -131,22 +331,24 @@ impl FindPanel {
         }
         self.matches = engine.find_all(text, self.scope, MAX_HIGHLIGHTS);
         self.current = None;
-        self.status = if self.matches.len() >= MAX_HIGHLIGHTS {
-            tr_args(
-                "find.match_count_limited",
-                &[
-                    ("count", self.matches.len().to_string()),
-                    ("first", MAX_HIGHLIGHTS.to_string()),
-                ],
-            )
-        } else if self.matches.len() == 1 {
-            tr("find.match_count.one")
-        } else {
-            tr_args(
-                "find.match_count.other",
-                &[("count", self.matches.len().to_string())],
-            )
-        };
+        if !self.status_sticky {
+            self.status = if self.matches.len() >= MAX_HIGHLIGHTS {
+                tr_args(
+                    "find.match_count_limited",
+                    &[
+                        ("count", self.matches.len().to_string()),
+                        ("first", MAX_HIGHLIGHTS.to_string()),
+                    ],
+                )
+            } else if self.matches.len() == 1 {
+                tr("find.match_count.one")
+            } else {
+                tr_args(
+                    "find.match_count.other",
+                    &[("count", self.matches.len().to_string())],
+                )
+            };
+        }
     }
 
     pub fn replace_all(
@@ -174,11 +376,14 @@ impl FindPanel {
 
     pub fn clear(&mut self) {
         self.matches.clear();
+        self.all_results.clear();
+        self.all_results_limited = false;
         self.huge_results.clear();
         self.huge_truncated = false;
         self.current = None;
         self.error = None;
         self.status.clear();
+        self.status_sticky = false;
         self.scope = None;
         self.highlighted_revision = u64::MAX;
         self.generation = self.generation.wrapping_add(1);

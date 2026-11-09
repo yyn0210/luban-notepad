@@ -442,11 +442,6 @@ impl LubanApp {
             self.snippet_session = None;
         }
         if key == "escape" {
-            if self.replace_preview.is_some() {
-                self.replace_preview = None;
-                cx.notify();
-                return true;
-            }
             if self.column_editor.open {
                 self.column_editor.open = false;
                 self.column_editor.error = None;
@@ -537,19 +532,8 @@ impl LubanApp {
                 self.close_preferences(window, cx);
                 return true;
             }
-            if self.find_in_files.open {
-                self.cancel_find_in_files(cx);
-                self.find_in_files.open = false;
-                self.focus_editor(window, cx);
-                cx.notify();
-                return true;
-            }
             if self.find.open {
-                self.find.open = false;
-                self.cancel_huge_search();
-                self.find.clear();
-                self.focus_editor(window, cx);
-                cx.notify();
+                self.close_find_window(window, cx);
                 return true;
             }
             if self.cancel_huge_opens(cx) {
@@ -559,10 +543,6 @@ impl LubanApp {
         }
 
         if key == "enter" {
-            if self.replace_preview.is_some() {
-                self.confirm_replace_preview(window, cx);
-                return true;
-            }
             if self.sort_dialog.is_some() {
                 self.apply_sort_dialog(window, cx);
                 return true;
@@ -695,6 +675,11 @@ impl LubanApp {
 
         if key == "f3" {
             self.find_next(!shift, window, cx);
+            return true;
+        }
+        // Notepad-- binds Find Previous to F4 in addition to Shift+F3.
+        if key == "f4" {
+            self.find_next(false, window, cx);
             return true;
         }
 

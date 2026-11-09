@@ -40,7 +40,7 @@ use luban_core::large_file::{format_bytes, RangeMode, SizeUnit};
 use luban_core::line_ops::{self, SortMode};
 use luban_core::local_history::{HistoryEntry, HistoryStore};
 use luban_core::macros::SavedMacro;
-use luban_core::search::{ByteMatch, Match, ReplacePreview};
+use luban_core::search::{ByteMatch, Match, SearchOptions};
 use luban_core::session::{GroupSession, Session, SessionTab, SplitLayout, WindowSession};
 use luban_core::settings::{
     LanguageSettings, Settings, ThemeChoice, PLUGIN_PANEL_MAX_WIDTH, PLUGIN_PANEL_MIN_WIDTH,
@@ -68,7 +68,7 @@ use crate::file_picker::{
     PlaceIcon, PlaceSection, PreviewContent, PreviewKind, SortKey,
 };
 use crate::file_watch::{FileWatcher, WatchEventKind};
-use crate::find::{FindInFilesPanel, FindPanel};
+use crate::find::{FindInFilesPanel, FindPanel, MarkHighlight, MAX_HIGHLIGHTS};
 use crate::huge_file::{
     clamp_top_line, diff_bytes, max_top_line, top_line_from_scroll, window_max_top_line,
     HugeFileUi, SaveJob, SearchJob, SearchKind, WindowJump, WindowRequest, WindowTarget,
@@ -292,10 +292,6 @@ struct FilterDialogState {
     error: Option<String>,
 }
 
-struct ReplacePreviewState {
-    preview: ReplacePreview,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BookmarkAction {
     Cut,
@@ -409,7 +405,6 @@ pub struct LubanApp {
     macro_recorded: Vec<String>,
     macro_playback: bool,
     macro_keymap: Vec<(commands::Binding, String)>,
-    replace_preview: Option<ReplacePreviewState>,
     /// Last match end reached by Select Next Occurrence, keyed by needle and tab.
     occurrence_anchor: Option<(String, usize, u64)>,
     sort_dialog: Option<SortDialogState>,
@@ -701,6 +696,7 @@ mod command_ui;
 mod editor_view;
 mod file_picker_ui;
 mod find_replace_ui;
+mod find_window_ui;
 mod huge_file_ui;
 mod menus;
 mod plugin_events;
@@ -782,6 +778,7 @@ impl LubanApp {
         }
 
         let plugin_store_url = settings.plugin_store_url.clone();
+        let find_placement = settings.find_window;
         let mut app = Self {
             settings,
             global_settings,
@@ -813,7 +810,7 @@ impl LubanApp {
             untitled_counter: 0,
             pending_opens: Vec::new(),
             pending_open_at: None,
-            find: FindPanel::new(window, cx),
+            find: FindPanel::new(&find_placement, window, cx),
             find_in_files: FindInFilesPanel::new(window, cx),
             explorer: ExplorerState::new(),
             explorer_focus: cx.focus_handle(),
@@ -854,7 +851,6 @@ impl LubanApp {
             macro_recorded: Vec::new(),
             macro_playback: false,
             macro_keymap: Vec::new(),
-            replace_preview: None,
             occurrence_anchor: None,
             sort_dialog: None,
             filter_dialog: None,
@@ -1110,6 +1106,7 @@ impl LubanApp {
             cx.subscribe(&app.find.query, |this, _, event, cx| match event {
                 InputEvent::Change => {
                     this.find.dirty = true;
+                    this.find.status_sticky = false;
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => {
@@ -1130,6 +1127,20 @@ impl LubanApp {
                 _ => {}
             },
         ));
+        app._subscriptions
+            .push(cx.subscribe(&app.find.mark_query, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.find.mark_status.clear();
+                    cx.notify();
+                }
+            }));
+        app._subscriptions.push(
+            cx.subscribe(&app.find_in_files.query, |this, _, event, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.start_find_in_files(cx);
+                }
+            }),
+        );
         for entity in [
             app.find_in_files.query.clone(),
             app.find_in_files.folder.clone(),
@@ -1623,6 +1634,8 @@ impl LubanApp {
             group: self.active_group,
             bookmarks: BookmarkSet::default(),
             bookmark_revision: 0,
+            mark: None,
+            mark_generation: 0,
             fold_generation: 0,
             needs_sync: false,
             pending_edit: false,
@@ -4781,6 +4794,7 @@ impl LubanApp {
             return;
         };
         let large = self.tabs[index].large_file;
+        self.refresh_mark_highlights(index, cx);
         let key = {
             let tab = &self.tabs[index];
             (
@@ -4790,6 +4804,7 @@ impl LubanApp {
                 self.find.open,
                 self.settings.highlight_matching_brackets,
                 large,
+                tab.mark_generation,
             )
         };
         if self.tabs[index].decorations_key == Some(key) {
@@ -4798,6 +4813,17 @@ impl LubanApp {
         let current = self.find.current;
         let matches = if self.find.open && !large {
             self.find.matches.clone()
+        } else {
+            Vec::new()
+        };
+        // Marks stay visible after the floating window is closed, like
+        // Notepad--'s Mark tab. Find matches paint on top of them.
+        let marks = if !large {
+            self.tabs[index]
+                .mark
+                .as_ref()
+                .map(|mark| mark.matches.clone())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -4813,6 +4839,18 @@ impl LubanApp {
             let state = editor.read(cx);
             let rope = state.text();
             let total = rope.len_chars();
+            for matched in &marks {
+                let b0 = rope.char_to_byte_idx(matched.start.min(total));
+                let b1 = rope.char_to_byte_idx(matched.end.min(total));
+                if b0 == b1 {
+                    continue;
+                }
+                decorations.push(
+                    RangeDecoration::new(b0..b1)
+                        .with_style(RangeDecorationStyle::Fill)
+                        .with_color(rgba(0x3FB95044).into()),
+                );
+            }
             for (match_index, matched) in matches.iter().enumerate() {
                 let b0 = rope.char_to_byte_idx(matched.start.min(total));
                 let b1 = rope.char_to_byte_idx(matched.end.min(total));
@@ -4845,6 +4883,43 @@ impl LubanApp {
         tab.decorations_key = Some(key);
         tab.highlighted_revision = tab.doc.revision();
         self.refresh_bracket_decorations(index, cx);
+    }
+
+    /// Recompute a document's persistent marks when its text changed. Marks
+    /// keep following edits instead of pointing at stale character offsets.
+    fn refresh_mark_highlights(&mut self, index: usize, _cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let Some(mark) = &tab.mark else {
+            return;
+        };
+        let revision = tab.doc.revision();
+        if mark.revision == revision {
+            return;
+        }
+        let unsupported = tab.large_file
+            || tab.doc.is_huge()
+            || tab.doc.is_non_text()
+            || tab.doc.partial_range().is_some();
+        let matches = if unsupported {
+            Vec::new()
+        } else {
+            let engine = luban_core::search::SearchEngine::new(
+                mark.query.clone(),
+                SearchOptions {
+                    in_selection: false,
+                    ..mark.options
+                },
+            );
+            engine.find_all(&tab.doc.text, None, MAX_HIGHLIGHTS)
+        };
+        if let Some(tab) = self.tabs.get_mut(index) {
+            if let Some(mark) = tab.mark.as_mut() {
+                mark.matches = matches;
+                mark.revision = revision;
+            }
+        }
     }
 
     /// Recolour paired brackets when the document or the setting changed.
@@ -6980,8 +7055,8 @@ impl LubanApp {
         if self.plugin_panel.is_some() {
             overlays.push(self.render_plugin_panel(window, cx));
         }
-        if self.find_in_files.open {
-            overlays.push(self.render_find_in_files(window, cx));
+        if self.find.open {
+            overlays.push(self.render_find_window(window, cx));
         }
         if self.preferences.open {
             overlays.push(self.render_preferences(window, cx));
@@ -7027,9 +7102,6 @@ impl LubanApp {
         }
         if self.overwrite_save.is_some() {
             overlays.push(self.render_overwrite_confirm(window, cx));
-        }
-        if self.replace_preview.is_some() {
-            overlays.push(self.render_replace_preview(cx));
         }
         if self.sort_dialog.is_some() {
             overlays.push(self.render_sort_dialog(cx));
@@ -7612,7 +7684,6 @@ impl Render for LubanApp {
         let show_toolbar = self.settings.show_toolbar;
         let show_status = self.settings.show_status_bar;
         let show_explorer = self.settings.show_file_explorer;
-        let show_find = self.find.open;
         let overlays = self.render_overlays(window, cx);
 
         // Draw our own title bar unless the platform really provides server-side
@@ -7633,11 +7704,6 @@ impl Render for LubanApp {
         };
         let panes = self.render_panes(window, cx);
         let banner = self.render_external_banner(cx);
-        let find_bar = if show_find {
-            Some(self.render_find_bar(window, cx))
-        } else {
-            None
-        };
         let status_bar = if show_status {
             Some(self.render_status_bar(cx))
         } else {
@@ -7707,9 +7773,6 @@ impl Render for LubanApp {
                 .child(panes)
                 .children(large_file_panel),
         );
-        if let Some(find_bar) = find_bar {
-            root = root.child(find_bar);
-        }
         if let Some(status_bar) = status_bar {
             root = root.child(status_bar);
         }

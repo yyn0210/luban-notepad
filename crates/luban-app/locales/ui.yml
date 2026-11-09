@@ -334,6 +334,147 @@ find.match_count_limited:
 find.empty_query:
   en: "search text is empty"
   zh-CN: "搜索内容为空"
+find.window_title:
+  en: "Find and Replace"
+  zh-CN: "查找和替换"
+find.tab.find:
+  en: "Find"
+  zh-CN: "查找"
+find.tab.replace:
+  en: "Replace"
+  zh-CN: "替换"
+find.tab.in_files:
+  en: "Find in Files"
+  zh-CN: "在文件中查找"
+find.tab.mark:
+  en: "Mark"
+  zh-CN: "标记"
+find.find_what:
+  en: "Find what"
+  zh-CN: "查找内容"
+find.replace_with:
+  en: "Replace with"
+  zh-CN: "替换为"
+find.mark_placeholder:
+  en: "Text to mark"
+  zh-CN: "要标记的内容"
+find.mark_what:
+  en: "Mark what"
+  zh-CN: "标记内容"
+find.backward:
+  en: "Backward direction"
+  zh-CN: "反向查找"
+find.wrap_around:
+  en: "Wrap around"
+  zh-CN: "循环查找"
+find.mode:
+  en: "Search mode"
+  zh-CN: "查找模式"
+find.mode.normal:
+  en: "Normal"
+  zh-CN: "普通"
+find.mode.regex:
+  en: "Regular expression"
+  zh-CN: "正则表达式"
+find.mode.extend:
+  en: "Extend (\\n, \\r, \\t, \\0, \\x...)"
+  zh-CN: "扩展（\\n、\\r、\\t、\\0、\\x…）"
+find.count:
+  en: "Count"
+  zh-CN: "计数"
+find.count_result:
+  en: "%{count} matches"
+  zh-CN: "共 %{count} 处匹配"
+find.find_all_current:
+  en: "Find All in Current Document"
+  zh-CN: "在当前文档中查找全部"
+find.find_all_open:
+  en: "Find All in All Opened Documents"
+  zh-CN: "在所有打开的文档中查找全部"
+find.copy_results:
+  en: "Copy Results"
+  zh-CN: "复制结果"
+find.clear_results:
+  en: "Clear Results"
+  zh-CN: "清除结果"
+find.results_title:
+  en: "Results"
+  zh-CN: "查找结果"
+find.mark_results_title:
+  en: "Marks"
+  zh-CN: "标记结果"
+find.results_empty:
+  en: "Press Find All to list every match here."
+  zh-CN: "点击“在当前文档中查找全部”后，匹配结果会显示在这里。"
+find.results_limited:
+  en: "Showing the first %{count} matches."
+  zh-CN: "仅显示前 %{count} 处匹配。"
+find.results_copied:
+  en: "Copied %{count} results"
+  zh-CN: "已复制 %{count} 条结果"
+find.results_cleared:
+  en: "Results cleared"
+  zh-CN: "已清除结果"
+find.replace_preview_title:
+  en: "Replace preview"
+  zh-CN: "替换预览"
+find.find_next_short:
+  en: "Find Next (F3)"
+  zh-CN: "查找下一个（F3）"
+find.find_prev_short:
+  en: "Find Previous (F4)"
+  zh-CN: "查找上一个（F4）"
+find.mark_bookmark:
+  en: "Mark & Bookmark"
+  zh-CN: "标记并添加书签"
+find.clear_mark:
+  en: "Clear Marks"
+  zh-CN: "清除标记"
+find.clear_all_marks:
+  en: "Clear All Marks"
+  zh-CN: "清除全部标记"
+find.marked_count:
+  en: "%{count} marked ranges"
+  zh-CN: "已标记 %{count} 处"
+find.mark_none:
+  en: "No marked text"
+  zh-CN: "尚未标记任何内容"
+find.mark_unsupported:
+  en: "Marks are unavailable for large, partial or binary documents"
+  zh-CN: "大文件、部分打开或二进制文档不支持标记"
+find.mark_empty:
+  en: "Enter text and press Mark All."
+  zh-CN: "输入内容后点击“标记全部”。"
+find.marks_cleared:
+  en: "Marks cleared"
+  zh-CN: "已清除标记"
+find.marks_cleared_docs:
+  en: "Marks cleared in %{count} documents"
+  zh-CN: "已清除 %{count} 个文档中的标记"
+find.count_huge:
+  en: "Count is unavailable for disk-engine documents; use Find All instead"
+  zh-CN: "磁盘引擎文档不支持计数，请使用“查找全部”"
+find.replace_in_files:
+  en: "Replace in Files…"
+  zh-CN: "在文件中替换…"
+find.replace_open_docs:
+  en: "Replace in All Opened Documents"
+  zh-CN: "在所有打开的文档中替换"
+find.replaced_open_docs:
+  en: "Replaced %{total} occurrences in %{files} documents"
+  zh-CN: "已在 %{files} 个文档中替换 %{total} 处"
+find.history_empty:
+  en: "No history"
+  zh-CN: "没有历史记录"
+find.large_results_hint:
+  en: "Large file: use Find All to collect results"
+  zh-CN: "大文件：使用“查找全部”收集结果"
+find.in_selection_hint:
+  en: "Search is limited to the captured selection"
+  zh-CN: "搜索范围限制在已记录的选区"
+find.matches_in_files:
+  en: "%{count} matches in %{files} files"
+  zh-CN: "在 %{files} 个文件中找到 %{count} 处匹配"
 
 ff.title:
   en: "Find in Files"
@@ -2091,8 +2232,8 @@ replace.nothing_to_undo:
   en: "There is no workspace replace to undo"
   zh-CN: "没有可撤销的工作区替换"
 replace.undone:
-  en: "Workspace replace undone"
-  zh-CN: "已撤销工作区替换"
+  en: "Replace undone"
+  zh-CN: "已撤销替换"
 ff.workspace:
   en: "Workspace"
   zh-CN: "工作区"

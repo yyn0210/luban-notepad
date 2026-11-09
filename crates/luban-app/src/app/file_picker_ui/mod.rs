@@ -1153,6 +1153,10 @@ impl LubanApp {
             }
             _ => {
                 self.open_path(&path, window, cx);
+                // The picker owned focus while it was open. Restore it even
+                // when the path merely activates an already-open tab, which
+                // does not create a new editor.
+                self.focus_editor(window, cx);
             }
         }
     }

@@ -18,8 +18,8 @@ GPUI 使用平台的次级修饰键：Linux/Windows 上为 **Ctrl**，macOS 上�
 | 关闭所有标签页 | `Ctrl+Shift+W` |
 | 查找 | `Ctrl+F` |
 | 替换 | `Ctrl+H` |
-| 查找下一个 | `F3` |
-| 查找上一个 | `Shift+F3` |
+| 查找下一个 | `F3`（遵循“反向查找”） |
+| 查找上一个 | `F4` / `Shift+F3` |
 | 在文件中查找 | `Ctrl+Shift+F` |
 | 跳转到行 | `Ctrl+G` |
 | 复制行 | `Ctrl+D` |

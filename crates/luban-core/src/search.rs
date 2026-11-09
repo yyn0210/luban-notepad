@@ -83,6 +83,60 @@ pub struct ReplacePreview {
     pub samples: Vec<(String, String)>,
 }
 
+/// Expand the escapes used by the Notepad-- "Extend" search mode:
+/// `\n`, `\r`, `\t`, `\0`, `\\` and `\xHH`.
+///
+/// Unknown escapes keep their backslash, so a pattern such as `\w` still
+/// reaches the regular-expression engine unchanged when the caller switches
+/// modes. `\xHH` values are interpreted as Unicode code points in the
+/// Latin-1 range, matching how the UI presents them.
+pub fn expand_extended(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('x') => {
+                let mut hex = String::new();
+                for _ in 0..2 {
+                    match chars.peek().copied() {
+                        Some(next) if next.is_ascii_hexdigit() => {
+                            hex.push(next);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if hex.len() == 2 {
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        if let Some(expanded) = char::from_u32(byte as u32) {
+                            out.push(expanded);
+                            continue;
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('x');
+                out.push_str(&hex);
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 type GroupRange = Option<(usize, usize)>;
 
 #[derive(Clone, Debug)]
@@ -1120,5 +1174,33 @@ mod tests {
         let e = engine(r"(?<word>\w+)@(?<domain>\w+)", enhanced);
         let (out, _) = e.replace_all("a@b", "${domain}:$word", None).unwrap();
         assert_eq!(out, "b:a");
+    }
+
+    #[test]
+    fn extended_mode_expands_supported_escapes() {
+        assert_eq!(expand_extended(r"a\nb"), "a\nb");
+        assert_eq!(expand_extended(r"a\r\tb"), "a\r\tb");
+        assert_eq!(expand_extended(r"a\0b"), "a\0b");
+        assert_eq!(expand_extended(r"a\\b"), r"a\b");
+        assert_eq!(expand_extended(r"\x41\x62"), "Ab");
+        assert_eq!(expand_extended(r"\x4"), r"\x4");
+        assert_eq!(expand_extended(r"\w+"), r"\w+");
+        assert_eq!(expand_extended("trailing\\"), "trailing\\");
+        assert_eq!(expand_extended(r"\xE9"), "é");
+    }
+
+    #[test]
+    fn extended_mode_searches_expanded_text_literally() {
+        let options = SearchOptions {
+            match_case: true,
+            ..SearchOptions::default()
+        };
+        let pattern = expand_extended(r"a\nb");
+        let e = engine(&pattern, options);
+        assert_eq!(
+            e.find_all("xa\nbx", None, 10),
+            vec![Match { start: 1, end: 4 }]
+        );
+        assert!(e.find_all("a b", None, 10).is_empty());
     }
 }

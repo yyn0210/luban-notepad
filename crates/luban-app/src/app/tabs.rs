@@ -53,6 +53,10 @@ pub struct Tab {
     pub group: usize,
     pub bookmarks: BookmarkSet,
     pub bookmark_revision: u64,
+    /// Mark-all highlights (the Notepad-- Mark tab), independent of bookmarks.
+    pub mark: Option<MarkHighlight>,
+    /// Bumped when marks are set or cleared so decorations rebuild.
+    pub mark_generation: u64,
     pub fold_generation: u64,
     pub needs_sync: bool,
     /// The editor emitted a real text change that has not been synced into
@@ -80,7 +84,7 @@ pub struct Tab {
     /// gutter follow the viewport.
     pub(super) _notification: Subscription,
 }
-type DecorationKey = (u64, usize, u64, bool, bool, bool);
+type DecorationKey = (u64, usize, u64, bool, bool, bool, u64);
 /// Destination index after moving one item, or `None` for a no-op move.
 pub(super) fn reorder_index(len: usize, from: usize, target: usize) -> Option<usize> {
     if from >= len || target > len || from == target || from + 1 == target {

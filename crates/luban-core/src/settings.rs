@@ -36,6 +36,39 @@ impl LanguageSettings {
     }
 }
 
+/// Last geometry of the floating find/replace window.
+///
+/// Coordinates are window-relative points. `None` places a newly opened
+/// window at the default top-right anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FindWindowPlacement {
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for FindWindowPlacement {
+    fn default() -> Self {
+        Self {
+            x: None,
+            y: None,
+            width: DEFAULT_FIND_WINDOW_WIDTH,
+            height: DEFAULT_FIND_WINDOW_HEIGHT,
+        }
+    }
+}
+
+/// Default width of the floating find/replace window, in points.
+pub const DEFAULT_FIND_WINDOW_WIDTH: f32 = 620.0;
+/// Default height of the floating find/replace window, in points.
+pub const DEFAULT_FIND_WINDOW_HEIGHT: f32 = 470.0;
+/// Narrowest the floating find/replace window may be resized to.
+pub const FIND_WINDOW_MIN_WIDTH: f32 = 500.0;
+/// Shortest the floating find/replace window may be resized to.
+pub const FIND_WINDOW_MIN_HEIGHT: f32 = 430.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -92,6 +125,9 @@ pub struct Settings {
     /// Default exclude globs for workspace search.
     #[serde(default)]
     pub search_exclude: String,
+    /// Last position and size of the floating find/replace window.
+    #[serde(default)]
+    pub find_window: FindWindowPlacement,
     pub highlight_current_line: bool,
     pub highlight_matching_brackets: bool,
     pub auto_indent: bool,
@@ -248,6 +284,7 @@ impl Default for Settings {
             respect_gitignore: true,
             search_include: String::new(),
             search_exclude: String::new(),
+            find_window: FindWindowPlacement::default(),
             highlight_current_line: true,
             highlight_matching_brackets: true,
             auto_indent: true,
@@ -412,6 +449,17 @@ impl Settings {
         normalize_ruler_columns(&mut self.ruler_columns);
         self.search_include = self.search_include.trim().to_string();
         self.search_exclude = self.search_exclude.trim().to_string();
+        self.find_window.width = self.find_window.width.clamp(FIND_WINDOW_MIN_WIDTH, 2400.0);
+        self.find_window.height = self
+            .find_window
+            .height
+            .clamp(FIND_WINDOW_MIN_HEIGHT, 2000.0);
+        if self.find_window.x.is_some_and(|x| !x.is_finite()) {
+            self.find_window.x = None;
+        }
+        if self.find_window.y.is_some_and(|y| !y.is_finite()) {
+            self.find_window.y = None;
+        }
         let language = self.ui_language.trim();
         if language.is_empty()
             || (language != "system" && !crate::i18n::SUPPORTED.contains(&language))
