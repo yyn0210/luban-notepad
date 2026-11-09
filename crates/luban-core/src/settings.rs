@@ -39,8 +39,13 @@ impl LanguageSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// On-disk schema version. Files written by older versions are migrated
+    /// when loaded; see [`SETTINGS_VERSION`].
+    #[serde(default)]
+    pub settings_version: u32,
     pub theme: ThemeChoice,
-    /// Name of a syntect theme. The GUI falls back to the built-in default if
+    /// Name of a syntect theme, or `default` to follow the application's
+    /// light/dark appearance. The GUI falls back to the built-in default if
     /// the name is not available.
     pub syntax_theme: String,
     /// Empty selects the bundled monospace font.
@@ -207,11 +212,21 @@ pub const MAX_RECENT_WORKSPACES: usize = 20;
 /// Maximum number of folders remembered by the file picker.
 pub const MAX_RECENT_DIRS: usize = 12;
 
+/// Current on-disk settings schema version.
+///
+/// Version 2 changed the implicit syntax theme from `InspiredGitHub`, a fixed
+/// light palette, to `default`, which follows the light/dark appearance.
+pub const SETTINGS_VERSION: u32 = 2;
+
+/// Syntax theme id that follows the application's light/dark appearance.
+pub const DEFAULT_SYNTAX_THEME: &str = "default";
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            settings_version: SETTINGS_VERSION,
             theme: ThemeChoice::Light,
-            syntax_theme: "InspiredGitHub".to_string(),
+            syntax_theme: DEFAULT_SYNTAX_THEME.to_string(),
             font_family: String::new(),
             font_size: 14.0,
             tab_size: 4,
@@ -280,6 +295,7 @@ impl Settings {
         match fs::read_to_string(path) {
             Ok(json) => match serde_json::from_str::<Settings>(&json) {
                 Ok(mut settings) => {
+                    settings.migrate();
                     settings.validate();
                     settings
                 }
@@ -310,6 +326,20 @@ impl Settings {
 
     pub fn path() -> PathBuf {
         config_dir().join("settings.json")
+    }
+
+    /// Upgrade settings written by older versions in place.
+    ///
+    /// Before version 2 the syntax theme default was `InspiredGitHub`, a
+    /// fixed light palette: switching the application to dark mode left the
+    /// document area light. Treat that legacy default as "follow the
+    /// appearance". A choice made after the upgrade survives because the
+    /// version is saved with it.
+    fn migrate(&mut self) {
+        if self.settings_version < 2 && self.syntax_theme == "InspiredGitHub" {
+            self.syntax_theme = DEFAULT_SYNTAX_THEME.to_string();
+        }
+        self.settings_version = SETTINGS_VERSION;
     }
 
     pub fn validate(&mut self) {
@@ -354,7 +384,7 @@ impl Settings {
             self.syntax_theme_path = None;
         }
         if self.syntax_theme.is_empty() {
-            self.syntax_theme = "InspiredGitHub".to_string();
+            self.syntax_theme = DEFAULT_SYNTAX_THEME.to_string();
         }
         self.disabled_plugins.retain(|id| !id.trim().is_empty());
         self.disabled_plugins.sort();
@@ -437,6 +467,7 @@ impl Settings {
     pub fn from_json(json: &str) -> Result<Self, String> {
         let mut settings: Settings =
             serde_json::from_str(json).map_err(|error| error.to_string())?;
+        settings.migrate();
         settings.validate();
         Ok(settings)
     }
@@ -634,6 +665,8 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
+        assert_eq!(s.settings_version, SETTINGS_VERSION);
+        assert_eq!(s.syntax_theme, DEFAULT_SYNTAX_THEME);
         assert_eq!(s.tab_size, 4);
         assert!(s.show_line_numbers);
         assert!(s.restore_session);
@@ -644,6 +677,41 @@ mod tests {
         assert_eq!(s.large_file_controller_threshold, 200 * 1024 * 1024);
         assert_eq!(s.large_file_partial_size, 200 * 1024 * 1024);
         assert_eq!(s.large_file_display_unit, SizeUnit::Bytes);
+    }
+
+    #[test]
+    fn legacy_syntax_theme_default_migrates_to_appearance_following() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Written before the settings version field existed: the syntax theme
+        // carries the old implicit default.
+        fs::write(
+            &path,
+            r#"{"theme": "dark", "syntax_theme": "InspiredGitHub"}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert_eq!(loaded.syntax_theme, DEFAULT_SYNTAX_THEME);
+
+        // Once migrated, an explicit choice of the same named theme is
+        // preserved on the next load.
+        let mut explicit = loaded;
+        explicit.syntax_theme = "InspiredGitHub".to_string();
+        explicit.save_to(&path).unwrap();
+        let reloaded = Settings::load_from(&path);
+        assert_eq!(reloaded.syntax_theme, "InspiredGitHub");
+    }
+
+    #[test]
+    fn empty_syntax_theme_follows_the_appearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"syntax_theme": ""}"#).unwrap();
+        assert_eq!(
+            Settings::load_from(&path).syntax_theme,
+            DEFAULT_SYNTAX_THEME
+        );
     }
 
     #[test]
