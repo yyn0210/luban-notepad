@@ -48,9 +48,73 @@ impl LubanApp {
         self.set_status(tr("status.search_history_cleared"), cx);
         cx.notify();
     }
+    /// The editor selection as search text for a freshly opened find window.
+    /// Very long selections are ignored so Ctrl+A cannot stuff a whole
+    /// document into the query field.
+    fn find_selection_text(&self, cx: &gpui_kit::App) -> Option<String> {
+        const MAX_SELECTION_CHARS: usize = 1024;
+        let (a, b) = self.active_selection();
+        if a == b {
+            return None;
+        }
+        let (start, end) = (a.min(b), a.max(b));
+        if end.saturating_sub(start) > MAX_SELECTION_CHARS {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        if tab.doc.is_huge() {
+            // Huge-file selections are byte offsets in the file; the editor
+            // only mounts the window they must live in.
+            let ui = tab.huge.as_ref()?;
+            let start = ui.local_of_global(start as u64)? as usize;
+            let end = ui.local_of_global(end as u64)? as usize;
+            let text = &ui.last_text;
+            if start > text.len()
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                return None;
+            }
+            return Some(text[start..end].to_owned());
+        }
+        let state = tab.editor.read(cx);
+        let rope = state.text();
+        let chars = rope.len_chars();
+        let b0 = rope.char_to_byte_idx(start.min(chars));
+        let b1 = rope.char_to_byte_idx(end.min(chars));
+        Some(rope.slice(b0..b1).to_string())
+    }
+
+    /// Opening the window with selected text makes that text the search
+    /// keyword (Notepad-- behaviour) and selects it so typing replaces it.
+    fn seed_find_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.find_selection_text(cx) else {
+            return;
+        };
+        self.find.query.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.select_all(window, cx);
+        });
+    }
+
+    fn seed_find_in_files_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.find_selection_text(cx) else {
+            return;
+        };
+        self.find_in_files.query.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.select_all(window, cx);
+        });
+    }
+
     pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.find.open = true;
         self.find.dirty = true;
+        // The window opens modelessly, so the editor may still hold a
+        // selection the document has not observed yet.
+        self.sync_active(window, cx);
+        self.seed_find_query(window, cx);
         if self.find.in_selection && self.find.scope.is_none() {
             let (a, b) = self.active_selection();
             if a != b {
@@ -172,7 +236,7 @@ impl LubanApp {
                     };
                 }
                 self.find.generation = self.find.generation.wrapping_add(1);
-                self.select_char_range(matched.start, matched.end, window, cx);
+                self.select_find_char_range(matched.start, matched.end, window, cx);
                 self.focus_editor = true;
                 // Keep the modeless window usable for repeated Enter/F3 while
                 // still revealing the match in the editor.
@@ -501,6 +565,8 @@ impl LubanApp {
         self.find_in_files.show_replace = true;
         self.find_in_files.respect_gitignore = self.settings.respect_gitignore;
         self.find.open = true;
+        self.sync_active(window, cx);
+        self.seed_find_in_files_query(window, cx);
         self.switch_find_tab(crate::find::FindTab::FindInFiles, window, cx);
         self.find_in_files
             .replacement
@@ -955,6 +1021,8 @@ impl LubanApp {
     pub fn open_find_in_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find.open = true;
         self.find_in_files.respect_gitignore = self.settings.respect_gitignore;
+        self.sync_active(window, cx);
+        self.seed_find_in_files_query(window, cx);
         if self.find_in_files.folder.read(cx).value().is_empty() {
             let folder = self
                 .workspace_root

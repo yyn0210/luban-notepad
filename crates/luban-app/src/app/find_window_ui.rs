@@ -1697,7 +1697,7 @@ impl LubanApp {
         self.sync_active(window, cx);
         self.find.current = self.find.matches.iter().position(|item| *item == matched);
         self.find.generation = self.find.generation.wrapping_add(1);
-        self.select_char_range(matched.start, matched.end, window, cx);
+        self.select_find_char_range(matched.start, matched.end, window, cx);
         cx.notify();
     }
 

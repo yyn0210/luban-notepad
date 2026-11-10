@@ -11,8 +11,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{
-    Copy, Cut, Editor, EditorState, FoldRange, HighlightStyleResolver, Indent, Input, InputEvent,
-    InputState, Outdent, Paste, Position, RangeDecoration, RangeDecorationCollection,
+    BufferPoint, Copy, Cut, Editor, EditorState, FoldRange, HighlightStyleResolver, Indent, Input,
+    InputEvent, InputState, Outdent, Paste, Position, RangeDecoration, RangeDecorationCollection,
     RangeDecorationStyle, Redo, RopeExt, Search, SelectAll, TabSize, TextDecoration,
     TextDecorationCollection, Undo,
 };
@@ -3070,6 +3070,73 @@ impl LubanApp {
             state.set_selected_range(b0..b1, cx);
             state.focus(window, cx);
         });
+    }
+
+    /// Select a find result, centring its line when the match is outside the
+    /// visible rows. Matches already on screen keep the viewport where it is,
+    /// so repeated Find Next does not scroll under the user; off-screen
+    /// matches land in the middle of the editor like Notepad--.
+    fn select_find_char_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let editor = tab.editor.clone();
+        let centered = {
+            let state = editor.read(cx);
+            let text = state.text();
+            let total = text.len_chars();
+            let (start, end) = if start <= end {
+                (start.min(total), end.min(total))
+            } else {
+                (end.min(total), start.min(total))
+            };
+            let begin = text.offset_to_position(text.char_to_byte_idx(start));
+            // A match that ends at a line boundary ends *after* the newline;
+            // measure the last character so the trailing newline does not
+            // count as a row below the visible area.
+            let last_char = if end > start { end - 1 } else { start };
+            let finish = text.offset_to_position(text.char_to_byte_idx(last_char));
+            let line_height = state.line_height().map(|height| height.as_f32());
+            state
+                .visible_row_range()
+                .zip(line_height)
+                .and_then(|(visible, line_height)| {
+                    if line_height <= 0.0 {
+                        return None;
+                    }
+                    let map = state.display_map();
+                    let first = map
+                        .buffer_pos_to_display_pos(BufferPoint::new(
+                            begin.line as usize,
+                            begin.character as usize,
+                        ))
+                        .row;
+                    let last = map
+                        .buffer_pos_to_display_pos(BufferPoint::new(
+                            finish.line as usize,
+                            finish.character as usize,
+                        ))
+                        .row;
+                    if first >= visible.start && last < visible.end {
+                        // The whole match is on screen: reveal nothing.
+                        return None;
+                    }
+                    let height = state.input_bounds().size.height.as_f32();
+                    let rows = (height / line_height).floor().max(1.0);
+                    let top = (first as f32 - rows / 2.0).max(0.0);
+                    Some(point(state.scroll_offset().x, px(-(top * line_height))))
+                })
+        };
+        self.select_char_range(start, end, window, cx);
+        if let Some(offset) = centered {
+            editor.update(cx, |state, cx| state.set_scroll_offset(offset, cx));
+        }
     }
 
     fn replace_document_text(
@@ -8516,5 +8583,188 @@ mod plugin_panel_tests {
             Some(700.0),
             "the width dragged before the lost release is still saved"
         );
+    }
+}
+
+#[cfg(test)]
+mod find_selection_tests {
+    use super::{test_config_dir, test_lock, LaunchOptions, LubanApp, WindowInit};
+    use gpui::TestAppContext;
+    use gpui_kit::component::input::RopeExt as _;
+    use luban_core::document::Document;
+    use luban_core::encoding::TextEncoding;
+    use luban_core::eol::Eol;
+    use luban_core::language;
+
+    fn options() -> LaunchOptions {
+        LaunchOptions {
+            files: Vec::new(),
+            smoke_test: false,
+            safe_mode: true,
+            session_writer: false,
+            wait: false,
+            goto: None,
+            diff: None,
+            stdin: None,
+            command: None,
+            exit_on_command_failure: false,
+            command_result: None,
+            ipc_queue: None,
+            manual_window_chrome: false,
+            recoveries: Vec::new(),
+            init: WindowInit::Blank,
+            auto_recovery: false,
+            window_id: 1,
+        }
+    }
+
+    fn add_text(
+        app: &mut LubanApp,
+        text: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<LubanApp>,
+    ) {
+        let doc = Document::from_text(text, TextEncoding::Utf8, Eol::Lf, language::PLAIN_TEXT);
+        app.add_document(doc, window, cx);
+    }
+
+    fn select_bytes(
+        app: &LubanApp,
+        range: std::ops::Range<usize>,
+        cx: &mut gpui::Context<LubanApp>,
+    ) {
+        let editor = app.tabs[app.active].editor.clone();
+        editor.update(cx, |state, cx| state.set_selected_range(range, cx));
+    }
+
+    #[gpui::test]
+    fn opening_find_uses_the_selected_text_as_the_query(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                add_text(app, "alpha beta gamma", window, cx);
+                select_bytes(app, 6..10, cx);
+                app.open_find(false, window, cx);
+                assert_eq!(app.find.query_text(cx), "beta");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn opening_find_without_a_selection_keeps_the_query(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                add_text(app, "alpha beta gamma", window, cx);
+                select_bytes(app, 0..0, cx);
+                app.find.query.update(cx, |state, cx| {
+                    state.set_value("kept", window, cx);
+                });
+                app.open_find(false, window, cx);
+                assert_eq!(app.find.query_text(cx), "kept");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn opening_find_ignores_an_oversized_selection(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let text = "x".repeat(2048);
+                add_text(app, &text, window, cx);
+                select_bytes(app, 0..text.len(), cx);
+                app.find.query.update(cx, |state, cx| {
+                    state.set_value("kept", window, cx);
+                });
+                app.open_find(false, window, cx);
+                assert_eq!(app.find.query_text(cx), "kept");
+            });
+        });
+    }
+
+    /// A match below the visible rows scrolls to the middle of the editor;
+    /// the next match that is already on screen leaves the viewport alone.
+    #[gpui::test]
+    fn find_next_centres_an_offscreen_match(cx: &mut TestAppContext) {
+        let _guard = test_lock();
+        test_config_dir();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| LubanApp::new(window, cx, options()));
+        let text: String = (1..=120)
+            .map(|line| {
+                if line == 90 || line == 91 {
+                    format!("line {line} needle\n")
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                add_text(app, &text, window, cx);
+                app.find.query.update(cx, |state, cx| {
+                    state.set_value("needle", window, cx);
+                });
+                app.find.dirty = true;
+            });
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| app.find_next(true, window, cx));
+            window.draw(cx).clear(cx);
+        });
+        let first_offset = cx.update(|_, cx| {
+            let app = app.read(cx);
+            let state = app.tabs[app.active].editor.read(cx);
+            let visible = state.visible_row_range().expect("laid-out viewport");
+            assert!(visible.len() > 2, "the test editor is too short");
+            let line = state
+                .text()
+                .offset_to_position(state.selected_range().start);
+            let row = state
+                .display_map()
+                .buffer_pos_to_display_pos(gpui_kit::component::input::BufferPoint::new(
+                    line.line as usize,
+                    line.character as usize,
+                ))
+                .row;
+            let center = (visible.start + visible.end) / 2;
+            let distance = row.abs_diff(center);
+            assert!(
+                distance <= 2,
+                "match row {row} is not centred in {visible:?}"
+            );
+            state.scroll_offset().y.as_f32()
+        });
+        // The next hit is one line away and already visible: finding it must
+        // not move the viewport again.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.find_next(true, window, cx));
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|_, cx| {
+            let app = app.read(cx);
+            let state = app.tabs[app.active].editor.read(cx);
+            assert_eq!(
+                state
+                    .text()
+                    .offset_to_position(state.selected_range().start)
+                    .line,
+                90,
+                "the second hit should be on the following line"
+            );
+            assert!(
+                (state.scroll_offset().y.as_f32() - first_offset).abs() <= 0.5,
+                "an on-screen match moved the viewport"
+            );
+        });
     }
 }

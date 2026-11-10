@@ -1498,6 +1498,59 @@ impl LubanApp {
         })
         .detach();
     }
+    /// Reveal a huge-file search hit without moving a viewport that already
+    /// shows it. Off-screen hits load a window centred on their line, the same
+    /// rule the floating find window applies to normal documents.
+    fn reveal_huge_find_hit(
+        &mut self,
+        index: usize,
+        hit: &luban_core::disk_engine::SearchHit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport_lines = self.huge_viewport_lines(index, cx).unwrap_or(1);
+        let on_screen = self
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.huge.as_ref())
+            .and_then(|ui| {
+                let first = ui.scroll_top_line;
+                let last = first.saturating_add(viewport_lines);
+                if hit.line < first || hit.line >= last {
+                    return None;
+                }
+                Some((ui.local_of_global(hit.start)?, ui.local_of_global(hit.end)?))
+            });
+        if let Some((start, end)) = on_screen {
+            let editor = self.tabs[index].editor.clone();
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(start as usize..end as usize, cx);
+                state.focus(window, cx);
+            });
+            if let Some(huge) = self.tabs[index].doc.huge_mut() {
+                huge.anchor = hit.start;
+                huge.cursor = hit.end;
+            }
+            self.focus_editor = true;
+            cx.notify();
+            return;
+        }
+        // Keep the prefetch together with the viewport target: both are
+        // measured from the hit line so the match lands mid-window.
+        let target_line = hit.line.saturating_sub(PREFETCH_LINES / 2).max(1);
+        let top_line = hit.line.saturating_sub(viewport_lines / 2).max(1);
+        self.request_huge_window(
+            index,
+            WindowTarget::Line(target_line),
+            hit.start,
+            top_line,
+            Some((hit.start, hit.end)),
+            window,
+            cx,
+        );
+        self.focus_editor = true;
+        cx.notify();
+    }
     fn finish_huge_find(
         &mut self,
         tab_id: u64,
@@ -1524,16 +1577,7 @@ impl LubanApp {
         editor.update(cx, |state, cx| state.set_readonly(read_only, cx));
         match result {
             Ok(Some(hit)) => {
-                let target_line = hit.line.saturating_sub(PREFETCH_LINES / 2).max(1);
-                self.request_huge_window(
-                    index,
-                    WindowTarget::Line(target_line),
-                    hit.start,
-                    hit.line.saturating_sub(1).max(1),
-                    Some((hit.start, hit.end)),
-                    window,
-                    cx,
-                );
+                self.reveal_huge_find_hit(index, &hit, window, cx);
                 self.find.current = None;
                 self.find.status = tr_args("find.huge_match_at", &[("line", hit.line.to_string())]);
             }
@@ -1689,18 +1733,7 @@ impl LubanApp {
         if !self.tabs.get(index).is_some_and(|tab| tab.doc.is_huge()) {
             return;
         }
-        let target_line = hit.line.saturating_sub(PREFETCH_LINES / 2).max(1);
-        self.request_huge_window(
-            index,
-            WindowTarget::Line(target_line),
-            hit.start,
-            hit.line.saturating_sub(1).max(1),
-            Some((hit.start, hit.end)),
-            window,
-            cx,
-        );
-        self.focus_editor = true;
-        cx.notify();
+        self.reveal_huge_find_hit(index, &hit, window, cx);
     }
     pub(super) fn huge_replace_one(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active(window, cx);
