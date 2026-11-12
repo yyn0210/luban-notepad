@@ -26,6 +26,7 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
 | `gpui-ohos` vendor（rev `324abb33`） | `vendor/gpui-ohos` |
 | 库入口、`EmbeddedStartup`、`run_embedded` | `crates/luban-app/src/lib.rs` |
 | OHOS 入口与 HAP 工程 | `crates/luban-ohos` |
+| CI 交叉编译 arm64 cdylib（6.1 public SDK + `ohrs`） | `.github/workflows/ci.yml` |
 | X11 依赖/代码在 OHOS 上关闭 | `luban-app/Cargo.toml`、`window_registry.rs`、`lib.rs` |
 
 已执行的验证：
@@ -112,7 +113,7 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
   延到未来、`allowed-acls` 加入 `ohos.permission.READ_PASTEBOARD`，签出
   `profile.p7b`；再用 profile 里的 CA 签发证书 + CA + Root 组成证书链签 HAP。
 - 结果：`hdc install -r` 成功，`aa start -a EntryAbility -b
-  com.luban.notepad.ohos` 启动；完整编辑器 UI（菜单/工具栏/标签页/状态栏）
+  com.janeluo.lubannotepad` 启动；完整编辑器 UI（菜单/工具栏/标签页/状态栏）
   渲染正常，键盘输入、修改标记正常。
 - 配置目录：OHOS 进程的 `HOME=/storage/Users/currentUser` 不可写，会话保存
   报 `Operation not permitted`。`crates/luban-ohos/src/ohos_entry.rs` 现在

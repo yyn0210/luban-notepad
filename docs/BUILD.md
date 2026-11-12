@@ -113,6 +113,11 @@ crates/luban-ohos/scripts/build-hap.sh --release
 cd crates/luban-ohos/ohos && hvigorw assembleHap
 ```
 
+CI 的 `ohos` job 会下载 OpenHarmony 6.1 public SDK 的 native 组件，用 `ohrs`
+交叉编译 `aarch64` 的 `libluban_ohos.so`，校验 ELF 架构后上传产物。HAP 的
+hvigor 构建与签名依赖 DevEco command-line tools 和本机签名材料，仍需按上面的
+命令在本地完成。
+
 状态、当前限制与待决策项见 [`docs/HARMONYOS.md`](HARMONYOS.md)。
 
 ## 发布

@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "com.luban.notepad.ohos",
+    "bundleName": "com.janeluo.lubannotepad",
     "vendor": "luban-notepad",
     "versionCode": 1,
     "versionName": "1.0.0",
