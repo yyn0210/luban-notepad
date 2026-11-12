@@ -49,8 +49,8 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
   显式清理。
 - **G4 文件模型**：系统 picker URI → path、授权恢复早于会话恢复、最近文件
   存 URI、撤销授权后的重新授权流程、Trash 语义。
-- **G5 输入与渲染**：中文 IME、触摸滚动/选择、剪贴板权限、GLES 与 PC wgpu
-  的视觉对比、`/system/fonts` 字体回退。
+- **G5 输入与渲染**：中文 IME、触摸滚动/选择、剪贴板权限（模拟器已验证）、
+  GLES 与 PC wgpu 的视觉对比、`/system/fonts` 字体回退。
 - **G6 发行**：bundle 名、签名/ACL、AppGallery 或开源鸿蒙分发、插件商店
   `INTERNET` 与 `aarch64-linux-ohos` target 映射。
 
@@ -108,10 +108,11 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
   删除 `sdkApiVersion >= 26` 的 `zLevelAboveParentLoosened` 赋值；
   `WindowTitleBar` 的 `@Prop icon/label` 改为普通成员；`MenuBarSlot.build`
   改为空 `Column`（该 SDK 的 ArkTS 检查器不允许在 build 中调用普通函数）。
-- 签名：用 SDK 自带 `hap-sign-tool.jar` + `OpenHarmony.p12`；把
-  `UnsgnedReleasedProfileTemplate.json` 的 bundle-name 改成实际值、有效期
-  延到未来、`allowed-acls` 加入 `ohos.permission.READ_PASTEBOARD`，签出
-  `profile.p7b`；再用 profile 里的 CA 签发证书 + CA + Root 组成证书链签 HAP。
+- 签名：SDK 自带 `hap-sign-tool.jar` + `OpenHarmony.p12`；profile 由
+  `UnsgnedReleasedProfileTemplate.json` 生成（bundle-name、未来有效期、
+  `allowed-acls` 加入 `ohos.permission.READ_PASTEBOARD`），签出
+  `profile.p7b`；再用 profile 里的 CA 签发证书 + CA + Root 组成证书链签
+  HAP。现在可用 `crates/luban-ohos/scripts/sign-hap.sh` 自动完成。
 - 结果：`hdc install -r` 成功，`aa start -a EntryAbility -b
   com.janeluo.lubannotepad` 启动；完整编辑器 UI（菜单/工具栏/标签页/状态栏）
   渲染正常，键盘输入、修改标记正常。
@@ -121,14 +122,46 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
   `/data/storage/el2/base/files/luban-notepad`，已验证 settings/session/
   plugins 正常落盘。
 
-尚未在 6.1 上验证：系统文件选择器、中文 IME、剪贴板权限弹窗、触摸/鼠标
-手势、GLES 与桌面的视觉对比、aarch64 真机。
+尚未在 6.1 上验证：系统文件选择器、中文 IME、触摸/鼠标手势、GLES 与桌面的
+视觉对比、aarch64 真机。剪贴板权限已在 DevEco HarmonyOS 6.1 模拟器验证，
+见下一节。
 
 补充（重装验证）：首次开机的 OOBE 必须走完登录密码步骤（至少 6 位、
 数字/字母）。跳过该步骤会在最后一页出现 “PIN码设置失败（12300001）”，
 且“完成/上一步”失去响应；重装并在“创建登录密码”页设置密码后即可正常
-进入桌面。虚机里的锁屏/登录密码为 `111111`（6 个 1；2026-11-11 实测，
-`yangyn123` 不正确）。
+进入桌面。虚机口令属于本地测试环境配置，不写入仓库。
+
+## 2026-11-13 剪贴板 ACL 与运行时授权（DevEco HarmonyOS 6.1 模拟器）
+
+上一轮无签名 HAP 上 Ctrl+V 返回 `201`。根因是 `READ_PASTEBOARD` 为
+`system_basic + user_grant`，需要同时满足两层：
+
+- **签名 profile ACL**：未签名 HAP 没有 profile，`acls.allowed-acls` 为空。
+  用 `scripts/sign-hap.sh` 从 SDK 的 `UnsgnedReleasedProfileTemplate.json`
+  生成 profile（bundle-name、未来有效期、`allowed-acls` 加入
+  `ohos.permission.READ_PASTEBOARD`），签出 `profile.p7b` 后再签 HAP。
+  安装后 `bm dump` 的 `appProvisionType` 为 `release`，说明 profile 已生效。
+- **运行时授权**：ACL 只负责放行，应用仍需调用
+  `requestPermissionsFromUser`。`EntryAbility.onForeground` 现在请求一次，
+  授权后 `reqPermissionStates` 为 `0`，Ctrl+V 正常。
+
+注意：
+
+- 覆盖安装旧的未签名包会报 `9568332 install sign info inconsistent`，必须先
+  卸载；`sign-hap.sh --install` 已处理（会丢失应用数据）。
+- `Edit → Paste` 走 ArkUI 原生粘贴控件，没有运行时授权也能工作；Ctrl+V 走
+  原生剪贴板读取，必须 ACL + 运行时授权同时满足。
+- OpenHarmony 测试根只适用于模拟器/开发机。真机/AppGallery 需要在 AGC 为
+  应用申请 `ohos.permission.READ_PASTEBOARD` 的 ACL 权限，审核通过后用 AGC
+  生成的 profile 签名；调试 profile 的 ACL 支持以 AGC 审核结果为准。
+
+用法（路径、口令、设备序列号都不入库）：
+
+```sh
+export OHOS_SDK_LIB="<DevEco SDK>/default/openharmony/toolchains/lib"
+export OHOS_SIGN_STORE_PASSWORD="<SDK 测试密钥库口令>"
+crates/luban-ohos/scripts/sign-hap.sh --install --device <serial>
+```
 
 ## 2026-11-11 e2e 回归（KaihongOS 6.1 虚机）
 
