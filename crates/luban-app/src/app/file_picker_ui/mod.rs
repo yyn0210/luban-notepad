@@ -432,8 +432,10 @@ impl LubanApp {
         self.show_in_app_file_dialog(mode, purpose, dir, suggested_name, window, cx);
     }
 
-    /// The original path-based picker, used on desktop platforms only.
-    #[cfg_attr(target_env = "ohos", allow(dead_code))]
+    /// The original path-based picker. Desktop dialogs use it directly; on
+    /// OpenHarmony it is reserved for app-sandbox directories such as the logs
+    /// folder, which the system picker cannot reach. User files always go
+    /// through the system picker there.
     pub(super) fn show_in_app_file_dialog(
         &mut self,
         mode: FileDialogMode,

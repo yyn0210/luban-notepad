@@ -18,6 +18,11 @@ impl OpenCommand {
 }
 
 /// Open a directory in the platform file manager.
+///
+/// OpenHarmony has no external program to launch and its sandbox is invisible
+/// to the system file manager, so the log-directory command uses the in-app
+/// picker there instead.
+#[cfg_attr(target_env = "ohos", allow(dead_code))]
 pub fn open_directory_command(directory: &Path) -> OpenCommand {
     #[cfg(windows)]
     {

@@ -17,6 +17,9 @@ Luban Notepad 的所有重要变更都记录在此。
   位于 `luban-app` 库，日志目标是 `luban_app::…`，而默认 `RUST_LOG` 仍按旧的
   二进制 crate 名 `luban_notepad` 过滤，导致 `logs/luban.log` 里没有跳转截断、
   文件打开失败等记录。
+- 修复鸿蒙版“帮助 → 打开日志目录”必定报错的问题：系统里没有 `xdg-open`，
+  且文件管理器无法读取应用沙箱，现改为在应用内文件选择器中浏览 `logs`
+  目录，可直接打开 `luban.log`、`crash.log` 等日志文件。
 
 ## [1.0.0] — 2026-11-10
 

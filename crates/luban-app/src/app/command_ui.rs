@@ -363,15 +363,34 @@ impl LubanApp {
             }
             "help.open-log-dir" => {
                 let directory = logging::log_dir();
-                match util::open_directory_command(&directory).spawn() {
-                    Ok(()) => {}
-                    Err(error) => self.set_status(
-                        tr_args(
-                            "status.open_path_failed",
-                            &[("error", format!("{}: {error}", directory.display()))],
-                        ),
+                #[cfg(target_env = "ohos")]
+                {
+                    // HarmonyOS keeps app data in a sandbox that neither the
+                    // system file manager nor `xdg-open` can reach, so browse
+                    // the logs with the in-app picker instead of launching an
+                    // external program.
+                    let _ = fs::create_dir_all(&directory);
+                    self.show_in_app_file_dialog(
+                        FileDialogMode::Open,
+                        FileDialogPurpose::OpenFiles,
+                        directory,
+                        String::new(),
+                        window,
                         cx,
-                    ),
+                    );
+                }
+                #[cfg(not(target_env = "ohos"))]
+                {
+                    match util::open_directory_command(&directory).spawn() {
+                        Ok(()) => {}
+                        Err(error) => self.set_status(
+                            tr_args(
+                                "status.open_path_failed",
+                                &[("error", format!("{}: {error}", directory.display()))],
+                            ),
+                            cx,
+                        ),
+                    }
                 }
             }
             "plugins.manage" => {
