@@ -1335,16 +1335,11 @@ impl OhosWindow {
     /// click that a touch contact already delivered. OHOS does not guarantee
     /// that the mouse callback arrives first, so skip the later copy and its
     /// paired release. Two deliberate clicks cannot land this close together.
-    fn compat_tap_precedes_mouse(
-        &self,
-        button: MouseButton,
-        position: Point<Pixels>,
-    ) -> bool {
+    fn compat_tap_precedes_mouse(&self, button: MouseButton, position: Point<Pixels>) -> bool {
         let Some((at, tap_position)) = self.last_compat_tap.get() else {
             return false;
         };
-        if at.elapsed() > Duration::from_millis(150)
-            || (position - tap_position).magnitude() > 2.0
+        if at.elapsed() > Duration::from_millis(150) || (position - tap_position).magnitude() > 2.0
         {
             return false;
         }

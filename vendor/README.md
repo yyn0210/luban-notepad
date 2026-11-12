@@ -13,6 +13,10 @@
 - `gpui-ohos`：OpenHarmony 平台后端（固定到上游 commit，独立 workspace，
   不属于 `[patch.crates-io]`）。
 
+注意：`cargo fmt --all` 的 `--all` 包含本地 path 依赖，`gpui-ohos` 是
+`luban-ohos` 的 path 依赖，所以本目录下改过的代码也在 CI 的 rustfmt 检查范围内；
+打完补丁后先跑一次 `cargo fmt --all`。`--workspace` 的 clippy/test 不受影响。
+
 ## gpui-pre-linux
 
 `gpui-pre-linux` 0.3.11 的本地副本，叠加最小 X11 补丁。
