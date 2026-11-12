@@ -37,6 +37,9 @@ struct IgnoredSave {
     size: u64,
     modified: Option<SystemTime>,
     until: Instant,
+    /// Host-service saves may leave the file unreadable by path, so matching
+    /// cannot call `metadata`; the grace window alone suppresses the event.
+    verify_metadata: bool,
 }
 
 /// Paths registered by the caller plus the paths the backend reports for them.
@@ -237,6 +240,25 @@ impl FileWatcher {
                 size,
                 modified,
                 until: Instant::now() + SELF_SAVE_GRACE,
+                verify_metadata: true,
+            },
+        );
+    }
+
+    /// Suppress the event produced by a save the host wrote through a URI.
+    ///
+    /// The application sandbox cannot stat the selected user file, so the
+    /// usual size/modification-time comparison would always fail and show a
+    /// spurious "changed on disk" banner.
+    #[cfg(target_env = "ohos")]
+    pub fn note_saved_unverified(&mut self, path: &Path) {
+        self.ignored.insert(
+            path.to_path_buf(),
+            IgnoredSave {
+                size: 0,
+                modified: None,
+                until: Instant::now() + SELF_SAVE_GRACE,
+                verify_metadata: false,
             },
         );
     }
@@ -299,6 +321,9 @@ impl FileWatcher {
     }
 
     fn save_matches(&self, path: &Path, ignored: &IgnoredSave) -> bool {
+        if !ignored.verify_metadata {
+            return true;
+        }
         let Ok(metadata) = fs::metadata(path) else {
             return false;
         };

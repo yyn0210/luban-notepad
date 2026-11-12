@@ -6,4 +6,6 @@
 //! buildable.
 
 #[cfg(target_env = "ohos")]
+pub mod file_io;
+#[cfg(target_env = "ohos")]
 mod ohos_entry;

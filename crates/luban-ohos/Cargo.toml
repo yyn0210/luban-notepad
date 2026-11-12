@@ -28,6 +28,7 @@ openharmony-ability = { version = "1.0.0-beta.5", features = ["keyboard", "mouse
 openharmony-ability-derive = "1.0.0-beta.5"
 napi-ohos = "=1.2.0"
 napi-derive-ohos = "=1.2.0"
+ohos-fileuri-binding = "0.2.4"
 
 [build-dependencies]
 napi-build-ohos = "=1.2.0"

@@ -56,7 +56,23 @@ impl LubanApp {
             return;
         }
         let path = self.tabs[index].doc.path.clone();
-        if !force && path.is_some() {
+        // User files returned by the OpenHarmony picker are not stat-able
+        // through the sandbox path, so `disk_status` would report a changed
+        // file on every save. The host writer owns that conflict check; the
+        // system picker already asked before replacing anything.
+        let host_saved_path = path.as_deref().is_some_and(|path| {
+            #[cfg(target_env = "ohos")]
+            {
+                crate::ohos_file_save::is_user_path(path)
+                    && crate::ohos_file_save::writer().is_some()
+            }
+            #[cfg(not(target_env = "ohos"))]
+            {
+                let _ = path;
+                false
+            }
+        });
+        if !force && path.is_some() && !host_saved_path {
             let status = self.tabs[index].doc.disk_status();
             if matches!(status, DiskStatus::Changed | DiskStatus::Missing) {
                 let id = self.tabs[index].id;
@@ -99,6 +115,18 @@ impl LubanApp {
                 self.snapshot_before_save(target, cx);
             }
         }
+        // User-storage files must be written through the picker URI; POSIX
+        // path writes are rejected by the OpenHarmony sandbox. The host writer
+        // is asynchronous, so completion resumes in `finish_host_save`.
+        #[cfg(target_env = "ohos")]
+        if let Some(target) = path.as_deref() {
+            if crate::ohos_file_save::is_user_path(target)
+                && crate::ohos_file_save::writer().is_some()
+            {
+                self.start_host_save(index, target.to_path_buf(), then, false, window, cx);
+                return;
+            }
+        }
         let (name, encoding, saved, path, error) = {
             let tab = &mut self.tabs[index];
             let name = tab.doc.display_name();
@@ -120,7 +148,7 @@ impl LubanApp {
                     .note_saved(&path, tab.doc.file_size, tab.doc.last_modified);
             }
         }
-        self.commit_settings();
+        self.commit_settings(cx);
         match (saved, error) {
             (Some(lossy), _) if lossy => self.set_status(
                 tr_args(
@@ -701,7 +729,7 @@ impl LubanApp {
                     self.large_file.bound_tab = Some(tab_id);
                 }
                 self.settings.add_recent(target.clone());
-                self.commit_settings();
+                self.commit_settings(cx);
                 if lossy {
                     let encoding = self.tabs[index].doc.encoding;
                     self.set_status(
@@ -766,6 +794,132 @@ impl LubanApp {
                     self.finish_save_flow(SaveThen::NextHugeSave, window, cx);
                 } else {
                     self.abort_pending_saves();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Start an OpenHarmony user-storage save through the host URI writer.
+    #[cfg(target_env = "ohos")]
+    pub(super) fn start_host_save(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        then: SaveThen,
+        save_as: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(writer) = crate::ohos_file_save::writer() else {
+            return;
+        };
+        let (bytes, lossy) = match self.tabs[index].doc.encoded_bytes() {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                self.set_status(
+                    tr_args("status.save_failed", &[("error", err.to_string())]),
+                    cx,
+                );
+                self.abort_pending_saves();
+                return;
+            }
+        };
+        let written = bytes.len() as u64;
+        let revision = self.tabs[index].doc.revision();
+        let tab_id = self.tabs[index].id;
+        let name = self.tabs[index].doc.display_name();
+        let encoding = self.tabs[index].doc.encoding;
+        self.release_tab_text(index);
+        let future = writer(path.clone(), bytes);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.finish_host_save(
+                    tab_id, path, written, lossy, revision, name, encoding, save_as, then, result,
+                    window, cx,
+                );
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Complete an OpenHarmony user-storage save.
+    #[cfg(target_env = "ohos")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_host_save(
+        &mut self,
+        tab_id: u64,
+        path: PathBuf,
+        written: u64,
+        lossy: bool,
+        revision: u64,
+        name: String,
+        encoding: TextEncoding,
+        save_as: bool,
+        then: SaveThen,
+        result: std::io::Result<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                self.tabs[index]
+                    .doc
+                    .finish_external_save(path.clone(), written, revision, true);
+                self.tabs[index].highlighted_revision = u64::MAX;
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.external = None;
+                    // The sandbox cannot stat the user file, so verify the
+                    // save by the grace window instead of by metadata.
+                    self.watch.note_saved_unverified(&path);
+                }
+                self.settings.add_recent(path.clone());
+                self.commit_settings(cx);
+                if save_as {
+                    if lossy {
+                        self.set_status(
+                            tr_args(
+                                "status.saved_path_lossy",
+                                &[("path", path.display().to_string())],
+                            ),
+                            cx,
+                        );
+                    } else {
+                        self.set_status(
+                            tr_args("status.saved_path", &[("path", path.display().to_string())]),
+                            cx,
+                        );
+                    }
+                } else if lossy {
+                    self.set_status(
+                        tr_args(
+                            "status.saved_lossy",
+                            &[("name", name), ("encoding", encoding.label())],
+                        ),
+                        cx,
+                    );
+                } else {
+                    self.set_status(tr_args("status.saved", &[("name", name)]), cx);
+                }
+                if let Some(snapshot) = self.plugin_tab_snapshot(index, cx) {
+                    self.plugin_emit(plugin_events::PluginEvent::DocumentSaved(snapshot));
+                }
+                self.finish_save_flow(then, window, cx);
+            }
+            Err(err) => {
+                let err = err.to_string();
+                if self.pending_normal_all {
+                    self.pending_save_failures.push(format!("{name}: {err}"));
+                    self.set_status(tr_args("status.save_failed", &[("error", err)]), cx);
+                    self.save_next_normal(window, cx);
+                } else {
+                    self.abort_pending_saves();
+                    self.set_status(tr_args("status.save_failed", &[("error", err)]), cx);
                 }
             }
         }

@@ -12,7 +12,7 @@ impl LubanApp {
         value: serde_json::Value,
         cx: &mut Context<Self>,
     ) {
-        if self.persist_plugin_setting(plugin_id, key, value) {
+        if self.persist_plugin_setting(plugin_id, key, value, cx) {
             self.plugin_manager.error = None;
         } else {
             self.plugin_manager.error = Some(tr_args(
@@ -34,6 +34,7 @@ impl LubanApp {
         plugin_id: &str,
         key: &str,
         value: serde_json::Value,
+        cx: &mut Context<Self>,
     ) -> bool {
         if !self
             .plugin_host
@@ -47,14 +48,14 @@ impl LubanApp {
             .or_default()
             .insert(key.to_string(), value);
         self.global_settings.plugin_settings = self.settings.plugin_settings.clone();
-        self.commit_settings();
+        self.commit_settings(cx);
         true
     }
 
     pub(super) fn plugin_action_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.plugin_manager.pending_uninstall = None;
         self.reload_plugins(window, cx);
-        self.commit_settings();
+        self.commit_settings(cx);
         self.plugin_manager.message = Some(tr("plugins.reloaded"));
         cx.notify();
     }
@@ -72,7 +73,7 @@ impl LubanApp {
                     self.global_settings.plugin_settings = self.settings.plugin_settings.clone();
                 }
                 self.reload_plugins(window, cx);
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.plugin_manager.pending_uninstall = None;
                 self.plugin_manager.error = None;
                 self.plugin_manager.message = Some(tr_args(
@@ -198,7 +199,7 @@ impl LubanApp {
         self.plugin_manager.store.url_error = None;
         self.settings.plugin_store_url = url.clone();
         self.global_settings.plugin_store_url = url.clone();
-        self.commit_settings();
+        self.commit_settings(cx);
         self.plugin_manager.store.clear_catalog();
         self.plugin_manager.store.error = None;
         self.start_plugin_store_fetch(url, cx);
@@ -216,7 +217,7 @@ impl LubanApp {
         self.plugin_manager.store.url_error = None;
         self.settings.plugin_store_url = url.clone();
         self.global_settings.plugin_store_url = url.clone();
-        self.commit_settings();
+        self.commit_settings(cx);
         self.plugin_manager.store.clear_catalog();
         self.plugin_manager.store.error = None;
         self.start_plugin_store_fetch(url, cx);
@@ -259,7 +260,7 @@ impl LubanApp {
                 let message = match result {
                     Ok(record) => {
                         self.reload_plugins_now(cx);
-                        self.commit_settings();
+                        self.commit_settings(cx);
                         Ok(tr_args(
                             "plugins.store.installed",
                             &[
@@ -1656,7 +1657,7 @@ impl LubanApp {
                                 let _ = weak_toggle.update(cx, |this, cx| {
                                     this.settings.plugins_enabled = *this_checked;
                                     this.global_settings.plugins_enabled = *this_checked;
-                                    this.commit_settings();
+                                    this.commit_settings(cx);
                                     this.plugin_action_reload(window, cx);
                                 });
                             }),

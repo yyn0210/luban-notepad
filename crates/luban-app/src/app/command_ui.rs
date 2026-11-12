@@ -134,7 +134,7 @@ impl LubanApp {
             "file.clear-recent-workspaces" => {
                 self.settings.recent_workspaces.clear();
                 self.global_settings.recent_workspaces.clear();
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.set_status(tr("workspace.recent_cleared"), cx);
             }
             "tree.new-file" | "tree.new-folder" | "tree.rename" | "tree.delete"

@@ -1511,7 +1511,7 @@ impl LubanApp {
 
     pub(super) fn end_find_drag(&mut self, cx: &mut Context<Self>) {
         if self.find.drag_offset.take().is_some() {
-            self.persist_find_geometry();
+            self.persist_find_geometry(cx);
             cx.notify();
         }
     }
@@ -1558,19 +1558,19 @@ impl LubanApp {
 
     pub(super) fn end_find_resize(&mut self, cx: &mut Context<Self>) {
         if self.find.resize_origin.take().is_some() {
-            self.persist_find_geometry();
+            self.persist_find_geometry(cx);
             cx.notify();
         }
     }
 
-    fn persist_find_geometry(&mut self) {
+    fn persist_find_geometry(&mut self, cx: &mut Context<Self>) {
         self.settings.find_window = FindWindowPlacement {
             x: Some(self.find.window_x),
             y: Some(self.find.window_y),
             width: self.find.window_width,
             height: self.find.window_height,
         };
-        self.commit_settings();
+        self.commit_settings(cx);
     }
 
     // ------------------------------------------------------------------
@@ -1624,7 +1624,7 @@ impl LubanApp {
             return;
         }
         self.settings.record_search(&query);
-        self.commit_settings();
+        self.commit_settings(cx);
         if self.find.dirty {
             let text = self
                 .tabs

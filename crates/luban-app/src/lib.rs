@@ -24,6 +24,8 @@ mod large_file;
 mod logging;
 mod macro_ui;
 mod navigation;
+#[cfg(target_env = "ohos")]
+pub mod ohos_file_save;
 mod outline;
 mod palette;
 mod path_prompt;

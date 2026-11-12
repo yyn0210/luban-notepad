@@ -468,7 +468,7 @@ impl LubanApp {
         self.window_height = size.height.into();
         self.window_maximized = window.is_maximized();
         self.save_session_now(cx);
-        self.commit_settings();
+        self.commit_settings(cx);
     }
 
     pub(super) fn save_session_now(&mut self, cx: &mut Context<Self>) {

@@ -4148,6 +4148,7 @@ dependencies = [
  "napi-build-ohos",
  "napi-derive-ohos",
  "napi-ohos",
+ "ohos-fileuri-binding",
  "openharmony-ability",
  "openharmony-ability-derive",
 ]

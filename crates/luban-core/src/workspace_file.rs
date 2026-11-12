@@ -184,8 +184,16 @@ impl WorkspaceFile {
         })
     }
 
+    /// Serialize the workspace exactly as [`Self::save_to`] writes it.
+    ///
+    /// Hosts that cannot open the destination path directly (the OpenHarmony
+    /// sandbox) hand these bytes to their own writer instead.
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
+        let json = self.to_json()?;
         crate::atomic_write::write_atomic(path, json.as_bytes())?;
         Ok(())
     }

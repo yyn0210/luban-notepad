@@ -214,7 +214,7 @@ impl LubanApp {
                         this.set_plugin_cursor(line, col, window, cx);
                     }
                     luban_plugin::runtime::HostAction::SetSetting { key, value } => {
-                        if this.persist_plugin_setting(plugin_id, &key, value) {
+                        if this.persist_plugin_setting(plugin_id, &key, value, cx) {
                             cx.notify();
                         } else {
                             ok = false;
@@ -1004,7 +1004,7 @@ impl LubanApp {
             self.settings
                 .plugin_panel_widths
                 .insert(drag.panel_key, width);
-            self.commit_settings();
+            self.commit_settings(cx);
         }
         cx.notify();
     }

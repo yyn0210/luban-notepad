@@ -245,7 +245,7 @@ impl LubanApp {
                     .map(|range| range.end.saturating_sub(range.start))
                     .unwrap_or(size);
                 self.settings.add_recent(path.clone());
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.add_document(doc, window, cx);
                 let tab_id = self.active_tab().map(|tab| tab.id);
                 if is_current_target {
@@ -488,7 +488,7 @@ impl LubanApp {
                 let total = doc.file_size;
                 let partial = doc.partial_range();
                 self.settings.add_recent(path.clone());
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.add_document(doc, window, cx);
                 let tab_id = self.active_tab().map(|tab| tab.id);
                 if is_current_target {

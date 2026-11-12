@@ -1862,7 +1862,7 @@ impl LubanApp {
             Ok(doc) => {
                 let non_text = doc.is_non_text();
                 self.settings.add_recent(path.clone());
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.add_document(doc, window, cx);
                 let status = if non_text {
                     tr_args(
@@ -1985,7 +1985,7 @@ impl LubanApp {
             Ok(doc) => {
                 let non_text = doc.is_non_text();
                 self.settings.add_recent(path.clone());
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.add_document(doc, window, cx);
                 let status = if non_text {
                     tr_args(
@@ -2474,6 +2474,31 @@ impl LubanApp {
                 .collect(),
             settings: self.workspace_settings.clone(),
         };
+        #[cfg(target_env = "ohos")]
+        if crate::ohos_file_save::is_user_path(path) {
+            if let Some(writer) = crate::ohos_file_save::writer() {
+                let json = match workspace.to_json() {
+                    Ok(json) => json,
+                    Err(error) => {
+                        self.set_status(
+                            tr_args("workspace.save_failed", &[("error", error.to_string())]),
+                            cx,
+                        );
+                        return false;
+                    }
+                };
+                let path = path.to_path_buf();
+                let future = writer(path.clone(), json.into_bytes());
+                cx.spawn(async move |this, cx| {
+                    let result = future.await.map_err(|error| error.to_string());
+                    let _ = this.update(cx, |app, cx| {
+                        app.finish_workspace_save(path, result, cx);
+                    });
+                })
+                .detach();
+                return true;
+            }
+        }
         match workspace.save_to(path) {
             Ok(()) => {
                 self.workspace_file = Some(path.to_path_buf());
@@ -2493,6 +2518,34 @@ impl LubanApp {
                     cx,
                 );
                 false
+            }
+        }
+    }
+
+    /// Record a workspace the host wrote through a picker URI.
+    #[cfg(target_env = "ohos")]
+    fn finish_workspace_save(
+        &mut self,
+        path: PathBuf,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.workspace_file = Some(path.clone());
+                self.settings.add_recent_workspace(path.clone());
+                self.global_settings.add_recent_workspace(path.clone());
+                let _ = self.global_settings.save();
+                self.set_status(
+                    tr_args("workspace.saved", &[("path", path.display().to_string())]),
+                    cx,
+                );
+                // `save_workspace` records the session before the asynchronous
+                // write completes; persist it again with the workspace path.
+                self.save_session_now(cx);
+            }
+            Err(error) => {
+                self.set_status(tr_args("workspace.save_failed", &[("error", error)]), cx)
             }
         }
     }
@@ -3247,7 +3300,11 @@ impl LubanApp {
             .get(&self.preferences.language)
     }
 
-    fn update_language_override(&mut self, update: impl FnOnce(&mut LanguageSettings)) {
+    fn update_language_override(
+        &mut self,
+        update: impl FnOnce(&mut LanguageSettings),
+        cx: &mut Context<Self>,
+    ) {
         let language = self.preferences.language.clone();
         let mut entry = self
             .settings
@@ -3261,17 +3318,17 @@ impl LubanApp {
         } else {
             self.settings.language_settings.insert(language, entry);
         }
-        self.commit_settings();
+        self.commit_settings(cx);
     }
 
     fn set_language_use_spaces(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
-        self.update_language_override(|entry| entry.use_spaces = value);
+        self.update_language_override(|entry| entry.use_spaces = value, cx);
         self.apply_language_indent_to_open_tabs(cx);
         cx.notify();
     }
 
     fn set_language_eol(&mut self, value: Option<Eol>, cx: &mut Context<Self>) {
-        self.update_language_override(|entry| entry.eol = value);
+        self.update_language_override(|entry| entry.eol = value, cx);
         cx.notify();
     }
 
@@ -3291,7 +3348,7 @@ impl LubanApp {
                     );
                     return;
                 }
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.set_status(
                     tr_args(
                         "status.theme_imported",
@@ -3329,7 +3386,7 @@ impl LubanApp {
         self.settings.syntax_theme = id.to_string();
         match syntax_theme::apply(&self.settings, cx) {
             Ok(()) => {
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.set_status(tr("status.theme_applied"), cx);
             }
             Err(error) => {
@@ -3416,6 +3473,21 @@ impl LubanApp {
             ExportFormat::Rtf => export::to_rtf(&text, &token, &theme),
         };
         self.release_active_text();
+        #[cfg(target_env = "ohos")]
+        if crate::ohos_file_save::is_user_path(path) {
+            if let Some(writer) = crate::ohos_file_save::writer() {
+                let path = path.to_path_buf();
+                let future = writer(path.clone(), content.into_bytes());
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = future.await.map_err(|error| error.to_string());
+                    let _ = this.update_in(cx, |app, _window, cx| {
+                        app.finish_export(path, result, cx);
+                    });
+                })
+                .detach();
+                return;
+            }
+        }
         match write_atomic(path, content.as_bytes()) {
             Ok(()) => self.set_status(
                 tr_args("status.exported", &[("path", path.display().to_string())]),
@@ -3425,6 +3497,18 @@ impl LubanApp {
                 tr_args("status.export_failed", &[("error", err.to_string())]),
                 cx,
             ),
+        }
+    }
+
+    /// Report the result of an export the host wrote through a picker URI.
+    #[cfg(target_env = "ohos")]
+    fn finish_export(&mut self, path: PathBuf, result: Result<(), String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(()) => self.set_status(
+                tr_args("status.exported", &[("path", path.display().to_string())]),
+                cx,
+            ),
+            Err(error) => self.set_status(tr_args("status.export_failed", &[("error", error)]), cx),
         }
     }
 
@@ -3453,6 +3537,13 @@ impl LubanApp {
         if !self.tabs[index].doc.is_non_text() {
             self.snapshot_before_save(&request.path, cx);
         }
+        #[cfg(target_env = "ohos")]
+        if crate::ohos_file_save::is_user_path(&request.path)
+            && crate::ohos_file_save::writer().is_some()
+        {
+            self.start_host_save(index, request.path, request.then, true, window, cx);
+            return;
+        }
         let lossy = match self.tabs[index].doc.save_as(&request.path) {
             Ok(lossy) => lossy,
             Err(err) => {
@@ -3474,7 +3565,7 @@ impl LubanApp {
                 .note_saved(&request.path, tab.doc.file_size, tab.doc.last_modified);
         }
         self.settings.add_recent(request.path.clone());
-        self.commit_settings();
+        self.commit_settings(cx);
         if lossy {
             self.set_status(
                 tr_args(
@@ -3539,6 +3630,21 @@ impl LubanApp {
                 return;
             }
         };
+        #[cfg(target_env = "ohos")]
+        if crate::ohos_file_save::is_user_path(path) {
+            if let Some(writer) = crate::ohos_file_save::writer() {
+                let path = path.to_path_buf();
+                let future = writer(path.clone(), json.into_bytes());
+                cx.spawn(async move |this, cx| {
+                    let result = future.await.map_err(|error| error.to_string());
+                    let _ = this.update(cx, |app, cx| {
+                        app.finish_export_settings(path, result, cx);
+                    });
+                })
+                .detach();
+                return;
+            }
+        }
         match write_atomic(path, json.as_bytes()) {
             Ok(()) => self.set_status(
                 tr_args("settings.exported", &[("path", path.display().to_string())]),
@@ -3548,6 +3654,25 @@ impl LubanApp {
                 tr_args("settings.export_failed", &[("error", error.to_string())]),
                 cx,
             ),
+        }
+    }
+
+    /// Report the result of a settings export the host wrote through a URI.
+    #[cfg(target_env = "ohos")]
+    fn finish_export_settings(
+        &mut self,
+        path: PathBuf,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(()) => self.set_status(
+                tr_args("settings.exported", &[("path", path.display().to_string())]),
+                cx,
+            ),
+            Err(error) => {
+                self.set_status(tr_args("settings.export_failed", &[("error", error)]), cx)
+            }
         }
     }
 
@@ -4501,13 +4626,13 @@ impl LubanApp {
 
     pub fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.settings.font_size = (self.settings.font_size + delta).clamp(6.0, 48.0);
-        self.commit_settings();
+        self.commit_settings(cx);
         cx.notify();
     }
 
     pub fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         self.settings.font_size = 14.0;
-        self.commit_settings();
+        self.commit_settings(cx);
         cx.notify();
     }
 
@@ -4542,7 +4667,7 @@ impl LubanApp {
             self.tabs[index].bracket_key = None;
         }
         if persist {
-            self.commit_settings();
+            self.commit_settings(cx);
         }
         self.explorer.refresh();
         cx.notify();
@@ -4550,7 +4675,10 @@ impl LubanApp {
 
     /// Persist global-only fields globally and overridable fields either to
     /// the workspace file or to the global settings.
-    fn commit_settings(&mut self) {
+    fn commit_settings(&mut self, cx: &mut Context<Self>) {
+        // Only the OpenHarmony host-writer branch below needs the context.
+        #[cfg(not(target_env = "ohos"))]
+        let _ = cx;
         let mut global = self.global_settings.clone();
         global.merge_global_fields_from(&self.settings);
         if let Some(path) = self.workspace_file.clone() {
@@ -4561,8 +4689,14 @@ impl LubanApp {
                 roots: self.workspace_roots.clone(),
                 settings: self.workspace_settings.clone(),
             };
-            if let Err(error) = workspace.save_to(&path) {
-                log::warn!("could not save workspace {}: {error}", path.display());
+            #[cfg(target_env = "ohos")]
+            let save_through_host = self.commit_workspace_through_host(&path, &workspace, cx);
+            #[cfg(not(target_env = "ohos"))]
+            let save_through_host = false;
+            if !save_through_host {
+                if let Err(error) = workspace.save_to(&path) {
+                    log::warn!("could not save workspace {}: {error}", path.display());
+                }
             }
             self.global_settings = global;
         } else {
@@ -4571,6 +4705,45 @@ impl LubanApp {
         if let Err(err) = self.global_settings.save() {
             log::warn!("could not save settings: {err}");
         }
+    }
+
+    /// Persist the workspace file through the host URI writer.
+    ///
+    /// Settings commits happen on almost every UI change, so they must not
+    /// report status messages or fail on the sandbox path. Returns `true` when
+    /// the write was dispatched.
+    #[cfg(target_env = "ohos")]
+    fn commit_workspace_through_host(
+        &self,
+        path: &Path,
+        workspace: &WorkspaceFile,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !crate::ohos_file_save::is_user_path(path) {
+            return false;
+        }
+        let Some(writer) = crate::ohos_file_save::writer() else {
+            return false;
+        };
+        let json = match workspace.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                log::warn!("could not serialize workspace {}: {error}", path.display());
+                return false;
+            }
+        };
+        let path = path.to_path_buf();
+        let future = writer(path.clone(), json.into_bytes());
+        cx.spawn(async move |_, _cx| {
+            if let Err(error) = future.await {
+                log::warn!(
+                    "could not save workspace {} through the host: {error}",
+                    path.display()
+                );
+            }
+        })
+        .detach();
+        true
     }
 
     fn toggle_macro_recording(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -4627,7 +4800,7 @@ impl LubanApp {
             .upsert(&name, self.macro_recorded.clone())
         {
             Ok(()) => {
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.macro_ui.open = false;
                 self.macro_ui.error = None;
                 self.macro_ui.overwrite_pending = None;
@@ -4690,7 +4863,7 @@ impl LubanApp {
 
     fn delete_macro(&mut self, name: &str, cx: &mut Context<Self>) {
         self.settings.macros.remove(name);
-        self.commit_settings();
+        self.commit_settings(cx);
         self.rebuild_macro_keymap();
         self.macro_ui.selected = None;
         self.set_status(
@@ -4709,7 +4882,7 @@ impl LubanApp {
         let new = self.macro_ui.name_input.read(cx).value().trim().to_string();
         match self.settings.macros.rename(&old, &new) {
             Ok(()) => {
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.macro_ui.selected = Some(new.clone());
                 self.macro_ui.error = None;
                 self.rebuild_macro_keymap();
@@ -4732,7 +4905,7 @@ impl LubanApp {
         let text = self.macro_ui.shortcut_input.read(cx).value().to_string();
         if text.trim().is_empty() {
             self.settings.macros.remove_binding(&name);
-            self.commit_settings();
+            self.commit_settings(cx);
             self.rebuild_macro_keymap();
             self.macro_ui.error = None;
             self.set_status(tr("status.macro_shortcut_removed"), cx);
@@ -4747,7 +4920,7 @@ impl LubanApp {
         ) {
             Ok(formatted) => {
                 self.settings.macros.set_binding(&name, formatted);
-                self.commit_settings();
+                self.commit_settings(cx);
                 self.rebuild_macro_keymap();
                 self.macro_ui.error = None;
                 self.set_status(tr("status.macro_shortcut_saved"), cx);
@@ -4814,7 +4987,7 @@ impl LubanApp {
         self.plugin_host
             .set_locale(crate::i18n::active_locale().as_str());
         self.refresh_open_plugin_panel(window, cx);
-        self.commit_settings();
+        self.commit_settings(cx);
         for tab in &mut self.tabs {
             if tab.doc.path.is_some() {
                 continue;

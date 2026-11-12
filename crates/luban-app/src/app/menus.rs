@@ -1043,7 +1043,7 @@ impl LubanApp {
                         Some(settings.show_toolbar),
                         |this, _window, cx| {
                             this.settings.show_toolbar = !this.settings.show_toolbar;
-                            this.commit_settings();
+                            this.commit_settings(cx);
                             cx.notify();
                         },
                     ))
@@ -1054,7 +1054,7 @@ impl LubanApp {
                         Some(settings.show_status_bar),
                         |this, _window, cx| {
                             this.settings.show_status_bar = !this.settings.show_status_bar;
-                            this.commit_settings();
+                            this.commit_settings(cx);
                             cx.notify();
                         },
                     ))
@@ -1065,7 +1065,7 @@ impl LubanApp {
                         Some(settings.show_file_explorer),
                         |this, _window, cx| {
                             this.settings.show_file_explorer = !this.settings.show_file_explorer;
-                            this.commit_settings();
+                            this.commit_settings(cx);
                             cx.notify();
                         },
                     ))

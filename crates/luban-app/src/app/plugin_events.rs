@@ -441,7 +441,7 @@ impl LubanApp {
             );
         }
         self.global_settings.disabled_plugins = self.settings.disabled_plugins.clone();
-        self.commit_settings();
+        self.commit_settings(cx);
         self.reload_plugins(window, cx);
     }
 

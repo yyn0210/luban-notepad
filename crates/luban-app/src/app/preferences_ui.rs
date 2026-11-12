@@ -1325,7 +1325,7 @@ impl LubanApp {
                                             let _ = weak_plugins.update(cx, |this, cx| {
                                                 this.settings.plugins_enabled = *checked;
                                                 this.global_settings.plugins_enabled = *checked;
-                                                this.commit_settings();
+                                                this.commit_settings(cx);
                                                 this.plugin_action_reload(window, cx);
                                             });
                                         }),

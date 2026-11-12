@@ -20,6 +20,14 @@ fn openharmony_app(app: OpenHarmonyApp) {
         std::env::set_var("LUBAN_NOTEPAD_CONFIG_DIR", &config_dir);
     }
 
+    // The system picker grants URI access, not directory access, so saves to
+    // user storage go through the ArkTS `fs` plugin instead of POSIX writes.
+    crate::file_io::register(&app).expect("failed to register the OHOS file I/O plugin");
+    let writer_app = app.clone();
+    let _ = luban_app::ohos_file_save::set_writer(Box::new(move |path, bytes| {
+        crate::file_io::write_uri(writer_app.clone(), path, bytes)
+    }));
+
     // Persist picker/drag/URI grants across restarts. The OHOS module manifest
     // must declare `ohos.permission.FILE_ACCESS_PERSIST`; grant restoration
     // starts in the background after the first presented frame.

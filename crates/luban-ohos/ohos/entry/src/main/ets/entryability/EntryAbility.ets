@@ -10,6 +10,7 @@ import { SystemStatePlugin } from "@ohos-rs/ability-plugin-system-state";
 import { UrlPlugin } from "@ohos-rs/ability-plugin-url";
 import { WindowPlugin } from "@ohos-rs/ability-plugin-window";
 import * as nativeModule from "libluban_ohos.so";
+import { FileIoPlugin } from "../common/FileIoPlugin";
 
 /**
  * Hosts the gpui-ohos platform. `moduleName` must match the Rust `[lib] name`
@@ -23,6 +24,7 @@ export default class EntryAbility extends NativeAbility {
     new LazyPlugin(() => new AppControlPlugin()),
     new LazyPlugin(() => new ClipboardPlugin()),
     new LazyPlugin(() => new FilesPlugin()),
+    new LazyPlugin(() => new FileIoPlugin()),
     new LazyPlugin(() => new MenuPlugin()),
     new LazyPlugin(() => new NotificationPlugin({ scheme: "luban-notification" })),
     new LazyPlugin(() => new PermissionPlugin()),

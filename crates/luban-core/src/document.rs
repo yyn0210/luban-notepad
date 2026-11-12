@@ -1026,6 +1026,75 @@ impl Document {
         Ok(lossy)
     }
 
+    /// Encode the document exactly as [`Self::save_to_path`] would write it.
+    ///
+    /// Hosts that must write through a file descriptor (the OpenHarmony
+    /// document picker grants URI access, not directory access) use this to
+    /// produce the bytes before handing them to the platform writer.
+    pub fn encoded_bytes(&self) -> Result<(Vec<u8>, bool)> {
+        if self.read_only {
+            return Err(Error::Other(crate::i18n::tr("core.document.read_only")));
+        }
+        if self.text_detached {
+            return Err(Error::Other("document text is not materialized".into()));
+        }
+        let encoded = if self.non_text {
+            // Non-text buffers were decoded reversibly and keep their original
+            // line endings; write them back without normalization so untouched
+            // bytes stay identical.
+            encoding::encode(&self.text, self.encoding)
+        } else if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom)
+            && self.eol == Eol::Lf
+            && !self.text.as_bytes().contains(&b'\r')
+        {
+            // Fast path: LF UTF-8 is already the on-disk representation.
+            let mut bytes = Vec::with_capacity(self.encoding.bom().len() + self.text.len());
+            bytes.extend_from_slice(self.encoding.bom());
+            bytes.extend_from_slice(self.text.as_bytes());
+            (bytes, false)
+        } else {
+            let with_eol = eol::normalize(&self.text, self.eol);
+            if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom) {
+                let mut bytes = Vec::with_capacity(self.encoding.bom().len() + with_eol.len());
+                bytes.extend_from_slice(self.encoding.bom());
+                bytes.extend_from_slice(with_eol.as_bytes());
+                (bytes, false)
+            } else {
+                encoding::encode(&with_eol, self.encoding)
+            }
+        };
+        Ok(encoded)
+    }
+
+    /// Finish a save whose bytes a host service wrote through a URI.
+    ///
+    /// `revision` is the document revision captured when the bytes were
+    /// encoded. If the document changed while the write was in flight, the
+    /// path and metadata still update but the tab stays modified, so the next
+    /// save writes the newer text.
+    pub fn finish_external_save(
+        &mut self,
+        path: PathBuf,
+        written: u64,
+        revision: u64,
+        mark_saved_when_unchanged: bool,
+    ) {
+        if mark_saved_when_unchanged && self.revision == revision {
+            self.mark_saved();
+        }
+        let was_plain = self.language == language::PLAIN_TEXT;
+        self.path = Some(path);
+        self.partial = None;
+        self.file_size = written;
+        self.last_modified = Some(SystemTime::now());
+        if was_plain && !self.text_detached {
+            self.auto_detect_language();
+        }
+        if !self.text_detached {
+            self.prime_char_count();
+        }
+    }
+
     fn save_to_path(&mut self, path: &Path) -> Result<bool> {
         if self.read_only {
             return Err(Error::Other(crate::i18n::tr("core.document.read_only")));

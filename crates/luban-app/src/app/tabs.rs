@@ -1762,11 +1762,11 @@ impl LubanApp {
             .trim()
             .to_string();
         if value.is_empty() {
-            self.update_language_override(|entry| entry.tab_size = None);
+            self.update_language_override(|entry| entry.tab_size = None, cx);
         } else {
             match value.parse::<usize>() {
                 Ok(size) if (1..=16).contains(&size) => {
-                    self.update_language_override(|entry| entry.tab_size = Some(size));
+                    self.update_language_override(|entry| entry.tab_size = Some(size), cx);
                 }
                 _ => {
                     self.set_status(tr("prefs.language_tab_invalid"), cx);

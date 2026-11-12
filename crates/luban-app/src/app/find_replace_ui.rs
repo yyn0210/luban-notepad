@@ -44,7 +44,7 @@ impl LubanApp {
     pub(super) fn clear_search_history(&mut self, cx: &mut Context<Self>) {
         self.settings.search_history.clear();
         self.settings.replace_history.clear();
-        self.commit_settings();
+        self.commit_settings(cx);
         self.set_status(tr("status.search_history_cleared"), cx);
         cx.notify();
     }
@@ -153,7 +153,7 @@ impl LubanApp {
             return;
         }
         self.settings.record_search(&query);
-        self.commit_settings();
+        self.commit_settings(cx);
         self.record_navigation(cx);
         if self.find.in_selection && self.find.scope.is_none() {
             let (a, b) = self.active_selection();
@@ -278,7 +278,7 @@ impl LubanApp {
         }
         self.settings.record_search(&query);
         self.settings.record_replacement(&replacement);
-        self.commit_settings();
+        self.commit_settings(cx);
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -421,7 +421,7 @@ impl LubanApp {
         }
         self.settings.record_search(&query);
         self.settings.record_replacement(&replacement);
-        self.commit_settings();
+        self.commit_settings(cx);
         if !self.ensure_active_text(cx) {
             return;
         }
@@ -505,7 +505,7 @@ impl LubanApp {
         }
         self.settings.record_search(&query);
         self.settings.record_replacement(&replacement);
-        self.commit_settings();
+        self.commit_settings(cx);
         let engine = self.find.engine(&query);
         if let Some(error) = engine.error() {
             self.find.error = Some(error.to_string());
@@ -1050,7 +1050,7 @@ impl LubanApp {
             return;
         }
         self.settings.record_search(&query);
-        self.commit_settings();
+        self.commit_settings(cx);
         if self.find_in_files.open_documents {
             self.search_open_documents(cx);
             return;

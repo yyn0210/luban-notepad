@@ -281,7 +281,9 @@ impl LubanApp {
             let result = receiver.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(Ok(Some(path))) => {
-                    this.apply_save_path(purpose, path, window, cx);
+                    // The system save dialog already asks before replacing an
+                    // existing file, so do not show a second confirmation.
+                    this.apply_save_path(purpose, path, true, window, cx);
                 }
                 Ok(Ok(None)) => {
                     if started.elapsed() < PICKER_START_WINDOW {
@@ -1235,7 +1237,7 @@ impl LubanApp {
         };
         let current_dir = dialog.dir.clone();
         dialog.remember_recent(&current_dir);
-        self.persist_file_picker_recent(&dialog);
+        self.persist_file_picker_recent(&dialog, cx);
         let typed = self.file_path_input.read(cx).value().to_string();
         let typed = typed.trim().to_string();
         let name = self.file_name_input.read(cx).value().to_string();
@@ -1340,7 +1342,7 @@ impl LubanApp {
                     self.file_picker_error(tr("dialog.target_is_folder"), cx);
                     return;
                 }
-                self.apply_save_path(dialog.purpose.clone(), candidate, window, cx);
+                self.apply_save_path(dialog.purpose.clone(), candidate, false, window, cx);
             }
             FileDialogMode::Folder => {
                 let candidate = if let Some(path) = typed_override {
@@ -1457,6 +1459,7 @@ impl LubanApp {
         &mut self,
         purpose: FileDialogPurpose,
         candidate: PathBuf,
+        system_picker: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1467,14 +1470,21 @@ impl LubanApp {
                     path: candidate,
                     then,
                 };
-                if request.path.exists() {
+                // The OHOS system picker creates a placeholder for a new file
+                // and asks the user before replacing an existing one, so an
+                // existence check here would either prompt twice or report a
+                // placeholder as an overwrite.
+                if request.path.exists() && !system_picker {
                     self.overwrite_save = Some(request);
                 } else {
                     self.save_as_request(request, window, cx);
                 }
             }
             FileDialogPurpose::Export { format } => {
-                if candidate.exists() {
+                // The OHOS system dialog already asked before replacing an
+                // existing file, and its sandbox path cannot be stat'ed
+                // reliably, so it never reaches the in-app prompt.
+                if candidate.exists() && !system_picker {
                     self.pending_export = Some(format);
                     self.overwrite_save = Some(SaveAsRequest {
                         tab_id: 0,
@@ -1532,7 +1542,7 @@ impl LubanApp {
 
     pub(super) fn cancel_file_dialog(&mut self, cx: &mut Context<Self>) {
         if let Some(dialog) = self.file_dialog.take() {
-            self.persist_file_picker_recent(&dialog);
+            self.persist_file_picker_recent(&dialog, cx);
             if let FileDialogPurpose::SaveAs {
                 then: SaveThen::Exit | SaveThen::CloseAll | SaveThen::NextTrimSave,
                 ..
@@ -1547,10 +1557,10 @@ impl LubanApp {
         cx.notify();
     }
 
-    fn persist_file_picker_recent(&mut self, dialog: &FileDialogState) {
+    fn persist_file_picker_recent(&mut self, dialog: &FileDialogState, cx: &mut Context<Self>) {
         if self.settings.recent_dirs != dialog.recent_dirs {
             self.settings.recent_dirs = dialog.recent_dirs.clone();
-            self.commit_settings();
+            self.commit_settings(cx);
         }
     }
 
