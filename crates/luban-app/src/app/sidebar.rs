@@ -570,7 +570,7 @@ impl LubanApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if modifiers.control || modifiers.secondary() || modifiers.alt || modifiers.shift {
+        if modifiers.control || modifiers.secondary(cx) || modifiers.alt || modifiers.shift {
             return false;
         }
         if !self.settings.show_outline
@@ -654,10 +654,10 @@ impl LubanApp {
             return false;
         }
         let plain =
-            !modifiers.control && !modifiers.secondary() && !modifiers.alt && !modifiers.shift;
+            !modifiers.control && !modifiers.secondary(cx) && !modifiers.alt && !modifiers.shift;
         if !plain {
             if key == "n"
-                && (modifiers.control || modifiers.secondary())
+                && (modifiers.control || modifiers.secondary(cx))
                 && !modifiers.shift
                 && !modifiers.alt
             {

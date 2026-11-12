@@ -621,6 +621,9 @@ dialog.loading:
 dialog.list_failed:
   en: "Could not read this folder: %{error}"
   zh-CN: "无法读取此文件夹：%{error}"
+dialog.list_sandbox_denied:
+  en: "HarmonyOS does not allow the app to read this folder. Use the system file picker to open files outside the app sandbox."
+  zh-CN: "鸿蒙不允许应用直接读取该目录。请使用系统文件选择器打开应用沙箱之外的文件。"
 dialog.back:
   en: "Back"
   zh-CN: "后退"
@@ -699,6 +702,12 @@ dialog.place_documents:
 dialog.place_downloads:
   en: "Downloads"
   zh-CN: "下载"
+dialog.place_sandbox_documents:
+  en: "App documents"
+  zh-CN: "应用文档"
+dialog.place_app_files:
+  en: "App files"
+  zh-CN: "应用文件"
 dialog.place_current_file:
   en: "Current file folder"
   zh-CN: "当前文件所在文件夹"
@@ -1031,6 +1040,9 @@ status.save_cancelled:
 status.save_cancelled_close:
   en: "Save cancelled; close aborted"
   zh-CN: "已取消保存；关闭操作已中止"
+status.picker_fallback:
+  en: "The system file picker is unavailable; using the built-in picker."
+  zh-CN: "系统文件选择器不可用，已切换到应用内选择器。"
 
 lfc.title:
   en: "Large File Controller"
@@ -1875,6 +1887,9 @@ dialog.export_rtf:
 dialog.not_a_file:
   en: "Please select a file"
   zh-CN: "请选择文件"
+dialog.select_open_file:
+  en: "Select a file to open"
+  zh-CN: "请选择要打开的文件"
 dialog.select_file:
   en: "Select a theme file first"
   zh-CN: "请先选择主题文件"

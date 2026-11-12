@@ -1,0 +1,33 @@
+[package]
+name = "luban-ohos"
+description = "OpenHarmony entry point for Luban Notepad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "luban_ohos"
+crate-type = ["cdylib"]
+doctest = false
+test = false
+
+[dependencies]
+luban-app = { path = "../luban-app" }
+log.workspace = true
+
+# The OpenHarmony dependencies are target-gated so that this package stays a
+# cheap, buildable member of the desktop workspace. `ohrs build --arch arm64`
+# targets `aarch64-unknown-linux-ohos` (target_env = "ohos") and activates them.
+[target.'cfg(target_env = "ohos")'.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui-ohos = { path = "../../vendor/gpui-ohos", default-features = false, features = ["gles"] }
+openharmony-ability = { version = "1.0.0-beta.5", features = ["keyboard", "mouse", "drag"] }
+openharmony-ability-derive = "1.0.0-beta.5"
+napi-ohos = "=1.2.0"
+napi-derive-ohos = "=1.2.0"
+
+[build-dependencies]
+napi-build-ohos = "=1.2.0"

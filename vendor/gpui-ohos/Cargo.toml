@@ -1,0 +1,138 @@
+[workspace]
+members = []
+exclude = ["example"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = true
+
+[workspace.dependencies]
+accesskit_ohos = { package = "accesskit_ohos_pre", version = "0.0.2", features = ["api-15"] }
+anyhow = "1"
+bytemuck = "1"
+crossbeam-channel = "0.5"
+cosmic-text = "0.17.0"
+harfrust = "0.5.2"
+swash = "0.2.10"
+unicode-segmentation = "1.12"
+etagere = "0.2"
+font-kit = { package = "zed-font-kit", version = "0.14.1-zed", features = ["source-fontconfig-dlopen"] }
+futures = "0.3.34"
+gpui = { package = "gpui-pre", version = "0.3.11", default-features = false }
+gpui-fast = { package = "gpui-fast", version = "=0.1.13", default-features = false }
+itertools = "0.14.0"
+image = { version = "0.25.1", default-features = false }
+log = "0.4"
+ohos-accessibility-binding = "0.2.0"
+ohos-asset-binding = "0.1.6"
+ohos-device-binding = "0.1.0"
+ohos-fileuri-binding = "0.2.4"
+ohos-fileshare-binding = "0.2.4"
+ohos-init-binding = "0.1.4"
+ohos-resource-manager-binding = "0.3.6"
+ohos-vsync-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
+napi-ohos = "=1.2.0"
+napi-derive-ohos = "=1.2.0"
+openharmony-ability = { version = "1.0.0-beta.5", features = ["keyboard", "mouse", "drag"] }
+openharmony-ability-plugin-audio = "1.0.0-beta.4"
+openharmony-ability-plugin-menu = "1.0.0-beta.5"
+openharmony-ability-plugin-notification = "1.0.0-beta.5"
+openharmony-ability-plugin-resource = "1.0.0-beta.5"
+openharmony-ability-plugin-system-state = "1.0.0-beta.5"
+openharmony-ability-plugin-app-control = "1.0.0-beta.5"
+openharmony-ability-plugin-clipboard = { version = "1.0.0-beta.5", features = ["api-18"] }
+openharmony-ability-plugin-files = "1.0.0-beta.5"
+openharmony-ability-plugin-url = "1.0.0-beta.5"
+openharmony-ability-plugin-window = "1.0.0-beta.5"
+parking_lot = "0.12.1"
+profiling = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+raw-window-handle = "0.6"
+rustc-hash = "2"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+sha2 = "0.10"
+smol = "2.0"
+uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
+url = "2"
+unicode-script = "0.5"
+wgpu = { version = "30.0.1", default-features = false, features = ["parking_lot", "std", "wgsl"] }
+
+[package]
+name = "gpui-ohos"
+version = "0.0.1-beta.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "OpenHarmony platform support for GPUI"
+repository = "https://github.com/ohos-rs/gpui-ohos"
+
+[features]
+default = ["gles"]
+fast = ["dep:gpui-fast"]
+gles = ["wgpu/gles"]
+vulkan = ["wgpu/vulkan"]
+native-vsync = ["dep:ohos-vsync-binding"]
+audio = ["dep:openharmony-ability-plugin-audio"]
+grid = ["dep:harfrust"]
+native-input = []
+api-19 = ["openharmony-ability/api-19"]
+api-26 = ["api-19", "openharmony-ability/api-26"]
+
+[lib]
+name = "gpui_ohos"
+path = "src/gpui_ohos.rs"
+
+[dependencies]
+accesskit_ohos.workspace = true
+gpui.workspace = true
+gpui-fast = { workspace = true, optional = true }
+anyhow.workspace = true
+bytemuck.workspace = true
+cosmic-text.workspace = true
+harfrust = { workspace = true, optional = true }
+swash.workspace = true
+unicode-segmentation.workspace = true
+etagere.workspace = true
+font-kit.workspace = true
+futures.workspace = true
+itertools.workspace = true
+image.workspace = true
+log.workspace = true
+ohos-accessibility-binding.workspace = true
+ohos-asset-binding.workspace = true
+ohos-device-binding.workspace = true
+ohos-fileuri-binding.workspace = true
+ohos-fileshare-binding.workspace = true
+ohos-init-binding.workspace = true
+ohos-resource-manager-binding.workspace = true
+ohos-vsync-binding = { workspace = true, optional = true }
+openharmony-ability.workspace = true
+openharmony-ability-plugin-audio = { workspace = true, optional = true }
+openharmony-ability-plugin-menu.workspace = true
+openharmony-ability-plugin-notification.workspace = true
+openharmony-ability-plugin-resource.workspace = true
+openharmony-ability-plugin-system-state.workspace = true
+openharmony-ability-plugin-app-control.workspace = true
+openharmony-ability-plugin-clipboard.workspace = true
+openharmony-ability-plugin-files.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+napi-ohos.workspace = true
+napi-derive-ohos.workspace = true
+url.workspace = true
+unicode-script.workspace = true
+openharmony-ability-plugin-url.workspace = true
+openharmony-ability-plugin-window.workspace = true
+parking_lot.workspace = true
+profiling.workspace = true
+raw-window-handle.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+sha2.workspace = true
+smol.workspace = true
+uuid.workspace = true
+wgpu.workspace = true

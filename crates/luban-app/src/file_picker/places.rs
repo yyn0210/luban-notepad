@@ -55,6 +55,16 @@ fn push_unique(places: &mut Vec<Place>, place: Place) {
     places.push(place);
 }
 
+/// Whether the process can actually enumerate this directory.
+///
+/// A directory can exist but still be unreadable: on OpenHarmony the app
+/// sandbox rejects everything outside the application data directories, and
+/// desktop systems have protected folders too. Offering such a place only
+/// produces a permission error after one click.
+fn is_readable_dir(path: &Path) -> bool {
+    path.is_dir() && std::fs::read_dir(path).is_ok()
+}
+
 /// Build the sidebar. Empty sections are omitted; missing standard folders
 /// (for example an unset Documents directory) are skipped.
 pub fn build_sections(
@@ -66,7 +76,7 @@ pub fn build_sections(
     let mut sections = Vec::new();
 
     let mut quick = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = dirs::home_dir().filter(|dir| is_readable_dir(dir)) {
         push_unique(
             &mut quick,
             Place {
@@ -93,7 +103,7 @@ pub fn build_sections(
             PlaceIcon::Downloads,
         ),
     ] {
-        if let Some(dir) = dir.filter(|dir| dir.is_dir()) {
+        if let Some(dir) = dir.filter(|dir| is_readable_dir(dir)) {
             push_unique(
                 &mut quick,
                 Place {
@@ -110,6 +120,9 @@ pub fn build_sections(
 
     let mut workspace = Vec::new();
     for (index, root) in roots.iter().enumerate() {
+        if !is_readable_dir(root) {
+            continue;
+        }
         let label = if index == 0 && !workspace_name.trim().is_empty() {
             workspace_name.trim().to_string()
         } else {
@@ -124,7 +137,7 @@ pub fn build_sections(
             },
         );
     }
-    if let Some(dir) = current_file_dir.filter(|dir| dir.is_dir()) {
+    if let Some(dir) = current_file_dir.filter(|dir| is_readable_dir(dir)) {
         let already_listed = roots
             .iter()
             .any(|root| crate::util::same_path(root, dir) || dir.starts_with(root));
@@ -144,7 +157,7 @@ pub fn build_sections(
     }
 
     let mut recent_places = Vec::new();
-    for path in recent.iter().filter(|path| path.is_dir()).take(5) {
+    for path in recent.iter().filter(|path| is_readable_dir(path)).take(5) {
         push_unique(
             &mut recent_places,
             Place {
@@ -168,7 +181,42 @@ pub fn build_sections(
 /// Filesystem roots and removable/mounted volumes for the current platform.
 pub fn system_locations() -> Vec<Place> {
     let mut places = Vec::new();
-    #[cfg(target_os = "linux")]
+    // OpenHarmony denies path access outside the application sandbox. User
+    // documents are reached through the system picker (which grants access to
+    // the selected URIs), so the fallback picker only offers sandbox folders
+    // instead of `/` and mount points that can never be read.
+    #[cfg(target_env = "ohos")]
+    {
+        if let Some(config) = std::env::var_os("LUBAN_NOTEPAD_CONFIG_DIR").map(PathBuf::from) {
+            let documents = config.join("Documents");
+            if is_readable_dir(&documents) {
+                places.push(Place {
+                    label: tr("dialog.place_sandbox_documents"),
+                    path: documents,
+                    icon: PlaceIcon::Documents,
+                });
+            }
+            if is_readable_dir(&config) {
+                places.push(Place {
+                    label: tr("dialog.place_app_files"),
+                    path: config,
+                    icon: PlaceIcon::Folder,
+                });
+            }
+        }
+        if places.is_empty() {
+            if let Ok(cwd) = std::env::current_dir() {
+                if is_readable_dir(&cwd) {
+                    places.push(Place {
+                        label: display_name(&cwd),
+                        path: cwd,
+                        icon: PlaceIcon::Drive,
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         places.push(Place {
             label: "/".to_string(),
@@ -227,12 +275,13 @@ pub fn system_locations() -> Vec<Place> {
     places
 }
 
+#[cfg_attr(target_env = "ohos", allow(dead_code))]
 pub struct MountPoint {
     pub path: PathBuf,
     pub label: String,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn read_linux_mounts() -> Vec<MountPoint> {
     std::fs::read_to_string("/proc/mounts")
         .map(|text| parse_linux_mounts(&text))
@@ -243,6 +292,7 @@ fn read_linux_mounts() -> Vec<MountPoint> {
 /// the usual removable-media roots are kept, so `/proc`, `/sys`, `/dev` and
 /// boot partitions do not clutter the sidebar.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(target_env = "ohos", allow(dead_code))]
 pub fn parse_linux_mounts(text: &str) -> Vec<MountPoint> {
     const FILESYSTEMS: &[&str] = &[
         "ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "exfat", "ntfs", "ntfs3", "fuseblk",
@@ -286,6 +336,7 @@ pub fn parse_linux_mounts(text: &str) -> Vec<MountPoint> {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(target_env = "ohos", allow(dead_code))]
 fn unescape_mount(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
@@ -366,5 +417,22 @@ nas:/share /mnt/share cifs rw 0 0
             .expect("recent section");
         assert_eq!(recent.places.len(), 1);
         assert_eq!(recent.places[0].path, dir.path());
+    }
+
+    #[test]
+    fn unreadable_or_missing_roots_are_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_readable_dir(dir.path()));
+        let missing = dir.path().join("missing");
+        assert!(!is_readable_dir(&missing));
+
+        // A root that cannot even be opened must not become a workspace place.
+        let sections = build_sections("ws", &[missing], None, &[]);
+        assert!(!sections.iter().any(|section| {
+            section
+                .places
+                .iter()
+                .any(|place| place.icon == PlaceIcon::Workspace)
+        }));
     }
 }

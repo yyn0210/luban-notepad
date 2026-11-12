@@ -146,17 +146,27 @@ pub fn window_options(
             title: Some("Luban Notepad".into()),
             ..TitleBar::title_bar_options()
         }),
-        // All platforms request `Client` decorations. On X11 with manual
-        // chrome, the vendored gpui-pre-linux patch interprets that as "the
-        // app draws its own chrome": it writes the borderless
+        // All desktop platforms request `Client` decorations. On X11 with
+        // manual chrome, the vendored gpui-pre-linux patch interprets that as
+        // "the app draws its own chrome": it writes the borderless
         // `_MOTIF_WM_HINTS` *before* the window is mapped, so the window
         // manager never draws a native titlebar (it used to flash for ~150ms
         // until we rewrote the hint after mapping), and the platform still
         // reports `Server` decorations so gpui-component adds no client-side
         // shadow margin and the appearance is unchanged. Wayland/Windows/
         // macOS handle `Client` natively as before.
-        window_decorations: Some(WindowDecorations::Client),
-        window_background: if cfg!(target_os = "linux") && !manual_chrome {
+        //
+        // OpenHarmony 2in1 windows keep the system decorations: the platform
+        // maps `Server` to `setWindowDecorVisible(true)`, which gives the
+        // freeform window its system title bar, resize frame and window menu.
+        window_decorations: Some(if cfg!(target_env = "ohos") {
+            WindowDecorations::Server
+        } else {
+            WindowDecorations::Client
+        }),
+        window_background: if cfg!(all(target_os = "linux", not(target_env = "ohos")))
+            && !manual_chrome
+        {
             WindowBackgroundAppearance::Transparent
         } else {
             WindowBackgroundAppearance::Opaque
@@ -330,7 +340,7 @@ pub fn open_window_with(
         cx.new(|cx| LubanApp::new(window, cx, options))
     })?;
     register(id, entity.downgrade(), initial_bounds, maximized);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if manual_chrome {
         crate::remove_window_decorations(handle, cx);
     }

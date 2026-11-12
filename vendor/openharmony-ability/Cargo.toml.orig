@@ -1,0 +1,52 @@
+[package]
+name = "openharmony-ability"
+version = "1.0.0-beta.5"
+edition.workspace = true
+license.workspace = true
+description = "Binding Rust application on Harmony with Ability"
+
+[features]
+default = ["log", "window"]
+log = ["dep:log"]
+window = ["dep:ohos-window-manager-binding", "dep:ohos-image-native-binding"]
+# ArkUI keyboard snapshots and consumption are opt-in; raw XComponent keys remain available.
+keyboard = ["ohos-arkui-binding/api-15"]
+# These features select linked NDK APIs and raise the application's minimum API.
+api-19 = ["ohos-arkui-binding/api-19"]
+api-26 = ["api-19", "ohos-ime-binding/api-26"]
+# API-18 mouse cancellation is opt-in; basic XComponent mouse input remains available.
+mouse = ["ohos-xcomponent-binding/api-18", "ohos-arkui-binding/api-17"]
+stylus = ["ohos-arkui-binding/api-17"]
+# Native file drag/drop is opt-in; ordinary keyboard/pointer input needs no UDMF or preview images.
+drag = ["dep:ohos-udmf-binding", "ohos-arkui-binding/udmf", "ohos-arkui-binding/image"]
+
+[dependencies]
+# common dependencies
+futures-channel = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+png = { workspace = true }
+
+log = { version = "0.4", optional = true }
+
+# for napi binding
+napi-ohos = { workspace = true, features = ["napi8"] }
+napi-derive-ohos = { workspace = true }
+
+# for xcomponent native render
+ohos-arkui-binding = { workspace = true, features = ["napi"] }
+ohos-xcomponent-binding = { workspace = true }
+ohos-udmf-binding = { workspace = true, optional = true }
+ohos-ime-binding = { workspace = true }
+ohos-device-binding = { workspace = true }
+ohos-display-binding = { workspace = true }
+ohos-init-binding = { workspace = true }
+ohos-resource-manager-binding = { workspace = true }
+
+# cursor-grab and window-snapshot NDK FFI (re-exported from the `window` module);
+# api-22 feature gates OH_WindowManager_LockCursor/UnlockCursor and api-15 gates
+# OH_WindowManager_Snapshot / OH_WindowManager_GetWindowProperties.
+ohos-window-manager-binding = { workspace = true, optional = true, features = ["api-22"] }
+ohos-image-native-binding = { workspace = true, optional = true }

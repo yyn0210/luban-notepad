@@ -1010,7 +1010,7 @@ impl LubanApp {
                 }
                 let modifiers = event.keystroke.modifiers;
                 let key = event.keystroke.key.to_ascii_lowercase();
-                let command = modifiers.secondary() || modifiers.control;
+                let command = modifiers.secondary(cx) || modifiers.control;
                 // The editor binds Tab, Shift+Tab, Ctrl+F and Ctrl+H to its
                 // own actions, so these keys never reach the normal shortcut
                 // handler. Resolve snippet navigation and the application find
@@ -5551,7 +5551,7 @@ impl LubanApp {
         }
         let modifiers = keystroke.modifiers;
         let mut parts = Vec::new();
-        if modifiers.secondary() || modifiers.control {
+        if modifiers.secondary(cx) || modifiers.control {
             parts.push("ctrl".to_string());
         }
         if modifiers.shift {

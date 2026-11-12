@@ -7,11 +7,39 @@ mod preview;
 mod sidebar;
 
 use std::path::{Path, PathBuf};
+#[cfg(target_env = "ohos")]
+use std::time::{Duration, Instant};
 
 use super::*;
 
 /// Row height shared by the virtual list and keyboard paging.
 pub(super) const FILE_PICKER_ROW_HEIGHT: f32 = 30.0;
+
+/// A picker that returns "cancelled" faster than this never presented a UI.
+#[cfg(target_env = "ohos")]
+const PICKER_START_WINDOW: Duration = Duration::from_secs(2);
+
+/// Saving writes a temporary sibling before renaming, so the directory itself
+/// has to accept new files, not just list them.
+#[cfg(target_env = "ohos")]
+fn directory_is_writable(dir: &Path) -> bool {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(".luban-write-probe-{}-{nanos}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
 
 impl LubanApp {
     // ------------------------------------------------------------------
@@ -39,6 +67,271 @@ impl LubanApp {
             window,
             cx,
         );
+    }
+
+    /// OpenHarmony owns the file-access permission model: user files are only
+    /// reachable through the system picker, which also returns a granted path.
+    /// Every file, folder and save dialog therefore goes through it. The
+    /// in-app browser is only used when the system picker cannot present
+    /// itself at all (for example a broken/virtualized FilePicker), never as a
+    /// normal alternative.
+    #[cfg(target_env = "ohos")]
+    fn in_app_picker_directory(&self) -> PathBuf {
+        // HOME is `/storage/Users/currentUser`, which the sandbox cannot read.
+        // The app files directory is the one path the picker can both list and
+        // write, so keep saved documents in a dedicated subdirectory.
+        let config = std::env::var_os("LUBAN_NOTEPAD_CONFIG_DIR").map(PathBuf::from);
+        if let Some(config) = config.filter(|dir| dir.is_dir()) {
+            let documents = config.join("Documents");
+            if !documents.is_dir() {
+                let _ = std::fs::create_dir(&documents);
+            }
+            if directory_is_writable(&documents) {
+                return documents;
+            }
+            if directory_is_writable(&config) {
+                return config;
+            }
+        }
+        std::env::current_dir()
+            .ok()
+            .filter(|dir| directory_is_writable(dir))
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn fallback_to_in_app_picker(
+        &mut self,
+        mode: FileDialogMode,
+        purpose: FileDialogPurpose,
+        dir: PathBuf,
+        suggested_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_status(tr("status.picker_fallback"), cx);
+        self.show_in_app_file_dialog(mode, purpose, dir, suggested_name, window, cx);
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn system_open_picker(
+        &mut self,
+        purpose: FileDialogPurpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let multiple = matches!(purpose, FileDialogPurpose::OpenFiles);
+        let started = Instant::now();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple,
+            prompt: Some(tr("dialog.open_file").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(Ok(Some(paths))) => {
+                    if matches!(purpose, FileDialogPurpose::OpenFiles) {
+                        this.open_paths_batch(paths, window, cx);
+                    } else if let Some(path) = paths.into_iter().next() {
+                        this.apply_open_path(purpose, path, window, cx);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    if started.elapsed() < PICKER_START_WINDOW {
+                        let dir = this.in_app_picker_directory();
+                        this.fallback_to_in_app_picker(
+                            FileDialogMode::Open,
+                            purpose,
+                            dir,
+                            String::new(),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::warn!("OHOS file picker failed, using in-app picker: {error}");
+                    let dir = this.in_app_picker_directory();
+                    this.fallback_to_in_app_picker(
+                        FileDialogMode::Open,
+                        purpose,
+                        dir,
+                        String::new(),
+                        window,
+                        cx,
+                    );
+                }
+                Err(_) => {
+                    log::warn!("OHOS file picker channel closed, using in-app picker");
+                    let dir = this.in_app_picker_directory();
+                    this.fallback_to_in_app_picker(
+                        FileDialogMode::Open,
+                        purpose,
+                        dir,
+                        String::new(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn system_folder_picker(
+        &mut self,
+        purpose: FileDialogPurpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let started = Instant::now();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(tr("dialog.open_folder").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.apply_folder_path(purpose, path, window, cx);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    if started.elapsed() < PICKER_START_WINDOW {
+                        let dir = this.in_app_picker_directory();
+                        this.fallback_to_in_app_picker(
+                            FileDialogMode::Folder,
+                            purpose,
+                            dir,
+                            String::new(),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::warn!("OHOS folder picker failed, using in-app picker: {error}");
+                    let dir = this.in_app_picker_directory();
+                    this.fallback_to_in_app_picker(
+                        FileDialogMode::Folder,
+                        purpose,
+                        dir,
+                        String::new(),
+                        window,
+                        cx,
+                    );
+                }
+                Err(_) => {
+                    log::warn!("OHOS folder picker channel closed, using in-app picker");
+                    let dir = this.in_app_picker_directory();
+                    this.fallback_to_in_app_picker(
+                        FileDialogMode::Folder,
+                        purpose,
+                        dir,
+                        String::new(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn system_save_picker(
+        &mut self,
+        purpose: FileDialogPurpose,
+        dir: PathBuf,
+        suggested_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The picker needs a URI-addressable default location. HOME is never
+        // readable on OpenHarmony, so fall back to the app's own documents
+        // directory before the filesystem root.
+        let start_dir = if dir.is_dir() {
+            dir
+        } else {
+            std::env::var_os("LUBAN_NOTEPAD_CONFIG_DIR")
+                .map(PathBuf::from)
+                .map(|config| {
+                    let documents = config.join("Documents");
+                    if documents.is_dir() {
+                        documents
+                    } else {
+                        config
+                    }
+                })
+                .filter(|dir| dir.is_dir())
+                .unwrap_or_else(|| PathBuf::from("/"))
+        };
+        let cancel_purpose = purpose.clone();
+        let fallback_dir = self.in_app_picker_directory();
+        let fallback_name = suggested_name.clone();
+        let started = Instant::now();
+        let receiver = cx.prompt_for_new_path(&start_dir, Some(&suggested_name));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(Ok(Some(path))) => {
+                    this.apply_save_path(purpose, path, window, cx);
+                }
+                Ok(Ok(None)) => {
+                    if started.elapsed() < PICKER_START_WINDOW {
+                        // The picker never presented itself; continue the save
+                        // flow in the in-app picker instead of aborting it.
+                        this.fallback_to_in_app_picker(
+                            FileDialogMode::Save,
+                            purpose,
+                            fallback_dir,
+                            fallback_name,
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    if let FileDialogPurpose::SaveAs { then, .. } = cancel_purpose {
+                        if matches!(
+                            then,
+                            SaveThen::Exit | SaveThen::CloseAll | SaveThen::NextTrimSave
+                        ) {
+                            this.abort_pending_saves();
+                            this.set_status(tr("status.save_cancelled_close"), cx);
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::warn!("OHOS save picker failed, using in-app picker: {error}");
+                    this.fallback_to_in_app_picker(
+                        FileDialogMode::Save,
+                        purpose,
+                        fallback_dir,
+                        fallback_name,
+                        window,
+                        cx,
+                    );
+                }
+                Err(_) => {
+                    log::warn!("OHOS save picker channel closed, using in-app picker");
+                    this.fallback_to_in_app_picker(
+                        FileDialogMode::Save,
+                        purpose,
+                        fallback_dir,
+                        fallback_name,
+                        window,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn open_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -112,6 +405,34 @@ impl LubanApp {
     }
 
     pub(super) fn show_file_dialog(
+        &mut self,
+        mode: FileDialogMode,
+        purpose: FileDialogPurpose,
+        dir: PathBuf,
+        suggested_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // OpenHarmony has its own permission model: only the system picker can
+        // return user files with the required grants. Never open the in-app
+        // browser there, not even as a fallback.
+        #[cfg(target_env = "ohos")]
+        {
+            match mode {
+                FileDialogMode::Open => self.system_open_picker(purpose, window, cx),
+                FileDialogMode::Save => {
+                    self.system_save_picker(purpose, dir, suggested_name, window, cx)
+                }
+                FileDialogMode::Folder => self.system_folder_picker(purpose, window, cx),
+            }
+        }
+        #[cfg(not(target_env = "ohos"))]
+        self.show_in_app_file_dialog(mode, purpose, dir, suggested_name, window, cx);
+    }
+
+    /// The original path-based picker, used on desktop platforms only.
+    #[cfg_attr(target_env = "ohos", allow(dead_code))]
+    pub(super) fn show_in_app_file_dialog(
         &mut self,
         mode: FileDialogMode,
         purpose: FileDialogPurpose,
@@ -279,10 +600,23 @@ impl LubanApp {
             Err(error) => {
                 dialog.entries.clear();
                 dialog.recompute_rows();
-                dialog.error = Some(tr_args(
-                    "dialog.list_failed",
-                    &[("error", error.to_string())],
-                ));
+                // OpenHarmony path access is sandboxed: an unreadable path is
+                // not a transient I/O failure, and the raw `os error 13` text
+                // gives no way forward. Point at the system picker, which is
+                // the supported route for files outside the sandbox.
+                #[cfg(target_env = "ohos")]
+                let message = if matches!(
+                    &error,
+                    luban_core::Error::Io(io)
+                        if io.kind() == std::io::ErrorKind::PermissionDenied
+                ) {
+                    tr("dialog.list_sandbox_denied")
+                } else {
+                    tr_args("dialog.list_failed", &[("error", error.to_string())])
+                };
+                #[cfg(not(target_env = "ohos"))]
+                let message = tr_args("dialog.list_failed", &[("error", error.to_string())]);
+                dialog.error = Some(message);
             }
         }
         self.refresh_file_picker_preview(cx);
@@ -522,7 +856,7 @@ impl LubanApp {
                     self.file_dialog_confirm(window, cx);
                     return;
                 }
-                let command = modifiers.secondary() || modifiers.control;
+                let command = modifiers.secondary(cx) || modifiers.control;
                 if let Some(dialog) = &mut self.file_dialog {
                     match dialog.mode {
                         FileDialogMode::Open => {
@@ -666,7 +1000,7 @@ impl LubanApp {
         if row_count == 0 {
             return false;
         }
-        let command = modifiers.secondary() || modifiers.control;
+        let command = modifiers.secondary(cx) || modifiers.control;
 
         if key == "space" && !command {
             if let Some(dialog) = &mut self.file_dialog {
@@ -778,7 +1112,7 @@ impl LubanApp {
     ) -> bool {
         let key = event.keystroke.key.to_ascii_lowercase();
         let modifiers = event.keystroke.modifiers;
-        let command = modifiers.secondary() || modifiers.control;
+        let command = modifiers.secondary(cx) || modifiers.control;
         let alt = modifiers.alt;
         if command && !modifiers.shift && !alt {
             match key.as_str() {
@@ -943,38 +1277,7 @@ impl LubanApp {
                         return;
                     }
                     if dialog.purpose_is_open_files() {
-                        let total = selected.len();
-                        let mut opened = 0usize;
-                        let mut failed = 0usize;
-                        for path in selected {
-                            if self.open_path(&path, window, cx) {
-                                opened += 1;
-                            } else {
-                                failed += 1;
-                            }
-                        }
-                        if total > 1 {
-                            if failed == 0 {
-                                self.set_status(
-                                    tr_args(
-                                        "status.batch_opened",
-                                        &[("count", opened.to_string())],
-                                    ),
-                                    cx,
-                                );
-                            } else {
-                                self.set_status(
-                                    tr_args(
-                                        "status.batch_open_partial",
-                                        &[
-                                            ("opened", opened.to_string()),
-                                            ("failed", failed.to_string()),
-                                        ],
-                                    ),
-                                    cx,
-                                );
-                            }
-                        }
+                        self.open_paths_batch(selected, window, cx);
                         cx.notify();
                         return;
                     }
@@ -1010,7 +1313,7 @@ impl LubanApp {
                     }
                 }
                 self.file_dialog = Some(dialog);
-                self.file_picker_error(tr("dialog.select_file"), cx);
+                self.file_picker_error(tr("dialog.select_open_file"), cx);
             }
             FileDialogMode::Save => {
                 let name = if name.is_empty() {
@@ -1018,7 +1321,7 @@ impl LubanApp {
                 } else {
                     dialog.with_default_extension(&name)
                 };
-                let mut candidate = if !name.is_empty() {
+                let candidate = if !name.is_empty() {
                     util::absolutize_from(&dialog.dir, Path::new(&name))
                 } else if let Some(path) = typed_override {
                     if path.is_dir() {
@@ -1037,54 +1340,7 @@ impl LubanApp {
                     self.file_picker_error(tr("dialog.target_is_folder"), cx);
                     return;
                 }
-                if matches!(
-                    dialog.purpose,
-                    FileDialogPurpose::SaveWorkspace | FileDialogPurpose::SaveWorkspaceAs
-                ) && candidate.extension().is_none()
-                {
-                    candidate =
-                        candidate.with_extension(luban_core::workspace_file::WORKSPACE_EXTENSION);
-                }
-                match dialog.purpose.clone() {
-                    FileDialogPurpose::SaveAs { tab_id, then } => {
-                        let request = SaveAsRequest {
-                            tab_id,
-                            path: candidate,
-                            then,
-                        };
-                        if request.path.exists() {
-                            self.overwrite_save = Some(request);
-                        } else {
-                            self.save_as_request(request, window, cx);
-                        }
-                    }
-                    FileDialogPurpose::Export { format } => {
-                        if candidate.exists() {
-                            self.pending_export = Some(format);
-                            self.overwrite_save = Some(SaveAsRequest {
-                                tab_id: 0,
-                                path: candidate,
-                                then: SaveThen::Nothing,
-                            });
-                        } else {
-                            self.write_export(&candidate, format, window, cx);
-                        }
-                    }
-                    FileDialogPurpose::SaveWorkspace | FileDialogPurpose::SaveWorkspaceAs => {
-                        let candidate = if candidate.extension().is_none() {
-                            candidate
-                                .with_extension(luban_core::workspace_file::WORKSPACE_EXTENSION)
-                        } else {
-                            candidate
-                        };
-                        self.write_workspace(&candidate, cx);
-                        self.save_session_now(cx);
-                    }
-                    FileDialogPurpose::ExportSettings => {
-                        self.export_settings(&candidate, cx);
-                    }
-                    _ => {}
-                }
+                self.apply_save_path(dialog.purpose.clone(), candidate, window, cx);
             }
             FileDialogMode::Folder => {
                 let candidate = if let Some(path) = typed_override {
@@ -1103,25 +1359,7 @@ impl LubanApp {
                     self.file_picker_error(not_a_folder_message(&candidate), cx);
                     return;
                 }
-                match dialog.purpose {
-                    FileDialogPurpose::OpenFolder => {
-                        self.settings.show_file_explorer = true;
-                        self.open_folder_workspace(&candidate, window, cx);
-                        self.apply_settings(window, cx);
-                    }
-                    FileDialogPurpose::AddFolder => {
-                        self.add_workspace_root(&candidate, cx);
-                        self.settings.show_file_explorer = true;
-                        self.apply_settings(window, cx);
-                    }
-                    FileDialogPurpose::FindInFilesFolder => {
-                        let value = candidate.display().to_string();
-                        self.find_in_files.folder.update(cx, |input, cx| {
-                            input.set_value(value, window, cx);
-                        });
-                    }
-                    _ => {}
-                }
+                self.apply_folder_path(dialog.purpose, candidate, window, cx);
             }
         }
         cx.notify();
@@ -1140,7 +1378,60 @@ impl LubanApp {
             self.file_picker_error(tr("dialog.not_a_file"), cx);
             return;
         }
-        match dialog.purpose {
+        self.apply_open_path(dialog.purpose, path, window, cx);
+    }
+
+    /// Open several files from the system picker, reporting partial failures.
+    fn open_paths_batch(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = paths.len();
+        let mut opened = 0usize;
+        let mut failed = 0usize;
+        for path in paths {
+            if self.open_path(&path, window, cx) {
+                opened += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        if total > 1 {
+            if failed == 0 {
+                self.set_status(
+                    tr_args("status.batch_opened", &[("count", opened.to_string())]),
+                    cx,
+                );
+            } else {
+                self.set_status(
+                    tr_args(
+                        "status.batch_open_partial",
+                        &[
+                            ("opened", opened.to_string()),
+                            ("failed", failed.to_string()),
+                        ],
+                    ),
+                    cx,
+                );
+            }
+        }
+        if opened > 0 {
+            self.focus_editor(window, cx);
+        }
+    }
+
+    /// Dispatch an open path through the purpose-specific flow. Shared by the
+    /// in-app picker and the OpenHarmony system picker.
+    fn apply_open_path(
+        &mut self,
+        purpose: FileDialogPurpose,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match purpose {
             FileDialogPurpose::ImportTheme => self.import_syntax_theme(&path, window, cx),
             FileDialogPurpose::OpenWorkspace => self.open_workspace(&path, window, cx),
             FileDialogPurpose::ImportSettings => {
@@ -1158,6 +1449,84 @@ impl LubanApp {
                 // does not create a new editor.
                 self.focus_editor(window, cx);
             }
+        }
+    }
+
+    /// Dispatch a save target through the purpose-specific flow.
+    fn apply_save_path(
+        &mut self,
+        purpose: FileDialogPurpose,
+        candidate: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match purpose {
+            FileDialogPurpose::SaveAs { tab_id, then } => {
+                let request = SaveAsRequest {
+                    tab_id,
+                    path: candidate,
+                    then,
+                };
+                if request.path.exists() {
+                    self.overwrite_save = Some(request);
+                } else {
+                    self.save_as_request(request, window, cx);
+                }
+            }
+            FileDialogPurpose::Export { format } => {
+                if candidate.exists() {
+                    self.pending_export = Some(format);
+                    self.overwrite_save = Some(SaveAsRequest {
+                        tab_id: 0,
+                        path: candidate,
+                        then: SaveThen::Nothing,
+                    });
+                } else {
+                    self.write_export(&candidate, format, window, cx);
+                }
+            }
+            FileDialogPurpose::SaveWorkspace | FileDialogPurpose::SaveWorkspaceAs => {
+                let candidate = if candidate.extension().is_none() {
+                    candidate.with_extension(luban_core::workspace_file::WORKSPACE_EXTENSION)
+                } else {
+                    candidate
+                };
+                self.write_workspace(&candidate, cx);
+                self.save_session_now(cx);
+            }
+            FileDialogPurpose::ExportSettings => {
+                self.export_settings(&candidate, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Dispatch a chosen folder through the purpose-specific flow.
+    fn apply_folder_path(
+        &mut self,
+        purpose: FileDialogPurpose,
+        candidate: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match purpose {
+            FileDialogPurpose::OpenFolder => {
+                self.settings.show_file_explorer = true;
+                self.open_folder_workspace(&candidate, window, cx);
+                self.apply_settings(window, cx);
+            }
+            FileDialogPurpose::AddFolder => {
+                self.add_workspace_root(&candidate, cx);
+                self.settings.show_file_explorer = true;
+                self.apply_settings(window, cx);
+            }
+            FileDialogPurpose::FindInFilesFolder => {
+                let value = candidate.display().to_string();
+                self.find_in_files.folder.update(cx, |input, cx| {
+                    input.set_value(value, window, cx);
+                });
+            }
+            _ => {}
         }
     }
 

@@ -1,0 +1,9 @@
+node_modules
+oh_modules
+/local.properties
+/build-profile.json5
+/AppScope/app.json5
+/.hvigor
+**/build
+/entry/libs
+/.idea

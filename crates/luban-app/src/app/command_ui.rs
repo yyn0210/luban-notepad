@@ -419,7 +419,7 @@ impl LubanApp {
     ) -> bool {
         let modifiers = event.keystroke.modifiers;
         let key = event.keystroke.key.to_ascii_lowercase();
-        let secondary = modifiers.secondary();
+        let secondary = modifiers.secondary(cx);
         let shift = modifiers.shift;
         let alt = modifiers.alt;
         let command = secondary || modifiers.control;

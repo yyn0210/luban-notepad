@@ -1,0 +1,12 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "Luban Notepad"
+    },
+    {
+      "name": "clipboard_permission_reason",
+      "value": "读取剪贴板以支持粘贴文本"
+    }
+  ]
+}

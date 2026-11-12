@@ -1,10 +1,25 @@
-# vendor/gpui-pre-linux
+# vendor/
 
-`gpui-pre-linux` 0.3.9 的本地副本，叠加最小 X11 补丁。
+本目录存放为 Luban Notepad 打过补丁的 GPUI/OpenHarmony crate，版本均与
+`Cargo.lock` 锁定的 `gpui-pre 0.3.11` / `gpui-kit 0.9.0` 对齐：
+
+- `gpui-pre-linux`：最小 X11 补丁（无边框、最大化、应用侧拖动调整大小），见下文。
+- `gpui-pre-platform`：为 OpenHarmony 目标补一个编译占位分支，见文末
+  “gpui-pre-platform 补丁”。
+- `ohos-xcomponent-binding`：未知键码回退为 `KeyCode::Unknown`，见文末
+  “ohos-xcomponent-binding 补丁”。
+- `openharmony-ability`：ArkUI 键盘事件忽略未知键码，见文末
+  “openharmony-ability 补丁”。
+- `gpui-ohos`：OpenHarmony 平台后端（固定到上游 commit，独立 workspace，
+  不属于 `[patch.crates-io]`）。
+
+## gpui-pre-linux
+
+`gpui-pre-linux` 0.3.11 的本地副本，叠加最小 X11 补丁。
 
 ## 为什么 vendored
 
-上游 `gpui-pre` 0.3.9 的 X11 后端在窗口映射**之前**调用
+上游 `gpui-pre` 0.3.11 的 X11 后端在窗口映射**之前**调用
 `request_decorations`。对没有合成器的 X11 会话（`client_side_decorations_supported == false`），
 上游把客户端装饰请求强制转换为服务端装饰并写入
 `_MOTIF_WM_HINTS = [2, 0, 1, 0, 0]`（显式请求窗口管理器装饰），
@@ -121,14 +136,16 @@
 
 ## 与上游版本的关系
 
-- vendored 源码与 `Cargo.lock` 锁定的 registry 版本 0.3.9 完全一致，
-  仅叠加本补丁（上游 pristine 校验和：`094a2a91a2c820c890e6f405f1d789e6ae626c9db3897e060d9c5f40bb9d9442`，
+- vendored 源码与 `Cargo.lock` 锁定的 registry 版本 0.3.11 完全一致，
+  仅叠加本补丁（13 处 `LUBAN PATCH` 标记：`window.rs` 9 处、`client.rs` 4 处；
+  上游 pristine 校验和：`3d4549d2482d8fa354410d35c8b3c8097cfe2540d4a4a15b5e92f9606471d1db`，
   为 `find . -type f | sort | xargs sha256sum | sha256sum` 的输出）。
 - 通过根 `Cargo.toml` 的 `[patch.crates-io]` 生效：
 
   ```toml
   [patch.crates-io]
   gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+  gpui-pre-platform = { path = "vendor/gpui-pre-platform" }
   ```
 
 ## 升级 gpui-pre 时的步骤
@@ -159,4 +176,65 @@
    如果上游已改为映射前写入无边框 hint、或 `zoom` 已显式设置状态、
    或上游已把映射前的状态请求延迟到 map 之后，可删除对应补丁；
    都不再需要时删除 vendored 目录。
-4. 更新本 README 的校验和与版本号。
+4. 更新本 README 的校验和与版本号（两个 vendored crate 都适用）。
+
+## gpui-pre-platform 补丁
+
+`gpui-pre-platform` 是 GPUI 的“默认平台选择”crate，`gpui-kit` 在
+**非 ios/android** 目标上无条件依赖它（`gpui-kit` 只 re-export 了
+`application`/`current_platform`，内部没有调用）。上游 0.3.11 的
+`current_platform` 用 `cfg_select!` 把 `target_os = "linux"` +
+`target_env = "ohos"` 从 Linux 分支排除，导致 OHOS 目标没有任何分支命中：
+
+```
+error: none of the predicates in this `cfg_select` evaluated to true
+```
+
+这不是“运行时选错后端”，而是**编译失败**，且发生在 `gpui-kit` 的依赖图里，
+应用无法通过 `#[cfg]` 绕开。补丁在 `cfg_select!` 末尾增加一个 OHOS 分支：
+
+```rust
+all(target_os = "linux", target_env = "ohos") => {
+    let _ = headless;
+    panic!("gpui-pre-platform has no OpenHarmony backend; \
+            build the application with gpui_ohos::current_platform")
+}
+```
+
+OpenHarmony 应用必须用
+`gpui::Application::with_platform(gpui_ohos::current_platform(..))` 启动，
+这个分支只用于让 crate 通过编译，**不得被调用**。删除条件：上游
+`gpui-pre-platform` 自己为 OHOS 提供分支（或 `gpui-kit` 不再在此目标上依赖它）。
+
+## ohos-xcomponent-binding 补丁
+
+`ohos-xcomponent-binding` 0.6.0 的本地副本。上游在键事件回调里调用
+`KeyCode::from(code)`，而该转换由 `EnumFrom` 派生，未覆盖的键码会走
+`unreachable!("Invalid attribute value")`，在回调线程里直接 abort 整个进程。
+实测 OpenHarmony 的 `uinput` 测试工具、部分媒体键/厂商键盘会送来超出
+`OH_NativeXComponent_KeyCode` 枚举的原始 evdev 键码，触发该崩溃。
+
+补丁只改 `src/events/native_callbacks.rs` 一处：
+
+```rust
+code: KeyCode::try_from_raw(code).unwrap_or(KeyCode::Unknown),
+```
+
+未知键码变成可忽略的 `KeyCode::Unknown`，不再让输入事件杀死应用。
+删除条件：上游 0.6.x 之后的版本不再对未知键码 panic（或
+`openharmony-ability` 切换到这样的版本）。
+
+## openharmony-ability 补丁
+
+`openharmony-ability` 1.0.0-beta.5 的本地副本。ArkUI 键盘回调走的是另一条
+转换路径，同样会对未知键码 panic：
+
+- `src/input/keyboard.rs` 的 `pressed_keys` 遍历用 `KeyCode::from(raw)`；
+- 主键码用 `KeyCode::from(event.key_code_raw() as u32)`。
+
+补丁把两处都改成 `KeyCode::try_from_raw(..)`：pressed 列表里未知键码直接
+过滤掉，主键码未知时返回 `None`（该按键事件不进入 GPUI）。这样
+`uinput` 注入的原始 evdev 键码、媒体键和厂商键盘都不会再 abort 进程。
+
+删除条件：上游把 ArkUI 键盘路径也改为非 panic 转换（或不再使用该 crate）。
+

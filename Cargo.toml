@@ -4,7 +4,10 @@ members = [
     "crates/luban-core",
     "crates/luban-app",
     "crates/luban-plugin",
+    "crates/luban-ohos",
 ]
+# gpui-ohos declares its own workspace (it is a standalone, vendored crate).
+exclude = ["vendor/gpui-ohos"]
 
 [workspace.package]
 version = "1.0.0"
@@ -39,10 +42,26 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
-# Vendored gpui-pre-linux 0.3.9 (matches Cargo.lock exactly) with a minimal
-# X11 patch: a `WindowDecorations::Client` request writes the borderless
-# `_MOTIF_WM_HINTS` before the window is mapped (no native titlebar flash)
-# while the platform keeps reporting server decorations so gpui-component
-# adds no client-side shadow margin. See vendor/README.md.
+# Vendored GPUI crates (all at 0.3.11, matching gpui-kit 0.9.0 and gpui-ohos):
+#
+# - gpui-pre-linux carries a minimal X11 patch: a `WindowDecorations::Client`
+#   request writes the borderless `_MOTIF_WM_HINTS` before the window is mapped
+#   (no native titlebar flash) while the platform keeps reporting server
+#   decorations so gpui-component adds no client-side shadow margin.
+# - gpui-pre-platform carries an OpenHarmony fallback arm. gpui-kit depends on
+#   this crate on every non-Apple/Android target, but upstream excludes OHOS
+#   from `current_platform`, so the crate does not compile for
+#   `aarch64-unknown-linux-ohos` without it. The real platform is injected by
+#   `gpui_ohos::current_platform` in the OHOS entry point.
+# - ohos-xcomponent-binding maps an unknown key code to `KeyCode::Unknown`
+#   instead of panicking; `uinput`, media keys and vendor keyboards can report
+#   evdev codes outside the generated OHOS enum.
+# - openharmony-ability ignores ArkUI key events with unknown raw key codes
+#   for the same reason (the ArkUI key path converts `key_code_raw` itself).
+#
+# See vendor/README.md.
 [patch.crates-io]
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-platform = { path = "vendor/gpui-pre-platform" }
+ohos-xcomponent-binding = { path = "vendor/ohos-xcomponent-binding" }
+openharmony-ability = { path = "vendor/openharmony-ability" }
