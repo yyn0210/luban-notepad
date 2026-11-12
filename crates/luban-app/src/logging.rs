@@ -13,6 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::{Log, Metadata, Record};
 use luban_core::settings::config_dir;
 
+/// Default `RUST_LOG` filter used when the environment sets none.
+///
+/// Directives match the target's leading module path, and the desktop binary is
+/// now a thin `main.rs` over this library, so the editor's own logs are
+/// `luban_app::…` — not the old binary-crate name `luban_notepad::…`.
+pub const DEFAULT_LOG_FILTER: &str = "luban_app=info,luban_plugin=info,gpui=warn";
+
 /// Rotate the active log at this size.
 pub const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 /// Number of rotated files kept besides the active one.
@@ -40,8 +47,7 @@ pub fn init() {
     };
     install_panic_hook(&directory);
     let console = env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("luban_notepad=info,luban_plugin=info,gpui=warn"),
+        env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
     )
     .build();
     let level = console.filter();
@@ -212,6 +218,29 @@ fn civil_time(seconds: u64) -> (i64, u64, u64, u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::Log;
+
+    #[test]
+    fn default_filter_enables_the_editor_logs() {
+        let logger = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
+        )
+        .build();
+        let enabled = |target: &str| {
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(log::Level::Info)
+                    .target(target)
+                    .build(),
+            )
+        };
+        assert!(
+            enabled(module_path!()),
+            "{DEFAULT_LOG_FILTER:?} drops the editor's own logs"
+        );
+        assert!(enabled("luban_plugin::host::lua"));
+        assert!(!enabled("some_dependency"));
+    }
 
     #[test]
     fn timestamp_is_utc_and_padded() {

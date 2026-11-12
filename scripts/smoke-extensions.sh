@@ -151,10 +151,21 @@ run_smoke() {
   fi
 }
 
+# Report a missing log line together with the log, so a filtered-out message
+# does not fail the step silently.
+expect_log() {
+  local needle="$1"
+  if ! grep -qF -- "$needle" "$TMP/logs/luban.log"; then
+    echo "smoke-extensions: log is missing '$needle'" >&2
+    sed -n '1,160p' "$TMP/logs/luban.log" >&2 || true
+    exit 1
+  fi
+}
+
 echo "smoke-extensions: plugin command"
 run_smoke "plugin command" --goto "$TMP/sample.rs:2:1" --command smoke.run
-grep -q "SMOKE_PLUGIN_RAN" "$TMP/logs/luban.log"
-grep -q "SMOKE_DOC 2:1" "$TMP/logs/luban.log"
+expect_log "SMOKE_PLUGIN_RAN"
+expect_log "SMOKE_DOC 2:1"
 
 echo "smoke-extensions: manager, panel, snippet picker, diff"
 run_smoke "plugin manager" --command plugins.manage
@@ -163,7 +174,7 @@ run_smoke "snippet picker" "$TMP/sample.rs" --command edit.insert-snippet
 run_smoke "diff" --diff "$TMP/left.txt" "$TMP/right.txt"
 rm -f "$TMP/logs/luban.log"
 run_smoke "goto clamp" --goto "$TMP/sample.rs:999:999"
-grep -q "was clamped" "$TMP/logs/luban.log"
+expect_log "was clamped"
 
 echo "smoke-extensions: safe mode disables plugins"
 rm -f "$TMP/logs/luban.log"

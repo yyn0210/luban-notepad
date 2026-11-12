@@ -11,6 +11,13 @@ Luban Notepad 的所有重要变更都记录在此。
   该包，同时校验其 glibc 依赖不超过 2.35 基线。打包需要 `rpmbuild`
   （Debian/Ubuntu 上为 `rpm` 包，Fedora/RHEL 上为 `rpm-build`）。
 
+### 修复
+
+- 修复拆分桌面入口后应用自身的日志被默认过滤规则丢弃的问题：编辑器代码现在
+  位于 `luban-app` 库，日志目标是 `luban_app::…`，而默认 `RUST_LOG` 仍按旧的
+  二进制 crate 名 `luban_notepad` 过滤，导致 `logs/luban.log` 里没有跳转截断、
+  文件打开失败等记录。
+
 ## [1.0.0] — 2026-11-10
 
 ### 变更
