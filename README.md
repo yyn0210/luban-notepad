@@ -166,13 +166,15 @@ cargo build --release -p luban-app
 在 Linux 和 macOS 上生成可分发的安装包：
 
 ```bash
-scripts/package-linux.sh   # dist/*.tar.gz, dist/*.deb
+scripts/package-linux.sh   # dist/*.tar.gz, dist/*.deb, dist/*.rpm
 scripts/package-macos.sh   # dist/Luban Notepad.app, dist/*.zip
 ```
 
+Debian 和 RPM 包分别需要系统提供 `dpkg-deb` 与 `rpmbuild`（Debian/Ubuntu 上
+为 `rpm` 包，Fedora/RHEL 上为 `rpm-build`），缺少时会跳过对应格式。
 Linux 包以 glibc 2.35（Ubuntu 22.04 / Debian 12 / Deepin 23 及以上）为基线。
 发布工作流固定在 Ubuntu 22.04 上构建，避免更新的 glibc 把可选弱符号绑定到
-`GLIBC_2.39`，从而生成无法在旧发行版安装的 deb。
+`GLIBC_2.39`，从而生成无法在旧发行版安装的 deb 或 rpm。
 
 Windows 同时提供安装版和便携版：
 

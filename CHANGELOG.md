@@ -4,6 +4,13 @@ Luban Notepad 的所有重要变更都记录在此。
 
 ## [Unreleased]
 
+### 新增
+
+- Linux 打包新增 RPM 产物 `dist/luban-notepad-<版本>-1.<架构>.rpm`，内容与
+  deb 相同（二进制、桌面入口、hicolor 图标和文档）；发布工作流会构建并上传
+  该包，同时校验其 glibc 依赖不超过 2.35 基线。打包需要 `rpmbuild`
+  （Debian/Ubuntu 上为 `rpm` 包，Fedora/RHEL 上为 `rpm-build`）。
+
 ## [1.0.0] — 2026-11-10
 
 ### 变更

@@ -76,7 +76,7 @@ jobs:
             libxcb1-dev libxcb-xkb-dev \
             libfontconfig1-dev libfreetype-dev \
             libbz2-dev libpng-dev libbrotli-dev libffi-dev zlib1g-dev \
-            libexpat1-dev uuid-dev
+            libexpat1-dev uuid-dev rpm
 
       - name: Build release
         run: cargo build --release --locked -p luban-app
@@ -103,6 +103,29 @@ jobs:
             exit 1
           fi
 
+      - name: Verify RPM package
+        run: |
+          rpm_pkg=$(find dist -maxdepth 1 -name '*.rpm' -print -quit)
+          if [ -z "$rpm_pkg" ]; then
+            echo "::error::no RPM package was produced"
+            exit 1
+          fi
+          rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' "$rpm_pkg"
+          requires=$(rpm -qp --requires "$rpm_pkg")
+          echo "Requires:"
+          printf '%s\n' "$requires"
+          newest=$(printf '%s\n' "$requires" |
+            sed -n 's/^libc\.so\.6(GLIBC_\([^)]*\))(64bit)$/\1/p' |
+            sort -V | tail -n 1)
+          if [ -z "$newest" ]; then
+            echo "::error::rpm has no versioned glibc dependency"
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$newest" "$LIBC_BASELINE" | sort -V | tail -n 1)" != "$LIBC_BASELINE" ]; then
+            echo "::error::rpm requires GLIBC_$newest, above the $LIBC_BASELINE baseline"
+            exit 1
+          fi
+
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
@@ -112,6 +135,8 @@ jobs:
             dist/*.tar.gz.sha256
             dist/*.deb
             dist/*.deb.sha256
+            dist/*.rpm
+            dist/*.rpm.sha256
           if-no-files-found: error
           retention-days: 7
 

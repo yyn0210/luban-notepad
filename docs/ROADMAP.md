@@ -47,7 +47,7 @@ Luban Notepad 0.13 不是“功能少”，而是**能力结构偏科**：超大
   Linux/Windows/macOS 使用同一套界面和文件对话框。
 - **工程基础**：约 28k 行 Rust；264 个单元测试（磁盘引擎 44 个）；
   Linux/Windows/macOS CI 构建，Linux 有 Xvfb + lavapipe GUI smoke test；
-  Linux `.tar.gz`/`.deb`、Windows 安装版/便携版、macOS `.app`/`.zip` 打包。
+  Linux `.tar.gz`/`.deb`/`.rpm`、Windows 安装版/便携版、macOS `.app`/`.zip` 打包。
 
 ### 1.2 短板
 
