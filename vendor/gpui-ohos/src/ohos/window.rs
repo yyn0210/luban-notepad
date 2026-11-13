@@ -1472,6 +1472,17 @@ impl OhosWindow {
         self.cancel_keyboard_retry();
         // GPUI can focus an editor before its native window gains focus. Attaching
         // here would send IME text to that editor while shortcuts reach the old window.
+        if self.active.get() && !self.input_ready.get() && self.surface_focused.get() {
+            // The cached readiness can lag the native editor if the
+            // TextInputReadyChanged event raced window creation; re-query instead of
+            // silently dropping every later attach.
+            let ready = self
+                .app
+                .borrow()
+                .as_ref()
+                .is_some_and(|app| app.is_text_input_ready_for(self.window_id));
+            self.input_ready.set(ready);
+        }
         if !self.active.get() || !self.input_ready.get() || !self.surface_focused.get() {
             return;
         }
@@ -1562,10 +1573,12 @@ impl OhosWindow {
                 );
                 // First-boot IME startup can outlast the fast retries. Keep
                 // recovering while focused, backing off to avoid repeated IPC stalls.
-                let delay = [250, 1000, 2000, 5000, 10000]
-                    .get(attempt)
-                    .copied()
-                    .unwrap_or(30000);
+                let delay_for = |attempt: usize| {
+                    [250, 1000, 2000, 5000, 10000]
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or(30000)
+                };
                 let Some(window) = self
                     .window_index
                     .upgrade()
@@ -1574,35 +1587,50 @@ impl OhosWindow {
                     return;
                 };
                 self.ime_retry_pending.set(true);
-                self.foreground_executor
+                let executor = self.foreground_executor.clone();
+                executor
                     .spawn(async move {
-                        smol::Timer::after(Duration::from_millis(delay)).await;
-                        let Some(window) = window.upgrade() else {
-                            return;
-                        };
-                        let window = window.borrow();
-                        if window.released.get()
-                            || window.closed.get()
-                            || !window.active.get()
-                            || !window.input_ready.get()
-                            || !window.surface_focused.get()
-                            || window.ime_retry_generation.get() != generation
-                        {
-                            return;
-                        }
-                        window.ime_retry_pending.set(false);
-                        let handler = window.input_handler.borrow_mut().take();
-                        let Some(mut handler) = handler else {
-                            return;
-                        };
-                        let accepts_text = handler.query_accepts_text_input();
-                        *window.input_handler.borrow_mut() = Some(handler);
-                        if accepts_text && window.ime_retry_generation.get() == generation {
-                            window.request_keyboard_attempt(
-                                attempt.saturating_add(1),
-                                generation,
-                                show_keyboard,
-                            );
+                        let mut attempt = attempt;
+                        loop {
+                            smol::Timer::after(Duration::from_millis(delay_for(attempt))).await;
+                            let Some(window) = window.upgrade() else {
+                                return;
+                            };
+                            let window = window.borrow();
+                            if window.released.get()
+                                || window.closed.get()
+                                || !window.active.get()
+                                || !window.input_ready.get()
+                                || !window.surface_focused.get()
+                                || window.ime_retry_generation.get() != generation
+                            {
+                                return;
+                            }
+                            window.ime_retry_pending.set(false);
+                            let accepts_text = {
+                                let mut handler = window.input_handler.borrow_mut().take();
+                                let accepts_text = handler
+                                    .as_mut()
+                                    .map(|handler| handler.query_accepts_text_input())
+                                    .unwrap_or(false);
+                                *window.input_handler.borrow_mut() = handler;
+                                accepts_text
+                            };
+                            if window.ime_retry_generation.get() != generation {
+                                return;
+                            }
+                            if accepts_text {
+                                window.request_keyboard_attempt(
+                                    attempt.saturating_add(1),
+                                    generation,
+                                    show_keyboard,
+                                );
+                                return;
+                            }
+                            // Focus can move to a text input between the failure and
+                            // this timer; keep the recovery loop alive while focused.
+                            window.ime_retry_pending.set(true);
+                            attempt = attempt.saturating_add(1);
                         }
                     })
                     .detach();

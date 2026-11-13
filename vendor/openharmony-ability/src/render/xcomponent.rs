@@ -538,10 +538,23 @@ pub fn render_for_window(
             let pending_response = Rc::new(RefCell::new(None));
             let pre_ime_response = pending_response.clone();
             xcomponent_native.on_key_pre_ime(move |event| {
-                if let Some(data) = KeyboardEventData::from_node_callback(event) {
-                    if let Some(callback) = pre_ime_app.input_callback(&pre_ime_owner) {
-                        *pre_ime_response.borrow_mut() = Some(data.response.clone());
-                        callback.key(data);
+                let raw = event.key_event().map(|key| key.key_code_raw());
+                match KeyboardEventData::from_node_callback(event) {
+                    Some(data) => {
+                        if let Some(callback) = pre_ime_app.input_callback(&pre_ime_owner) {
+                            *pre_ime_response.borrow_mut() = Some(data.response.clone());
+                            callback.key(data);
+                        } else {
+                            crate::warn!(
+                                "OHOS key pre-IME: code {raw:?} dropped, no input callback for {}",
+                                pre_ime_owner
+                            );
+                        }
+                    }
+                    None => {
+                        // Media keys, vendor keyboards and the `uinput` test tool
+                        // report codes outside the generated OHOS enum.
+                        crate::warn!("OHOS key pre-IME: code {raw:?} dropped, unmapped");
                     }
                 }
                 None
@@ -559,6 +572,11 @@ pub fn render_for_window(
                             input.set_consumed(true);
                             input.stop_propagation(true);
                         }
+                    } else {
+                        let raw = input.key_code_raw();
+                        crate::warn!(
+                            "OHOS key post-IME: code {raw} dropped, no input callback for {on_key_event_owner}"
+                        );
                     }
                 }
             });

@@ -18,7 +18,8 @@ use luban_core::settings::config_dir;
 /// Directives match the target's leading module path, and the desktop binary is
 /// now a thin `main.rs` over this library, so the editor's own logs are
 /// `luban_app::…` — not the old binary-crate name `luban_notepad::…`.
-pub const DEFAULT_LOG_FILTER: &str = "luban_app=info,luban_plugin=info,gpui=warn";
+pub const DEFAULT_LOG_FILTER: &str =
+    "luban_app=info,luban_plugin=info,gpui=warn,openharmony_ability=warn";
 
 /// Rotate the active log at this size.
 pub const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
