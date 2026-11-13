@@ -36,9 +36,27 @@ crates/luban-ohos/scripts/build-hap.sh --release
 cd crates/luban-ohos/ohos && hvigorw assembleHap
 ```
 
+CI 使用公开工具链复现同一条链路：OpenHarmony 7.0 public SDK（API 26，
+`26.0.0.38-Beta`）、DevEco command-line tools 5.1.0.840 中的 `ohpm`，以及从
+HarmonyOS npm registry 安装的 hvigor 6.26.20（CLI 自带的 hvigor 5.18.5 读不了
+API 26 SDK 的 `metaVersion 3.0.2`）。CI 通过 `--profile` 选择
+`ohos/build-profile.openharmony.json5`，产物是未签名的
+`entry-default-unsigned.hap`：
+
+```sh
+cd crates/luban-ohos
+scripts/build-hap.sh --profile "$PWD/ohos/build-profile.openharmony.json5" --release
+cd ohos && ohpm install --all
+# hvigor 6 装在任意目录，例如 CI 的 $RUNNER_TEMP/ohos-hvigor
+node /path/to/ohos-hvigor/node_modules/@ohos/hvigor/bin/hvigor.js \
+  --mode module -p product=default -p buildMode=release assembleHap --no-daemon
+```
+
 `build-hap.sh` 会把 `libluban_ohos.so`、`libc++_shared.so` 和自动生成的
 `Index.d.ts` 放进 HAP 工程，并从模板生成 `build-profile.json5` 与
 `AppScope/app.json5`（这两个文件带本机签名配置，已在 `.gitignore` 中）。
+显式传入 `--profile` 时会覆盖已有的 `build-profile.json5`；不传时只在文件
+不存在时按默认 HarmonyOS 模板生成。
 
 ## 签名（模拟器 / 开发机）
 
@@ -86,9 +104,13 @@ JBR。
 
 - `cargo check --target aarch64-unknown-linux-ohos -p luban-ohos` 通过
   （PC 侧 `cargo check/test --workspace` 也通过）。
+- CI 交叉编译 arm64 cdylib 并打包未签名 HAP（OpenHarmony 7.0 SDK API 26 +
+  hvigor 6），见 `.github/workflows/ci.yml` 的 `ohos` job。
 - 模拟器已验证：签名 HAP 安装、profile ACL、`READ_PASTEBOARD` 运行时授权、
   Ctrl+C/Ctrl+V 粘贴。
 - 尚未在真机验证：链接（需要真实 NDK）、IME/触摸、picker 授权恢复、
   GLES 渲染差异；真机签名/ACL 还需要 AGC 证书与 profile。
-- `targetSdkVersion`/`compatibleSdkVersion` 暂时是 `26.0.0`（与 gpui-ohos
-  示例一致）。是否下调研判中，见 `docs/HARMONYOS.md`。
+- 本地 DevEco 模板的 `targetSdkVersion`/`compatibleSdkVersion` 暂时是
+  `26.0.0`（与 gpui-ohos 示例一致）；CI 的 OpenHarmony 模板用
+  `compileSdkVersion/targetSdkVersion: "26.0.0"`、`compatibleSdkVersion: 15`。
+  是否下调研判中，见 `docs/HARMONYOS.md`。

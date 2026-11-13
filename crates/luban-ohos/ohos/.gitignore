@@ -6,4 +6,5 @@ oh_modules
 /.hvigor
 **/build
 /entry/libs
+/entry/src/main/ets/types/libluban_ohos/Index.d.ts
 /.idea

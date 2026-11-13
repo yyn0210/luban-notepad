@@ -149,9 +149,24 @@ jobs:
             dist/*.zip.sha256
 
   ohos:
-    name: OpenHarmony arm64 (cross-compile)
+    name: OpenHarmony arm64 (native library + HAP)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      # Public OpenHarmony 7.0 SDK (API 26). The HAP product in
+      # crates/luban-ohos/ohos/build-profile.openharmony.json5 targets it.
+      OHOS_SDK_API: "26.0.0"
+      OHOS_SDK_VERSION: "26.0.0.38-Beta"
+      OHOS_SDK_URL: https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz
+      OHOS_SDK_SHA256: 130a438cbcddd46a2a5b09ee9925339cddf4cca99223329b860f96a5c72f338f
+
+      # The DevEco command-line tools provide ohpm. hvigor comes from the
+      # HarmonyOS npm registry separately because the bundled hvigor 5.18.5
+      # cannot read the metaVersion 3.0.2 SDK metadata used by API 26.
+      OHOS_CLI_VERSION: "5.1.0.840"
+      OHOS_CLI_URL: https://repo.huaweicloud.com/harmonyos/ohpm/5.1.0/commandline-tools-linux-x64-5.1.0.840.zip
+      OHOS_CLI_SHA256: 1dcefa4741dc289277560b2802040e0c45b433898d8db453d711d5376e0478f1
+      HVIGOR_VERSION: "6.26.20"
     steps:
       - uses: actions/checkout@v4
 
@@ -163,7 +178,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ohos
+          key: ohos-${{ env.OHOS_SDK_VERSION }}
 
       # ohrs sets the NDK linker and sysroot for cargo. Cache the binary
       # because a fresh `cargo install` takes a few minutes.
@@ -178,59 +193,126 @@ jobs:
         if: steps.ohrs.outputs.cache-hit != 'true'
         run: cargo install ohrs --version 1.5.0 --locked
 
-      # The public SDK archive bundles every component. Only the native one is
-      # needed to link the cdylib, so cache that zip (835 MB) and extract it
-      # into a separate directory to keep the cache small.
-      - name: Cache OpenHarmony native SDK
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # The public SDK archive bundles every component (3.4 GB). Cache the
+      # extracted API directory so only a cold cache pays the download.
+      - name: Cache OpenHarmony SDK
         id: ohos-sdk
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/ohos-sdk/linux/native-linux-x64-6.1.0.31-Release.zip
-          key: ohos-native-6.1.0.31
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ohos-sdk-${{ env.OHOS_SDK_VERSION }}
 
-      - name: Download OpenHarmony SDK
+      - name: Install OpenHarmony SDK
         if: steps.ohos-sdk.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ohos-sdk/linux"
           archive="$RUNNER_TEMP/ohos-sdk.tar.gz"
-          curl -fL --retry 3 --retry-delay 5 \
-            -o "$archive" \
-            https://repo.huaweicloud.com/openharmony/os/6.1-Release/ohos-sdk-windows_linux-public.tar.gz
-          echo "b833b75a64ee46bbd7880921abbb49b733ec5c8171b6684c9b524d57f624cee0  $archive" |
-            sha256sum -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP/ohos-sdk" \
-            linux/native-linux-x64-6.1.0.31-Release.zip
+          staging="$RUNNER_TEMP/ohos-sdk-zips"
+          root="$RUNNER_TEMP/ohos-sdk/$OHOS_SDK_API"
+          mkdir -p "$root" "$staging"
+          curl -fL --retry 3 --retry-all-errors --retry-delay 5 -o "$archive" "$OHOS_SDK_URL"
+          echo "$OHOS_SDK_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$staging" --wildcards 'ohos-sdk/linux/*.zip'
+          for component in "$staging"/ohos-sdk/linux/*.zip; do
+            unzip -q -o "$component" -d "$root"
+          done
+          rm -rf "$archive" "$staging"
+
+      # Only ohpm is needed from the command-line tools; its bundled SDK and
+      # hvigor are skipped, so the extracted cache entry stays small.
+      - name: Cache OHPM
+        id: ohpm
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ohos-cli
+          key: ohpm-${{ env.OHOS_CLI_VERSION }}
+
+      - name: Install OHPM
+        if: steps.ohpm.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/commandline-tools.zip"
+          curl -fL --retry 3 --retry-all-errors --retry-delay 5 -o "$archive" "$OHOS_CLI_URL"
+          echo "$OHOS_CLI_SHA256  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ohos-cli"
+          unzip -q -o "$archive" 'command-line-tools/ohpm/*' -d "$RUNNER_TEMP/ohos-cli"
           rm -f "$archive"
 
-      - name: Extract OpenHarmony native SDK
+      - name: Configure OpenHarmony toolchain
+        run: |
+          {
+            echo "OHOS_BASE_SDK_HOME=$RUNNER_TEMP/ohos-sdk"
+            echo "DEVECO_SDK_HOME=$RUNNER_TEMP/ohos-sdk"
+            echo "OHOS_NDK_HOME=$RUNNER_TEMP/ohos-sdk/$OHOS_SDK_API"
+          } >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/ohos-cli/command-line-tools/ohpm/bin" >> "$GITHUB_PATH"
+
+      - name: Install hvigor
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ohos-ndk/linux"
-          unzip -q -o \
-            "$RUNNER_TEMP/ohos-sdk/linux/native-linux-x64-6.1.0.31-Release.zip" \
-            -d "$RUNNER_TEMP/ohos-ndk/linux"
-          echo "OHOS_NDK_HOME=$RUNNER_TEMP/ohos-ndk/linux" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ohos-hvigor"
+          npm install --prefix "$RUNNER_TEMP/ohos-hvigor" \
+            --no-audit --no-fund --registry https://repo.harmonyos.com/npm/ \
+            "@ohos/hvigor@$HVIGOR_VERSION" "@ohos/hvigor-ohos-plugin@$HVIGOR_VERSION"
+          rm -rf crates/luban-ohos/ohos/node_modules
+          ln -s "$RUNNER_TEMP/ohos-hvigor/node_modules" \
+            crates/luban-ohos/ohos/node_modules
 
       - name: Build OHOS native library
-        working-directory: crates/luban-ohos
-        run: ohrs build --arch arm64 --release
+        run: |
+          crates/luban-ohos/scripts/build-hap.sh \
+            --profile "$GITHUB_WORKSPACE/crates/luban-ohos/ohos/build-profile.openharmony.json5" \
+            --release
 
       - name: Verify native library
-        working-directory: crates/luban-ohos
         run: |
           set -euo pipefail
-          lib=dist/arm64-v8a/libluban_ohos.so
+          lib=crates/luban-ohos/dist/arm64-v8a/libluban_ohos.so
           test -f "$lib"
           file "$lib"
           readelf -h "$lib" | grep -q 'AArch64'
 
-      - name: Upload OHOS native library
+      - name: Install ArkTS dependencies
+        working-directory: crates/luban-ohos/ohos
+        run: ohpm install --all
+
+      - name: Assemble HAP
+        working-directory: crates/luban-ohos/ohos
+        run: |
+          node "$RUNNER_TEMP/ohos-hvigor/node_modules/@ohos/hvigor/bin/hvigor.js" \
+            --mode module -p product=default -p buildMode=release assembleHap --no-daemon
+
+      - name: Verify HAP
+        run: |
+          set -euo pipefail
+          hap=$(find crates/luban-ohos/ohos/entry/build -name '*-unsigned.hap' -print -quit)
+          if [ -z "$hap" ]; then
+            echo "::error::no unsigned HAP was produced"
+            exit 1
+          fi
+          entries="$RUNNER_TEMP/ohos-hap-entries.txt"
+          unzip -Z1 "$hap" > "$entries"
+          grep -qx 'libs/arm64-v8a/libluban_ohos.so' "$entries"
+          grep -qx 'libs/arm64-v8a/libc++_shared.so' "$entries"
+          module_json="$RUNNER_TEMP/ohos-module.json"
+          unzip -p "$hap" module.json > "$module_json"
+          grep -q '"requestPermissions"' "$module_json"
+          grep -q 'ohos.permission.READ_PASTEBOARD' "$module_json"
+          unzip -p "$hap" pack.info
+          ls -lh "$hap"
+
+      - name: Upload OHOS native library and HAP
         uses: actions/upload-artifact@v4
         with:
           name: ohos-arm64
           path: |
             crates/luban-ohos/dist/arm64-v8a/libluban_ohos.so
             crates/luban-ohos/dist/arm64-v8a/libc++_shared.so
+            crates/luban-ohos/ohos/entry/build/default/outputs/default/*-unsigned.hap
           if-no-files-found: error
           retention-days: 7

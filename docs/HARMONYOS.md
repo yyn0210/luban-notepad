@@ -26,7 +26,7 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
 | `gpui-ohos` vendor（rev `324abb33`） | `vendor/gpui-ohos` |
 | 库入口、`EmbeddedStartup`、`run_embedded` | `crates/luban-app/src/lib.rs` |
 | OHOS 入口与 HAP 工程 | `crates/luban-ohos` |
-| CI 交叉编译 arm64 cdylib（6.1 public SDK + `ohrs`） | `.github/workflows/ci.yml` |
+| CI 交叉编译 arm64 cdylib 并打包未签名 HAP（7.0 public SDK API 26 + hvigor 6） | `.github/workflows/ci.yml` |
 | X11 依赖/代码在 OHOS 上关闭 | `luban-app/Cargo.toml`、`window_registry.rs`、`lib.rs` |
 
 已执行的验证：
@@ -39,6 +39,46 @@ GPUI 在 OpenHarmony 上需要的平台层（窗口、触摸/鼠标/键盘、IME
 
 `cargo check` 不链接；真正的 `ohrs build` 仍需真实 NDK 与签名，属于 G1 的
 设备验收。
+
+## CI（GitHub Actions）
+
+`.github/workflows/ci.yml` 的 `ohos` job 走完整链路，不再只交叉编译 cdylib：
+
+1. 下载并校验 OpenHarmony 7.0 public SDK（`26.0.0.38-Beta`，API 26），把
+   `ets/js/native/toolchains/previewer` 解到 `$OHOS_BASE_SDK_HOME/26.0.0/`；
+2. 从 DevEco command-line tools 5.1.0.840 中只提取 `ohpm`；hvigor 6.26.20 与
+   `@ohos/hvigor-ohos-plugin` 从 `https://repo.harmonyos.com/npm/` 安装。
+   CLI 自带的 hvigor 5.18.5 只认 `metaVersion 3.0.0`，读不了 API 26 SDK 的
+   `3.0.2`，所以不能直接用 CLI 里的 hvigor；
+3. `ohrs build --arch arm64 --release` 生成 `libluban_ohos.so`；
+4. `ohpm install --all` + hvigor `assembleHap` 生成
+   `entry-default-unsigned.hap`；
+5. 校验 HAP 内的 `libs/arm64-v8a/libluban_ohos.so`、`libc++_shared.so` 和
+   `module.json` 的权限声明，然后上传 `ohos-arm64` 工件（含 HAP 与 .so）。
+
+CI 使用 `crates/luban-ohos/ohos/build-profile.openharmony.json5`：
+`runtimeOS: OpenHarmony`、`compileSdkVersion/targetSdkVersion: "26.0.0"`、
+`compatibleSdkVersion: 15`。API 26 起版本字段必须是点分字符串，低于 26 的
+`compatibleSdkVersion` 仍是数字；本地 DevEco 模板保留 HarmonyOS 版本串
+（如 `6.1.0(23)`）不变。
+
+工件是**未签名** HAP，适合 OpenHarmony 开发镜像/模拟器；真机与 AppGallery
+仍需 AGC 证书和 profile（见上文签名一节）。在 Linux 上可按 CI 的目录约定
+复现：
+
+```sh
+export OHOS_BASE_SDK_HOME=/path/to/sdk-root   # 含 26.0.0/{ets,js,native,toolchains,previewer}
+export DEVECO_SDK_HOME="$OHOS_BASE_SDK_HOME"
+export OHOS_NDK_HOME="$OHOS_BASE_SDK_HOME/26.0.0"
+export PATH="/path/to/command-line-tools/ohpm/bin:$PATH"
+
+cd crates/luban-ohos
+scripts/build-hap.sh --profile "$PWD/ohos/build-profile.openharmony.json5" --release
+cd ohos
+ohpm install --all
+node /path/to/node_modules/@ohos/hvigor/bin/hvigor.js \
+  --mode module -p product=default -p buildMode=release assembleHap --no-daemon
+```
 
 ## 待办（Phase 0 剩余）
 
