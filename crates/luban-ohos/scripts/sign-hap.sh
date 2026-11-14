@@ -1,9 +1,17 @@
 #!/bin/sh
-# Sign a HAP with the OpenHarmony SDK test profile and add ACL permissions.
+# Sign a HAP either with the OpenHarmony SDK test profile (default) or with
+# AppGallery Connect release material.
 #
-# This path is for emulators and OpenHarmony development images. Retail
-# HarmonyOS devices and AppGallery releases need a certificate and profile
-# issued by AppGallery Connect; this script cannot mint those.
+# Default (no --profile): mints a profile from the SDK test template and adds
+# ACL permissions. This path is for emulators and OpenHarmony development
+# images only.
+#
+# AGC release mode (--profile <p7b>): signs with a profile and distribution
+# certificate issued by AppGallery Connect, using the .p12 keystore that
+# matches the CSR uploaded to AGC. The profile is used as-is: ACLs, bundle
+# name and validity come from AGC, and the distribution certificate embedded
+# in the profile must be part of --app-cert. Use this for retail HarmonyOS
+# devices and AppGallery uploads.
 #
 # Required (environment or options):
 #   OHOS_SDK_LIB                 SDK toolchains/lib directory
@@ -20,6 +28,8 @@
 # Usage:
 #   scripts/sign-hap.sh --sdk-lib <dir>
 #   scripts/sign-hap.sh --sdk-lib <dir> --install
+#   scripts/sign-hap.sh --profile <AGC.p7b> --app-cert <release.cer> \
+#     --keystore <release.p12> --app-key-alias <alias> --out <signed.hap>
 #
 # The default ACLs are ohos.permission.READ_PASTEBOARD (clipboard reads) and
 # ohos.permission.FILE_ACCESS_PERSIST (persisting picker grants through
@@ -42,15 +52,18 @@ PYTHON_CMD=${PYTHON:-}
 HAP=$default_hap
 OUT=$default_out
 BUNDLE=
-ACLS=ohos.permission.READ_PASTEBOARD,ohos.permission.FILE_ACCESS_PERSIST
-VALIDITY_DAYS=3650
+ACLS=
+VALIDITY_DAYS=
 COMPAT=
 KEYSTORE=
+PROFILE=
 PROFILE_TEMPLATE=
 PROFILE_CERT=
-PROFILE_KEY_ALIAS="openharmony application profile release"
-APP_KEY_ALIAS="openharmony application release"
+PROFILE_KEY_ALIAS=
+APP_CERT=
+APP_KEY_ALIAS=
 SIGN_ALG=SHA256withECDSA
+AGC_MODE=0
 DEVICE=
 INSTALL=0
 KEEP_WORKDIR=0
@@ -62,7 +75,8 @@ die() {
 
 usage() {
     cat <<'EOF'
-Sign a HAP with the OpenHarmony SDK test profile and ACL permissions.
+Sign a HAP with the OpenHarmony SDK test profile (default) or with AGC
+release material (--profile).
 
 Required:
   --sdk-lib <dir>            SDK toolchains/lib directory
@@ -74,19 +88,11 @@ Options:
   --hap <file>               unsigned HAP (default: entry-default-unsigned.hap)
   --out <file>               signed HAP (default: entry-default-signed.hap)
   --bundle <name>            bundle name (default: read AppScope/app.json5)
-  --acls <list>              comma-separated ACL permissions
-                             (default: ohos.permission.READ_PASTEBOARD,
-                             ohos.permission.FILE_ACCESS_PERSIST)
-  --validity-days <n>        profile validity in days (default: 3650)
   --compatible-version <n>   min API level (default: read from the HAP)
   --key-password <pwd>       key password (default: the store password)
-  --keystore <file>          signing keystore (default: SDK OpenHarmony.p12)
-  --profile-template <file>  unsigned profile JSON
-                             (default: SDK UnsgnedReleasedProfileTemplate.json)
-  --profile-cert <file>      profile signing certificate chain
-                             (default: SDK OpenHarmonyProfileRelease.pem)
-  --profile-key-alias <a>    profile key alias
-  --app-key-alias <a>        application key alias
+  --sign-alg <alg>           signature algorithm
+                             (default: SHA256withECDSA; use SHA256withRSA/PSS
+                             for RSA keys)
   --java <file>              java executable
   --keytool <file>           keytool executable
   --hdc <file>               hdc executable
@@ -96,8 +102,31 @@ Options:
   --keep-workdir             keep the temporary profile/certificate directory
   -h, --help                 show this help
 
-Only use this script with the SDK test keystore on emulators or OpenHarmony
-development images. Do not commit keystores, passwords, or generated profiles.
+Test-material options (default; emulators and OpenHarmony dev images only):
+  --acls <list>              comma-separated ACL permissions
+                             (default: ohos.permission.READ_PASTEBOARD,
+                             ohos.permission.FILE_ACCESS_PERSIST)
+  --validity-days <n>        profile validity in days (default: 3650)
+  --keystore <file>          signing keystore (default: SDK OpenHarmony.p12)
+  --profile-template <file>  unsigned profile JSON
+                             (default: SDK UnsgnedReleasedProfileTemplate.json)
+  --profile-cert <file>      profile signing certificate chain
+                             (default: SDK OpenHarmonyProfileRelease.pem)
+  --profile-key-alias <a>    profile key alias
+  --app-key-alias <a>        application key alias
+
+AGC release options (real devices / AppGallery):
+  --profile <p7b>            AGC-signed profile, used as-is
+  --app-cert <cer|pem>       distribution certificate chain issued by AGC
+                             (the one matching the profile); the keystore must
+                             contain the matching private key
+  --keystore <file>          AGC keystore (.p12), required in this mode
+  --app-key-alias <a>        keystore alias of the release key, required in
+                             this mode
+
+Only use the default path with the SDK test keystore on emulators or
+OpenHarmony development images. Do not commit keystores, passwords, or
+generated profiles.
 EOF
 }
 
@@ -114,8 +143,11 @@ while [ "$#" -gt 0 ]; do
         --acls) need_value "$@"; ACLS=$2; shift 2 ;;
         --validity-days) need_value "$@"; VALIDITY_DAYS=$2; shift 2 ;;
         --compatible-version) need_value "$@"; COMPAT=$2; shift 2 ;;
+        --profile) need_value "$@"; PROFILE=$2; shift 2 ;;
+        --app-cert) need_value "$@"; APP_CERT=$2; shift 2 ;;
         --store-password) need_value "$@"; STORE_PWD=$2; shift 2 ;;
         --key-password) need_value "$@"; KEY_PWD=$2; shift 2 ;;
+        --sign-alg) need_value "$@"; SIGN_ALG=$2; shift 2 ;;
         --keystore) need_value "$@"; KEYSTORE=$2; shift 2 ;;
         --profile-template) need_value "$@"; PROFILE_TEMPLATE=$2; shift 2 ;;
         --profile-cert) need_value "$@"; PROFILE_CERT=$2; shift 2 ;;
@@ -131,6 +163,15 @@ while [ "$#" -gt 0 ]; do
         *) die "unknown option: $1 (try --help)" ;;
     esac
 done
+
+if [ -n "$PROFILE" ]; then
+    AGC_MODE=1
+    [ -z "$ACLS" ] || die "--acls cannot be combined with --profile (ACLs come from the AGC profile)"
+    [ -z "$VALIDITY_DAYS" ] || die "--validity-days cannot be combined with --profile (validity comes from the AGC profile)"
+    [ -z "$PROFILE_TEMPLATE" ] || die "--profile-template cannot be combined with --profile"
+    [ -z "$PROFILE_CERT" ] || die "--profile-cert cannot be combined with --profile"
+    [ -z "$PROFILE_KEY_ALIAS" ] || die "--profile-key-alias cannot be combined with --profile"
+fi
 
 if [ -z "$SDK_LIB" ]; then
     if [ -n "${OHOS_SDK_HOME:-}" ] && [ -d "$OHOS_SDK_HOME/toolchains/lib" ]; then
@@ -148,19 +189,31 @@ fi
 [ -f "$HAP" ] || die "unsigned HAP not found: $HAP (build it with hvigorw assembleHap)"
 [ "$HAP" != "$OUT" ] || die "--out must differ from --hap"
 
-if [ -z "$KEYSTORE" ]; then
-    KEYSTORE="$SDK_LIB/OpenHarmony.p12"
-fi
-if [ -z "$PROFILE_TEMPLATE" ]; then
-    PROFILE_TEMPLATE="$SDK_LIB/UnsgnedReleasedProfileTemplate.json"
-fi
-if [ -z "$PROFILE_CERT" ]; then
-    PROFILE_CERT="$SDK_LIB/OpenHarmonyProfileRelease.pem"
+if [ "$AGC_MODE" = 1 ]; then
+    [ -f "$PROFILE" ] || die "profile not found: $PROFILE"
+    [ -n "$APP_CERT" ] || die "--app-cert is required together with --profile"
+    [ -f "$APP_CERT" ] || die "app certificate not found: $APP_CERT"
+    [ -n "$KEYSTORE" ] || die "--keystore <AGC .p12> is required together with --profile (never sign a release HAP with the SDK test keystore)"
+    [ -n "$APP_KEY_ALIAS" ] || die "--app-key-alias is required together with --profile (list aliases with: keytool -list -keystore <p12>)"
+else
+    [ -n "$ACLS" ] || ACLS=ohos.permission.READ_PASTEBOARD,ohos.permission.FILE_ACCESS_PERSIST
+    [ -n "$VALIDITY_DAYS" ] || VALIDITY_DAYS=3650
+    [ -n "$PROFILE_KEY_ALIAS" ] || PROFILE_KEY_ALIAS="openharmony application profile release"
+    [ -n "$APP_KEY_ALIAS" ] || APP_KEY_ALIAS="openharmony application release"
+    if [ -z "$KEYSTORE" ]; then
+        KEYSTORE="$SDK_LIB/OpenHarmony.p12"
+    fi
+    if [ -z "$PROFILE_TEMPLATE" ]; then
+        PROFILE_TEMPLATE="$SDK_LIB/UnsgnedReleasedProfileTemplate.json"
+    fi
+    if [ -z "$PROFILE_CERT" ]; then
+        PROFILE_CERT="$SDK_LIB/OpenHarmonyProfileRelease.pem"
+    fi
+    [ -f "$PROFILE_TEMPLATE" ] || die "profile template not found: $PROFILE_TEMPLATE"
+    [ -f "$PROFILE_CERT" ] || die "profile certificate not found: $PROFILE_CERT"
 fi
 [ -f "$SDK_LIB/hap-sign-tool.jar" ] || die "hap-sign-tool.jar not found in $SDK_LIB"
 [ -f "$KEYSTORE" ] || die "keystore not found: $KEYSTORE"
-[ -f "$PROFILE_TEMPLATE" ] || die "profile template not found: $PROFILE_TEMPLATE"
-[ -f "$PROFILE_CERT" ] || die "profile certificate not found: $PROFILE_CERT"
 
 if [ -z "$PYTHON_CMD" ]; then
     if command -v python3 >/dev/null 2>&1; then
@@ -178,7 +231,8 @@ fi
 # caller did not provide it. This is only a convenience; --java/--keytool win.
 DEVECO_DIR=${DEVECO_HOME:-}
 if [ -z "$DEVECO_DIR" ]; then
-    candidate=$(CDPATH= cd -- "$SDK_LIB/../../../../.." 2>/dev/null && pwd) || candidate=
+    # <sdk>/default/openharmony/toolchains/lib is five levels below DevEco.
+    candidate=$(CDPATH= cd -- "$SDK_LIB/../../../../../" 2>/dev/null && pwd) || candidate=
     if [ -n "$candidate" ] && { [ -x "$candidate/jbr/bin/java" ] || [ -x "$candidate/jbr/bin/java.exe" ]; }; then
         DEVECO_DIR=$candidate
     fi
@@ -207,7 +261,7 @@ if [ -z "$JAVA_CMD" ]; then
 fi
 JAVA_CMD=$(resolve_cmd "$JAVA_CMD") || die "java not found; set --java or JAVA_HOME"
 
-if [ -z "$KEYTOOL_CMD" ]; then
+if [ -z "$KEYTOOL_CMD" ] && [ "$AGC_MODE" = 0 ]; then
     if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/keytool" ]; then
         KEYTOOL_CMD="$JAVA_HOME/bin/keytool"
     elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/keytool.exe" ]; then
@@ -220,7 +274,9 @@ if [ -z "$KEYTOOL_CMD" ]; then
         KEYTOOL_CMD=keytool
     fi
 fi
-KEYTOOL_CMD=$(resolve_cmd "$KEYTOOL_CMD") || die "keytool not found; set --keytool or JAVA_HOME"
+if [ "$AGC_MODE" = 0 ]; then
+    KEYTOOL_CMD=$(resolve_cmd "$KEYTOOL_CMD") || die "keytool not found; set --keytool or JAVA_HOME"
+fi
 
 if [ -z "$BUNDLE" ]; then
     app_json="$crate_dir/ohos/AppScope/app.json5"
@@ -268,7 +324,109 @@ else
     trap 'rm -rf "$WORK"; exit 1' INT TERM
 fi
 
-"$PYTHON_CMD" - "$PROFILE_TEMPLATE" "$WORK/profile.json" "$BUNDLE" "$ACLS" "$VALIDITY_DAYS" <<'PY'
+if [ "$AGC_MODE" = 1 ]; then
+    PROFILE_FILE=$PROFILE
+    APP_CERT_FILE=$APP_CERT
+
+    # The p7b is PKCS#7 signed data whose encapsulated content is the profile
+    # JSON. Extract it once: verify-profile works on the p7b itself, but the
+    # guards below need the plaintext fields.
+    "$PYTHON_CMD" - "$PROFILE" "$WORK/profile.json" <<'PY'
+import json
+import sys
+
+data = open(sys.argv[1], "rb").read().decode("latin-1")
+start = data.find('{"')
+if start < 0:
+    raise SystemExit("no embedded JSON found in profile")
+depth = 0
+end = None
+for i in range(start, len(data)):
+    c = data[i]
+    if c == "{":
+        depth += 1
+    elif c == "}":
+        depth -= 1
+        if depth == 0:
+            end = i + 1
+            break
+if end is None:
+    raise SystemExit("embedded profile JSON is truncated")
+try:
+    profile = json.loads(data[start:end])
+except ValueError as exc:
+    raise SystemExit(f"embedded profile JSON is not valid: {exc}")
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(profile, handle, ensure_ascii=False, indent=2)
+PY
+
+    ACLS=$("$PYTHON_CMD" - "$WORK/profile.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    profile = json.load(handle)
+acls = (profile.get("acls") or {}).get("allowed-acls") or []
+print(",".join(acls))
+PY
+)
+
+    "$PYTHON_CMD" - "$WORK/profile.json" "$BUNDLE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    profile = json.load(handle)
+info = profile.get("bundle-info") or {}
+actual = info.get("bundle-name")
+if actual != sys.argv[2]:
+    raise SystemExit(
+        "profile bundle-name is %r but the HAP/AppScope says %r"
+        % (actual, sys.argv[2])
+    )
+PY
+
+    "$PYTHON_CMD" - "$WORK/profile.json" "$APP_CERT" <<'PY'
+import base64
+import json
+import re
+import sys
+
+def der_of_pem(text):
+    body = "".join(
+        line
+        for line in text.splitlines()
+        if "BEGIN" not in line and "END" not in line and line.strip()
+    )
+    return base64.b64decode(body)
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    profile = json.load(handle)
+info = profile.get("bundle-info") or {}
+pem = info.get("distribution-certificate") or info.get("development-certificate") or ""
+if not pem:
+    raise SystemExit("profile has no distribution/development certificate")
+target = der_of_pem(pem)
+
+cert_text = open(sys.argv[2], "rb").read().decode("latin-1")
+blocks = re.findall(
+    r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", cert_text, re.S
+)
+if blocks:
+    candidates = [der_of_pem(block) for block in blocks]
+else:
+    candidates = [cert_text.encode("latin-1")]
+if target not in candidates:
+    raise SystemExit(
+        "the distribution certificate embedded in the profile is not part of "
+        "--app-cert; the signature would not match the profile"
+    )
+PY
+else
+    PROFILE_FILE=$WORK/profile.p7b
+    APP_CERT_FILE=$WORK/app-chain.pem
+
+    "$PYTHON_CMD" - "$PROFILE_TEMPLATE" "$WORK/profile.json" "$BUNDLE" "$ACLS" "$VALIDITY_DAYS" <<'PY'
 import json
 import sys
 import time
@@ -296,7 +454,7 @@ with open(out, "w", encoding="utf-8") as handle:
     json.dump(profile, handle, ensure_ascii=False, indent=2)
 PY
 
-"$PYTHON_CMD" - "$WORK/profile.json" "$WORK/app-leaf.pem" <<'PY'
+    "$PYTHON_CMD" - "$WORK/profile.json" "$WORK/app-leaf.pem" <<'PY'
 import json
 import sys
 
@@ -310,18 +468,18 @@ with open(sys.argv[2], "w", encoding="ascii") as handle:
     handle.write(certificate)
 PY
 
-"$KEYTOOL_CMD" -exportcert -rfc -alias "openharmony application ca" \
-    -keystore "$KEYSTORE" -storepass "$STORE_PWD" -file "$WORK/ca.pem" >/dev/null
-"$KEYTOOL_CMD" -exportcert -rfc -alias "openharmony application root ca" \
-    -keystore "$KEYSTORE" -storepass "$STORE_PWD" -file "$WORK/root.pem" >/dev/null
+    "$KEYTOOL_CMD" -exportcert -rfc -alias "openharmony application ca" \
+        -keystore "$KEYSTORE" -storepass "$STORE_PWD" -file "$WORK/ca.pem" >/dev/null
+    "$KEYTOOL_CMD" -exportcert -rfc -alias "openharmony application root ca" \
+        -keystore "$KEYSTORE" -storepass "$STORE_PWD" -file "$WORK/root.pem" >/dev/null
 
-cat "$WORK/app-leaf.pem" > "$WORK/app-chain.pem"
-printf '\n' >> "$WORK/app-chain.pem"
-cat "$WORK/ca.pem" >> "$WORK/app-chain.pem"
-printf '\n' >> "$WORK/app-chain.pem"
-cat "$WORK/root.pem" >> "$WORK/app-chain.pem"
+    cat "$WORK/app-leaf.pem" > "$WORK/app-chain.pem"
+    printf '\n' >> "$WORK/app-chain.pem"
+    cat "$WORK/ca.pem" >> "$WORK/app-chain.pem"
+    printf '\n' >> "$WORK/app-chain.pem"
+    cat "$WORK/root.pem" >> "$WORK/app-chain.pem"
 
-"$JAVA_CMD" -jar "$SDK_LIB/hap-sign-tool.jar" sign-profile \
+    "$JAVA_CMD" -jar "$SDK_LIB/hap-sign-tool.jar" sign-profile \
     -mode localSign \
     -keyAlias "$PROFILE_KEY_ALIAS" \
     -keyPwd "$KEY_PWD" \
@@ -331,9 +489,10 @@ cat "$WORK/root.pem" >> "$WORK/app-chain.pem"
     -keystoreFile "$KEYSTORE" \
     -keystorePwd "$STORE_PWD" \
     -outFile "$WORK/profile.p7b"
+fi
 
 "$JAVA_CMD" -jar "$SDK_LIB/hap-sign-tool.jar" verify-profile \
-    -inFile "$WORK/profile.p7b" \
+    -inFile "$PROFILE_FILE" \
     -outFile "$WORK/verify-profile.json" >/dev/null
 
 "$PYTHON_CMD" - "$WORK/verify-profile.json" <<'PY'
@@ -350,8 +509,8 @@ PY
     -mode localSign \
     -keyAlias "$APP_KEY_ALIAS" \
     -keyPwd "$KEY_PWD" \
-    -appCertFile "$WORK/app-chain.pem" \
-    -profileFile "$WORK/profile.p7b" \
+    -appCertFile "$APP_CERT_FILE" \
+    -profileFile "$PROFILE_FILE" \
     -inFile "$HAP" \
     -signAlg "$SIGN_ALG" \
     -keystoreFile "$KEYSTORE" \

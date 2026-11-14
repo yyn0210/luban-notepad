@@ -246,6 +246,36 @@ crates/luban-ohos/scripts/sign-hap.sh --install --device <serial>
 - API 23 模拟器无法验证卸载重装保留（API 24 起）。真机/AppGallery 需在
   AGC 为 `FILE_ACCESS_PERSIST` 申请 ACL。
 
+## 2026-11-14 AGC 发布 profile 到位，发布签名接入 sign-hap.sh
+
+AGC 审核通过并签发了 `prdRelease` profile（`app-distribution-type:
+app_gallery`，type `release`，有效期 2026-11-14 → 2029-11-14），与本地
+发布证书链（Root → Developer Relations CA G2 → `杨依宁(...),Release`，
+ECC P-256）核对一致：
+
+- bundle 名 `com.janeluo.lubannotepad` 与 `AppScope/app.json5` 相同；
+- **两条 ACL 都批了**：`ohos.permission.READ_PASTEBOARD` 和
+  `ohos.permission.FILE_ACCESS_PERSIST` 已出现在 profile 的
+  `acls.allowed-acls`，意味着剪贴板与 picker 授权持久化在零售设备上
+  不再需要额外申请；
+- profile 内嵌分发证书与 `.cer` 链里的叶子证书逐字节相同。
+
+`scripts/sign-hap.sh` 新增 AGC 发布模式（`--profile` + `--app-cert` +
+`--keystore` + `--app-key-alias`）：不再从 SDK 模板铸造 profile，AGC 的
+p7b 原样进 `sign-app`；签名前校验 profile 可验签、bundle 名一致、profile
+内嵌证书属于 `--app-cert`。用法与守卫说明见
+`crates/luban-ohos/README.md` 的 "AGC 发布签名" 一节。本机已用真实 AGC
+p7b + 真实未签名 HAP 冒烟到 `sign-app` 的密钥库加载步骤（哑密钥库按预期
+被工具的 key↔cert 匹配检查拒绝）；待办是用真实 `.p12` 口令签出正式包。
+
+后续真机/AppGallery 步骤：
+
+1. `hdc install` 发布签名包到真机，验证安装、ACL 生效（`bm dump`）、
+   Ctrl+V 与 picker 授权持久化；
+2. 上架材料、AppGallery 上传校验（含版本号与 profile 的
+   `version-code 2` 对齐策略）；
+3. 覆盖安装旧签名包必须先卸载（数据会丢）。
+
 ## 2026-11-11 e2e 回归（KaihongOS 6.1 虚机）
 
 本轮在 `KaihongOS61-install-0` 上通过 `hdc` + QEMU SDL 窗口做全功能

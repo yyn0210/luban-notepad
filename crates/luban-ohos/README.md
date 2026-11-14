@@ -82,7 +82,29 @@ bundle 的旧包再安装（应用数据会丢失）；不加 `--install` 只生
 默认使用 DevEco 自带的 JBR。
 
 真机和 AppGallery 必须使用 AGC 签发的证书/profile；OpenHarmony 测试根
-不适用于零售设备。ACL 申请和发布签名见 `docs/HARMONYOS.md`。
+不适用于零售设备。
+
+### AGC 发布签名（真机 / AppGallery）
+
+AGC 签发的 profile（`.p7b`）、发布证书（`.cer`）和与上传 CSR 配套的
+`.p12` 密钥库可以直接喂给同一脚本，跳过测试 profile 铸造流程：
+
+```sh
+export OHOS_SIGN_STORE_PASSWORD="<发布密钥库口令>"
+crates/luban-ohos/scripts/sign-hap.sh \
+  --profile <AGC 发布 profile.p7b> \
+  --app-cert <发布证书.cer> \
+  --keystore <发布密钥库.p12> \
+  --app-key-alias <别名> \
+  --out entry-release-signed.hap
+```
+
+该模式下 profile 原样使用（ACL、bundle 名、有效期都来自 AGC），脚本会
+先做三道校验：`verify-profile`、profile 的 bundle 名与 `AppScope/app.json5`
+一致、profile 内嵌的分发证书必须包含在 `--app-cert` 里。ECC 证书用默认
+的 `SHA256withECDSA`，RSA 证书加 `--sign-alg SHA256withRSA/PSS`。覆盖
+安装签名不一致的旧包仍需先 `hdc uninstall`（会丢应用数据）。路径、口令
+和别名不入库。
 
 ## 权限
 
