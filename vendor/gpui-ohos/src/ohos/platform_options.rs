@@ -6,6 +6,8 @@ pub struct PlatformOptions {
     ///
     /// Disabled by default. Requires `ohos.permission.FILE_ACCESS_PERSIST`.
     /// Restoration starts in the background after the first presented GPUI frame.
+    /// The grant history keeps the least recently used 256 grants; selecting
+    /// more revokes the oldest grants through ohos.fileshare first.
     pub persist_file_access: bool,
 }
 

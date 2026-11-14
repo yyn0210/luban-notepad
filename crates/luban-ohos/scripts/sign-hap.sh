@@ -21,9 +21,11 @@
 #   scripts/sign-hap.sh --sdk-lib <dir>
 #   scripts/sign-hap.sh --sdk-lib <dir> --install
 #
-# The default ACL is ohos.permission.READ_PASTEBOARD. Signing a HAP that is
-# already installed with a different (or no) signature requires uninstalling
-# it first; --install does that and therefore discards application data.
+# The default ACLs are ohos.permission.READ_PASTEBOARD (clipboard reads) and
+# ohos.permission.FILE_ACCESS_PERSIST (persisting picker grants through
+# ohos.fileshare). Signing a HAP that is already installed with a different
+# (or no) signature requires uninstalling it first; --install does that and
+# therefore discards application data.
 set -eu
 
 crate_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -40,7 +42,7 @@ PYTHON_CMD=${PYTHON:-}
 HAP=$default_hap
 OUT=$default_out
 BUNDLE=
-ACLS=ohos.permission.READ_PASTEBOARD
+ACLS=ohos.permission.READ_PASTEBOARD,ohos.permission.FILE_ACCESS_PERSIST
 VALIDITY_DAYS=3650
 COMPAT=
 KEYSTORE=
@@ -73,7 +75,8 @@ Options:
   --out <file>               signed HAP (default: entry-default-signed.hap)
   --bundle <name>            bundle name (default: read AppScope/app.json5)
   --acls <list>              comma-separated ACL permissions
-                             (default: ohos.permission.READ_PASTEBOARD)
+                             (default: ohos.permission.READ_PASTEBOARD,
+                             ohos.permission.FILE_ACCESS_PERSIST)
   --validity-days <n>        profile validity in days (default: 3650)
   --compatible-version <n>   min API level (default: read from the HAP)
   --key-password <pwd>       key password (default: the store password)

@@ -203,6 +203,49 @@ export OHOS_SIGN_STORE_PASSWORD="<SDK 测试密钥库口令>"
 crates/luban-ohos/scripts/sign-hap.sh --install --device <serial>
 ```
 
+## 2026-11-14 文件选择器授权持久化对齐官方文档
+
+按华为《用户文件授权持久化》文档补齐三处缺口，使 Picker 选择的文件在应用
+重启后免重新授权：
+
+- **签名 ACL**：`ohos.permission.FILE_ACCESS_PERSIST` 是 `system_basic` 级，
+  module.json5 声明之外还必须在签名 profile 的 `acls.allowed-acls` 里才会在
+  安装时授予。此前 `sign-hap.sh` 默认 ACL 只有 `READ_PASTEBOARD`，运行时
+  `fileShare.persistPermission` 必报 `201`。现在默认 ACL 为
+  `READ_PASTEBOARD,FILE_ACCESS_PERSIST`。
+- **卸载重装保留**：module.json5 增加
+  `metadata: ohos.fileshare.supportPreservePersistentPermission`（文档
+  "持久化权限保留配置"，API 24 起生效；旧 API 忽略，无副作用）。API 23
+  模拟器上不可验证，仅记档。
+- **按需撤销（LRU 淘汰）**：文档要求用 `fileShare.revokePermission` 按需
+  取消持久化授权。gpui-ohos 的授权历史此前满 256 条后直接拒绝新授权；现在
+  历史文件升级为有序 `[uri, mode]` 数组（兼容读取旧 map 格式），新授权放不
+  下时用 `revokePermission` 撤销最旧的授权腾位。
+- **能力/权限降级**：顶层返回 `PermissionError`（缺 ACL）或
+  `DeviceNotSupported`（无 FolderAuthorization 能力，等价 ArkTS
+  `canIUse` 检查不过）时，记录一次可操作日志并停用本次会话内的授权持久化；
+  Picker 的临时授权流程不受影响。
+
+验证（DevEco HarmonyOS 6.1 x86_64 模拟器，全部通过）：
+
+- `cargo check -p luban-ohos --target x86_64-unknown-linux-ohos` 通过；签名
+  安装后 `bm dump` 显示 `FILE_ACCESS_PERSIST` 授予（`reqPermissionStates`
+  为 0）、module metadata 含
+  `ohos.fileshare.supportPreservePersistentPermission`。
+- Picker 打开 `Documents.luban-workspace` 后强停并重启：全新进程无临时
+  授权，工作区仍自动恢复（内容完整渲染），证明 persist→历史文件→
+  check→activate 全链路生效；状态栏显示重启后 Ctrl+S 保存成功（写路径
+  同样可用）。
+- 淘汰路径：临时把 `MAX_GRANTS` 降到 3 重编译，连续打开 4 个不同文件，
+  `luban.log`（帮助 → 打开日志目录可读）出现
+  `File grant history is full; evicted 1 oldest grant(s), revoked 1`，
+  与第 4 个文件的打开时间吻合，随后恢复 256。淘汰走的是
+  `fileShare.revokePermission`。
+- 观测提示：Rust 日志在应用沙箱 `logs/luban.log`（UTC 时间戳），shell 无
+  root 读不了，用 帮助 → 打开日志目录 在应用内打开即可。
+- API 23 模拟器无法验证卸载重装保留（API 24 起）。真机/AppGallery 需在
+  AGC 为 `FILE_ACCESS_PERSIST` 申请 ACL。
+
 ## 2026-11-11 e2e 回归（KaihongOS 6.1 虚机）
 
 本轮在 `KaihongOS61-install-0` 上通过 `hdc` + QEMU SDL 窗口做全功能

@@ -61,8 +61,8 @@ node /path/to/ohos-hvigor/node_modules/@ohos/hvigor/bin/hvigor.js \
 ## 签名（模拟器 / 开发机）
 
 `hvigorw assembleHap` 产出的是 `entry-default-unsigned.hap`，没有签名 profile，
-因此拿不到 `READ_PASTEBOARD` 的 ACL 授权。模拟器/OpenHarmony 开发镜像可以用
-SDK 自带的测试材料签名：
+因此拿不到 `READ_PASTEBOARD`、`FILE_ACCESS_PERSIST` 的 ACL 授权。模拟器/
+OpenHarmony 开发镜像可以用 SDK 自带的测试材料签名：
 
 ```sh
 export OHOS_SDK_LIB="<DevEco SDK>/default/openharmony/toolchains/lib"
@@ -71,13 +71,15 @@ crates/luban-ohos/scripts/sign-hap.sh --install --device <serial>
 ```
 
 脚本会从 `UnsgnedReleasedProfileTemplate.json` 生成
-`acls.allowed-acls = ["ohos.permission.READ_PASTEBOARD"]` 的 profile，用
+`acls.allowed-acls = ["ohos.permission.READ_PASTEBOARD",
+"ohos.permission.FILE_ACCESS_PERSIST"]` 的 profile，用
 `hap-sign-tool.jar` 签出 `profile.p7b`，再用 SDK 的证书链签出
-`entry-default-signed.hap`。`--install` 会先卸载同 bundle 的旧包再安装
-（应用数据会丢失）；不加 `--install` 只生成签名包。路径、口令和设备序列号
-只通过参数或环境变量传入，仓库里不保存任何密钥或本机路径。脚本需要
-`python3`/`python` 生成 profile JSON；Java/keytool 默认使用 DevEco 自带的
-JBR。
+`entry-default-signed.hap`。后者用于 `ohos.fileshare` 的授权持久化
+（Picker 选择过的文件在应用重启后免重新授权）。`--install` 会先卸载同
+bundle 的旧包再安装（应用数据会丢失）；不加 `--install` 只生成签名包。
+路径、口令和设备序列号只通过参数或环境变量传入，仓库里不保存任何密钥或
+本机路径。脚本需要 `python3`/`python` 生成 profile JSON；Java/keytool
+默认使用 DevEco 自带的 JBR。
 
 真机和 AppGallery 必须使用 AGC 签发的证书/profile；OpenHarmony 测试根
 不适用于零售设备。ACL 申请和发布签名见 `docs/HARMONYOS.md`。

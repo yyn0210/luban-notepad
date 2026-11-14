@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result};
-use ohos_fileshare_binding::PolicyInfo;
+use ohos_fileshare_binding::{FileShareError, PolicyInfo};
 use parking_lot::Mutex;
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     io::{Read as _, Write as _},
@@ -26,10 +27,98 @@ pub(crate) struct FileAccess {
 
 #[derive(Default)]
 struct FileAccessState {
+    /// Persisted grants by URI, merged across sessions.
     policies: Option<BTreeMap<String, u32>>,
+    /// The URIs of `policies` in least-recently-used order (oldest first).
+    /// Mirrors the keys of `policies` exactly so eviction can pop the grant
+    /// the user has touched least recently.
+    order: Vec<String>,
     pending: BTreeMap<String, u32>,
     restored: bool,
     dirty: bool,
+    /// Set when the file-share service refused a whole API call for a reason
+    /// that cannot recover within this process; disables every further grant
+    /// persistence, activation and revocation attempt.
+    unavailable: Option<&'static str>,
+}
+
+impl FileAccessState {
+    fn contains_grant(&self, uri: &str) -> bool {
+        self.policies
+            .as_ref()
+            .is_some_and(|policies| policies.contains_key(uri))
+    }
+
+    /// Stores `mode` for `uri` verbatim (overwriting any previous mode)
+    /// without refreshing recency; startup restoration keeps the persisted
+    /// order intact.
+    fn set_mode(&mut self, uri: &str, mode: u32) {
+        if let Some(policies) = self.policies.as_mut() {
+            if policies.get(uri).copied() != Some(mode) {
+                policies.insert(uri.to_string(), mode);
+                self.dirty = true;
+            }
+        }
+        if !self.order.iter().any(|known| known == uri) {
+            self.order.push(uri.to_string());
+            self.dirty = true;
+        }
+    }
+
+    /// Merges `mode` into the grant for `uri` and moves it to the back of the
+    /// recency order (a fresh selection through Picker, a drop or open URI).
+    /// Marks the history dirty when the mode, membership or recency changed.
+    fn touch_grant(&mut self, uri: &str, mode: u32) -> u32 {
+        let previous = self
+            .policies
+            .as_ref()
+            .and_then(|policies| policies.get(uri).copied());
+        let merged = previous.unwrap_or(0) | mode;
+        if previous != Some(merged) {
+            self.policies
+                .get_or_insert_with(BTreeMap::new)
+                .insert(uri.to_string(), merged);
+            self.dirty = true;
+        }
+        match self.order.iter().position(|known| known == uri) {
+            Some(position) => {
+                if position + 1 != self.order.len() {
+                    let known = self.order.remove(position);
+                    self.order.push(known);
+                    self.dirty = true;
+                }
+            }
+            None => {
+                self.order.push(uri.to_string());
+                self.dirty = true;
+            }
+        }
+        merged
+    }
+
+    /// Drops the grant and its recency entry, marking the history dirty.
+    fn ungrant(&mut self, uri: &str) {
+        if let Some(position) = self.order.iter().position(|known| known == uri) {
+            self.order.remove(position);
+            self.dirty = true;
+        }
+        if self
+            .policies
+            .as_mut()
+            .and_then(|policies| policies.remove(uri))
+            .is_some()
+        {
+            self.dirty = true;
+        }
+    }
+
+    /// Removes the least recently used grant; returns it for revocation.
+    fn pop_oldest(&mut self) -> Option<(String, u32)> {
+        let uri = self.order.first()?.clone();
+        let mode = self.policies.as_ref()?.get(&uri).copied()?;
+        self.ungrant(&uri);
+        Some((uri, mode))
+    }
 }
 
 struct PolicyFailure {
@@ -61,6 +150,32 @@ fn activate_batch(policies: &[PolicyInfo]) -> Result<Vec<PolicyFailure>> {
             uri: error.uri,
         })
         .collect())
+}
+
+fn revoke_batch(policies: &[PolicyInfo]) -> Result<Vec<PolicyFailure>> {
+    Ok(ohos_fileshare_binding::revoke_permission(policies)?
+        .into_iter()
+        .map(|error| PolicyFailure {
+            message: format!("{error:?}"),
+            uri: error.uri,
+        })
+        .collect())
+}
+
+/// Whole-call failures that cannot recover within this process. A missing
+/// `ohos.permission.FILE_ACCESS_PERSIST` ACL entry makes every fileshare call
+/// return "permission verification failed"; devices without the capability
+/// would fail the ArkTS `canIUse` check for FolderAuthorization.
+fn unavailable_reason(error: &FileShareError) -> Option<&'static str> {
+    match error {
+        FileShareError::PermissionError => Some(
+            "ohos.permission.FILE_ACCESS_PERSIST is not granted; re-sign the HAP with it in the profile ACL (scripts/sign-hap.sh) and reinstall",
+        ),
+        FileShareError::DeviceNotSupported => Some(
+            "the device does not support FolderAuthorization (SystemCapability.FileManagement.AppFileService.FolderAuthorization)",
+        ),
+        _ => None,
+    }
 }
 
 impl FileAccess {
@@ -121,18 +236,39 @@ impl FileAccess {
     }
 
     fn process(&self, state: &mut FileAccessState, mut failures: Vec<String>) -> Result<()> {
+        if state.unavailable.is_some() {
+            return report(failures);
+        }
         // A read failure preserves both the file and the bounded pending selection.
         if state.policies.is_none() {
-            state.policies = Some(self.read_history()?);
+            let (policies, order) = self.read_history()?;
+            state.policies = Some(policies);
+            state.order = order;
         }
         self.restore_state(state, &mut failures);
         let pending = std::mem::take(&mut state.pending);
-        let policies = state.policies.as_mut().expect("history loaded above");
         let mut requests = Vec::new();
-        let mut count = policies.len();
+        let mut evictions = Vec::new();
+        let mut count = state.policies.as_ref().expect("history loaded above").len();
         for (uri, operation_mode) in pending {
-            if !policies.contains_key(&uri) {
-                if count == MAX_GRANTS {
+            if !state.contains_grant(&uri) {
+                // Evict the least recently used grant until there is room.
+                // Evicted grants leave the history even when their revocation
+                // fails, because a failed revocation usually means the file
+                // or its grant is already gone.
+                while count >= MAX_GRANTS {
+                    match state.pop_oldest() {
+                        Some((oldest_uri, oldest_mode)) => {
+                            evictions.push(PolicyInfo {
+                                uri: oldest_uri,
+                                operation_mode: oldest_mode,
+                            });
+                            count -= 1;
+                        }
+                        None => break,
+                    }
+                }
+                if count >= MAX_GRANTS {
                     failures.push(format!("File grant history is full ({MAX_GRANTS}): {uri}"));
                     continue;
                 }
@@ -143,7 +279,17 @@ impl FileAccess {
                 operation_mode,
             });
         }
-        let mut retained = apply_batches("persist", &requests, &mut failures, persist_batch);
+        if !evictions.is_empty() {
+            let revoked = apply_batches("revoke", &evictions, state, &mut failures, revoke_batch);
+            // The default log filter keeps gpui-prefixed targets at warn, so
+            // use warn to make evictions observable in luban.log.
+            log::warn!(
+                "File grant history is full; evicted {} oldest grant(s), revoked {}",
+                evictions.len(),
+                revoked.len()
+            );
+        }
+        let mut retained = apply_batches("persist", &requests, state, &mut failures, persist_batch);
         // Save dialogs may return providers that grant only reading.
         let read_fallbacks = requests
             .iter()
@@ -159,15 +305,14 @@ impl FileAccess {
         retained.extend(apply_batches(
             "persist read-only",
             &read_fallbacks,
+            state,
             &mut failures,
             persist_batch,
         ));
         for policy in &retained {
-            let mode = policies.get(&policy.uri).copied().unwrap_or(0) | policy.operation_mode;
-            let previous = policies.insert(policy.uri.clone(), mode);
-            state.dirty |= previous != Some(mode);
+            state.touch_grant(&policy.uri, policy.operation_mode);
         }
-        let activated = apply_batches("activate", &retained, &mut failures, activate_batch);
+        let activated = apply_batches("activate", &retained, state, &mut failures, activate_batch);
         state.restored &= activated.len() == retained.len();
         if let Err(error) = self.save_state(state) {
             failures.push(format!("Cannot save file access history: {error:#}"));
@@ -179,7 +324,7 @@ impl FileAccess {
         if state.restored {
             return;
         }
-        let policies = state.policies.as_mut().expect("history loaded above");
+        let policies = state.policies.as_ref().expect("history loaded above");
         let mut to_check = policies
             .iter()
             .map(|(uri, mode)| PolicyInfo {
@@ -197,9 +342,10 @@ impl FileAccess {
                     Ok(results) if results.len() == batch.len() => {
                         for (policy, granted) in batch.iter().zip(results) {
                             if granted {
-                                state.dirty |= policies
-                                    .insert(policy.uri.clone(), policy.operation_mode)
-                                    != Some(policy.operation_mode);
+                                // The check result is the mode the system
+                                // actually holds; store it verbatim instead
+                                // of merging it into the history mode.
+                                state.set_mode(&policy.uri, policy.operation_mode);
                                 active.push(policy.clone());
                             } else if policy.operation_mode == READ_WRITE {
                                 fallback.push(PolicyInfo {
@@ -207,7 +353,7 @@ impl FileAccess {
                                     operation_mode: READ,
                                 });
                             } else {
-                                state.dirty |= policies.remove(&policy.uri).is_some();
+                                state.ungrant(&policy.uri);
                             }
                         }
                     }
@@ -216,16 +362,28 @@ impl FileAccess {
                         results.len(),
                         batch.len()
                     )),
-                    Err(error) => failures.push(format!("Cannot check file grants: {error:#}")),
+                    Err(error) => {
+                        if let Some(reason) = error
+                            .downcast_ref::<FileShareError>()
+                            .and_then(unavailable_reason)
+                        {
+                            state.unavailable = Some(reason);
+                            log::error!(
+                                "File grant persistence is disabled for this session: {reason}"
+                            );
+                            return;
+                        }
+                        failures.push(format!("Cannot check file grants: {error:#}"));
+                    }
                 }
             }
             to_check = fallback;
         }
-        apply_batches("restore", &active, failures, activate_batch);
+        apply_batches("restore", &active, state, failures, activate_batch);
         state.restored = failures.len() == initial_failures;
     }
 
-    fn read_history(&self) -> Result<BTreeMap<String, u32>> {
+    fn read_history(&self) -> Result<(BTreeMap<String, u32>, Vec<String>)> {
         let path = self
             .path
             .as_ref()
@@ -233,7 +391,7 @@ impl FileAccess {
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
+                return Ok((BTreeMap::new(), Vec::new()));
             }
             Err(error) => return Err(error).context("Read file access history"),
         };
@@ -244,17 +402,43 @@ impl FileAccess {
             contents.len() as u64 <= MAX_HISTORY_BYTES,
             "File access history exceeds {MAX_HISTORY_BYTES} bytes"
         );
-        let policies: BTreeMap<String, u32> = serde_json::from_slice(&contents)
+        let stored: StoredGrants = serde_json::from_slice(&contents)
             .with_context(|| format!("Read file access history {}", path.display()))?;
-        anyhow::ensure!(
-            policies.len() <= MAX_GRANTS
-                && policies
-                    .iter()
-                    .all(|(uri, mode)| valid_uri(uri) && matches!(*mode, READ | READ_WRITE)),
-            "Invalid or excessive file grants in {}",
-            path.display()
-        );
-        Ok(policies)
+        let mut policies = BTreeMap::new();
+        let mut order = Vec::new();
+        let mut load = |uri: String, mode: u32| -> Result<()> {
+            anyhow::ensure!(
+                valid_uri(&uri) && matches!(mode, READ | READ_WRITE),
+                "Invalid file grant for {uri}"
+            );
+            let slot = policies.entry(uri.clone()).or_insert(0);
+            *slot |= mode;
+            if !order.iter().any(|known| known == &uri) {
+                order.push(uri);
+            }
+            Ok(())
+        };
+        match stored {
+            StoredGrants::Ordered(pairs) => {
+                anyhow::ensure!(
+                    pairs.len() <= MAX_GRANTS,
+                    "File access history exceeds {MAX_GRANTS} grants"
+                );
+                for (uri, mode) in pairs {
+                    load(uri, mode)?;
+                }
+            }
+            StoredGrants::Mapped(map) => {
+                anyhow::ensure!(
+                    map.len() <= MAX_GRANTS,
+                    "File access history exceeds {MAX_GRANTS} grants"
+                );
+                for (uri, mode) in map {
+                    load(uri, mode)?;
+                }
+            }
+        }
+        Ok((policies, order))
     }
 
     fn save_state(&self, state: &mut FileAccessState) -> Result<()> {
@@ -266,7 +450,23 @@ impl FileAccess {
             .as_ref()
             .context("File history unavailable")?;
         anyhow::ensure!(policies.len() <= MAX_GRANTS, "File grant history is full");
-        let contents = serde_json::to_vec(policies)?;
+        // v2: ordered [uri, mode] pairs, so restarts know which grant to
+        // evict first. Older releases stored a URI-keyed map.
+        let mut ordered: Vec<(&String, &u32)> = state
+            .order
+            .iter()
+            .filter_map(|uri| policies.get_key_value(uri))
+            .collect();
+        if ordered.len() != policies.len() {
+            // The recency order lost a key; keep the grant instead of
+            // silently dropping it from the history.
+            for (uri, mode) in policies {
+                if !ordered.iter().any(|(known, _)| *known == uri) {
+                    ordered.push((uri, mode));
+                }
+            }
+        }
+        let contents = serde_json::to_vec(&ordered)?;
         anyhow::ensure!(
             contents.len() as u64 <= MAX_HISTORY_BYTES,
             "File access history exceeds {MAX_HISTORY_BYTES} bytes"
@@ -295,6 +495,15 @@ impl FileAccess {
     }
 }
 
+/// History format v2: ordered `[uri, mode]` pairs. Older releases stored a
+/// URI-keyed map, which cannot express recency.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredGrants {
+    Ordered(Vec<(String, u32)>),
+    Mapped(BTreeMap<String, u32>),
+}
+
 fn valid_uri(uri: &str) -> bool {
     uri.starts_with("file://") && uri.len() <= MAX_URI_BYTES && !uri.contains('\0')
 }
@@ -307,9 +516,13 @@ fn report(failures: Vec<String>) -> Result<()> {
 fn apply_batches(
     operation: &str,
     policies: &[PolicyInfo],
+    state: &mut FileAccessState,
     failures: &mut Vec<String>,
     call: impl Fn(&[PolicyInfo]) -> Result<Vec<PolicyFailure>>,
 ) -> Vec<PolicyInfo> {
+    if state.unavailable.is_some() {
+        return Vec::new();
+    }
     let mut successful = Vec::new();
     for batch in policies.chunks(BATCH_SIZE) {
         match call(batch) {
@@ -336,7 +549,17 @@ fn apply_batches(
                     ));
                 }
             }
-            Err(error) => failures.push(format!("Cannot {operation} file grants: {error:#}")),
+            Err(error) => {
+                if let Some(reason) = error
+                    .downcast_ref::<FileShareError>()
+                    .and_then(unavailable_reason)
+                {
+                    state.unavailable = Some(reason);
+                    log::error!("File grant persistence is disabled for this session: {reason}");
+                    return successful;
+                }
+                failures.push(format!("Cannot {operation} file grants: {error:#}"));
+            }
         }
     }
     successful
