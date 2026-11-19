@@ -130,8 +130,8 @@ CI 的 `ohos` job 使用公开的 OpenHarmony 7.0 SDK（API 26）走完整链路
 版本并提交后，推送同名标签：
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
 工作流会校验标签与 `Cargo.toml` 版本一致，构建 Linux（`.tar.gz`、`.deb`、

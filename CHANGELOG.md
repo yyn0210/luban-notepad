@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-11-19
+
 ### 变更
 
 - 产品显示名称统一为“鲁班编辑器”：窗口标题与自绘标题栏、关于对话框、
@@ -15,6 +17,12 @@
 
 ### 新增
 
+- 新增 HarmonyOS / OpenHarmony 版本：复用桌面同一套 `luban-app` 编辑器，
+  `luban-ohos` 通过 ArkTS `NativeAbility` 加载 GPUI-ohos 后端，以 Stage
+  模型 HAP 发布并支持 arm64 / x86_64 两种 ABI。文件读写经系统文件选择器
+  URI 完成并保留持久授权，剪贴板、输入法、系统菜单和应用内日志浏览均已
+  接通；CI 使用 OpenHarmony API 26 公开 SDK 构建未签名 HAP，应用市场
+  发布链路支持 AGC 发布证书签名与 HarmonyOS 26.0.0 Release SDK。
 - 新增深开鸿 KaihongOS 应用市场发布链路：`ohos/build-profile.kaihongos.json5`
   档位（OpenHarmony runtimeOS、OpenHarmony 26.0.0 Release SDK、
   `compatibleSdkVersion 15`），`build-hap.sh --abi` 双 ABI 支持，
@@ -28,6 +36,18 @@
 
 ### 修复
 
+- 修复鸿蒙版向用户选择的位置保存时因应用沙箱无法使用 POSIX 路径而报
+  `EACCES` 的问题：文档保存、另存为、HTML/RTF 导出、导出设置与工作区
+  保存改为经 `luban.file-io` 桥接调用系统文件接口写入 URI，重叠保存保持
+  先后顺序。
+- 修复部分 HarmonyOS 设备启动即崩溃的问题：vendored `ohos-enum-derive`
+  在遇到 SDK 枚举范围外的原始值时回退到首个枚举分支，不再以
+  `unreachable!` 中止进程（例如零售机报告的显示旋转值）。
+- 修复鸿蒙版输入法在系统 IME 服务尚未就绪时附着失败后不再重试的问题：
+  焦点窗口保持期间持续按退避重试，并在缓存的就绪状态为假时重新查询。
+- 修复鸿蒙版文件选择器授权在应用重启后丢失、历史记录达到上限后无法再
+  选择文件的问题：授权记录改为按最近使用排序，溢出时回收最久未用的授权
+  （经 `ohos.fileshare.revokePermission`），卸载重装后仍可保留（API 24+）。
 - 修复拆分桌面入口后应用自身的日志被默认过滤规则丢弃的问题：编辑器代码现在
   位于 `luban-app` 库，日志目标是 `luban_app::…`，而默认 `RUST_LOG` 仍按旧的
   二进制 crate 名 `luban_notepad` 过滤，导致 `logs/luban.log` 里没有跳转截断、
