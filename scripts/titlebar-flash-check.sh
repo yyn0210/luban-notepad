@@ -341,8 +341,8 @@ echo "titlebar-flash-check: A2: new window via IPC --new-window"
 "$BIN" >"$TMP/app-first.out" 2>&1 &
 APP_PID=$!
 W1=""
-for _ in $(seq 1 100); do
-  W1="$(xdotool search --onlyvisible --name "鲁班编辑器" 2>/dev/null | head -1 || true)"
+for _ in $(seq 1 300); do
+  W1="$(xdotool search --onlyvisible --class luban-notepad 2>/dev/null | head -1 || true)"
   [ -n "$W1" ] && break
   kill -0 "$APP_PID" 2>/dev/null || fail "the first instance exited during startup"
   sleep 0.1
@@ -359,8 +359,8 @@ start_recording "$rec" || fail "ffmpeg could not record the display"
 "$BIN" --new-window >"$TMP/app-second.out" 2>&1 &
 sleep 3
 W2=""
-for _ in $(seq 1 20); do
-  W2="$(xdotool search --onlyvisible --name "鲁班编辑器" 2>/dev/null | grep -v "^$W1$" | head -1 || true)"
+for _ in $(seq 1 100); do
+  W2="$(xdotool search --onlyvisible --class luban-notepad 2>/dev/null | grep -v "^$W1$" | head -1 || true)"
   [ -n "$W2" ] && break
   sleep 0.1
 done

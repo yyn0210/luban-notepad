@@ -164,10 +164,15 @@ PY
       APP_PID=$!
       FOUND=0
       for _ in $(seq 1 12000); do
-        if xdotool search --onlyvisible --name "perf-big.txt - 鲁班编辑器" >/dev/null 2>&1; then
-          FOUND=1
-          break
-        fi
+        # Match WM_CLASS (ASCII) and read the title separately: xdotool's
+        # --name regex does not decode the localized WM_NAME reliably.
+        for wid in $(xdotool search --onlyvisible --class luban-notepad 2>/dev/null || true); do
+          if xdotool getwindowname "$wid" 2>/dev/null | grep -Fq "perf-big.txt"; then
+            FOUND=1
+            break
+          fi
+        done
+        [ "$FOUND" = "1" ] && break
         if ! kill -0 "$APP_PID" 2>/dev/null; then
           break
         fi
