@@ -99,8 +99,9 @@ node /path/to/node_modules/@ohos/hvigor/bin/hvigor.js \
 1. **API 基线**：示例工程与 `gpui-ohos` 默认使用 API 26 工具链。若目标设备
    低于该基线，需要先验证低版本设备；否则首发只覆盖最新系统。
 2. **首发形态**：当前 `module.json5` 声明 `tablet` / `2in1`，未声明 `phone`。
-3. **发行渠道**：AppGallery、开源鸿蒙社区分发或企业内部分发，签名与 ACL
-   要求不同。
+3. **发行渠道**：已定 AppGallery（2026-11-14 起）与深开鸿 KaihongOS 应用
+   市场（2026-11-15 起）双渠道，签名与 ACL 各走各的（见对应日期章节）；
+   企业内部分发暂未涉及。
 4. **文件访问产品策略**：picker + 最近授权为主，还是需要整目录授权方案。
 
 ## 风险
@@ -264,9 +265,33 @@ ECC P-256）核对一致：
 `--keystore` + `--app-key-alias`）：不再从 SDK 模板铸造 profile，AGC 的
 p7b 原样进 `sign-app`；签名前校验 profile 可验签、bundle 名一致、profile
 内嵌证书属于 `--app-cert`。用法与守卫说明见
-`crates/luban-ohos/README.md` 的 "AGC 发布签名" 一节。本机已用真实 AGC
-p7b + 真实未签名 HAP 冒烟到 `sign-app` 的密钥库加载步骤（哑密钥库按预期
-被工具的 key↔cert 匹配检查拒绝）；待办是用真实 `.p12` 口令签出正式包。
+`crates/luban-ohos/README.md` 的 "AGC 发布签名" 一节。
+
+**已完成（2026-11-14）**：版本号对齐 profile（`versionCode 2 /
+versionName 2.0.0`，`AppScope/app.json5` 与 `app.template.json5` 同步），
+arm64+x86_64 release HAP 用真实 AGC 材料签出
+`entry-release-signed.hap`，`verify-app` 通过（signing block v2、
+SHA-256 digest 全量一致、权限签名通过），签名内嵌 profile 与 AGC 原件
+逐字节相同，证书链为 Root → Developer Relations CA G2 → 发布叶子证书。
+工具怪癖记录：`verify-app` 的 `-outCertChain` 只认 `.cer` 后缀，
+`-outProfile` 认 `.p7b`。
+
+AppGallery 上架的 APP 包：`hvigorw assembleApp` 是**工程级**任务（带
+`--mode module` 会报 task not found）。关键结论：**AGC 校验的是 APP
+容器自身的签名块**——手工把签名 HAP 重打进容器会被 991（非法软件包）
+拒绝，而官方流程里内嵌 HAP 反而保持未签名，`SignApp` 给 APP 容器打
+v2 签名块。最终上传包
+`ohos/build/outputs/default/ohos-default-signed.app` 由带 signingConfig
+的 `assembleApp` 直接产出，`verify-app` 对容器校验通过（digest 全量
+一致，内嵌 profile 与 AGC 原件逐字节相同）。
+
+hvigor 6（modelVersion 6.0.0）签名配置写在 gitignore 的本机
+`build-profile.json5`：字段嵌在 `material` 对象里（certpath/keyAlias/
+keyPassword/profile/signAlg/storeFile/storePassword），且口令必须是
+"签名材料库"加密后的 hex（≥32 字符），不接受明文。材料库路径由
+`storeFile` 的上级目录推导（`<p12 所在目录>/material/`，含
+`fd/`（3 份密钥份额）、`ac/`（salt）、`ce/`（加密的工作密钥）），
+生成 key/CSR 时 DevEco 留下的材料库正好就在证书目录里。
 
 后续真机/AppGallery 步骤：
 
@@ -275,6 +300,261 @@ p7b + 真实未签名 HAP 冒烟到 `sign-app` 的密钥库加载步骤（哑密
 2. 上架材料、AppGallery 上传校验（含版本号与 profile 的
    `version-code 2` 对齐策略）；
 3. 覆盖安装旧签名包必须先卸载（数据会丢）。
+
+## 2026-11-14 云测启动崩溃（SIGABRT）：显示 rotation 越界
+
+AGC 上架测试在 HUAWEI MateBook Pro（HarmonyOS 6.1.0.135，arm64，2in1）
+上报"应用启动失败"，cppcrash 日志为 SIGABRT@`libluban_ohos.so`，进程
+存活 18s，栈在 `JsUIAbility::OnStart → @ohos-rs/ability initializeSession
+→ ArkNativeFunctionCallBack` 之下全部落在我们的 .so 里（无符号）。
+
+符号化过程（值得留档）：faultlogger 打印的 pc 是"运行时地址 - 映射基址"
+= ELF vaddr（用 Maps 段 `5bcb400000` 基址核对过）；打包的 .so 被 strip，
+只有 dynsym。用 `CARGO_PROFILE_RELEASE_STRIP=none ohrs build` 重出一
+份带 symtab 的同源 .so（注意：同时改 `DEBUG` 会使段布局漂移 ~0x100，
+只关 strip 则与线上版本仅差一个常量；以 `napi_register_module_v1` 的
+dynsym/symtab 地址差 0x470 为锚做平移），`llvm-addr2line` 逐帧符号化。
+
+结论：panic 链是 `openharmony_ability_mod::init`（OnceLock）→
+`gpui_ohos::OhosPlatform::new → set_app` →
+`ohos_display_binding::DisplayInfo::from_raw` →
+`core::panicking::panic_fmt`，反汇编看到守卫是 `cmp w8, #4; b.lo`——
+结构体偏移 88 的 `rotation` 字段（`NativeDisplayManager_Rotation`，
+4 个变体）取值 ≥ 4。与 SDK 头文件 `oh_display_info.h` 逐字段核对，
+布局一致，排除 ABI 错位；就是设备/云测环境返回了枚举范围外的值
+（模拟器与 KaihongOS 虚机均为 0–3，从未触发）。panic 消息字符串
+`unreachable!("Invalid attribute value")` 来自 `ohos-enum-derive`
+生成的 `From<raw> for 枚举`。
+
+修复：vendored `ohos-enum-derive`（见 `vendor/README.md`），raw→枚举
+的 `_` 臂改为回退到第一个非 cfg 变体（Rotation→Rotation0 等），对全部
+使用 `EnumFrom` 的 binding crate 生效——这是同一崩溃类第三次出现
+（XComponent 键码、ArkUI 键码之后），从宏层面根治。验证：新 .so 中
+`Invalid attribute value` 出现次数 5 → 0；重新 assembleApp 后容器
+`verify-app` 通过、内嵌 profile 与 AGC 原件一致。真机显示 rotation
+异常时按未旋转（ROTATION_0）处理，不再崩溃。
+
+注意：符号化用的临时 .so（`CARGO_PROFILE_RELEASE_*` 环境变量构建）
+不要用于发布；发布包一律用不带这些变量的标准 `ohrs build` 流程。
+
+## 2026-11-15 AGC 拒审：检测到 Beta 版 API
+
+上架检测报"您的应用使用了HarmonyOS beta版本的API"。这不是代码里调了
+什么 beta 接口——AGC 读的是包体元数据：上一包 `pack.info` 里
+`apiVersion.releaseType = "Beta1"`。来源是工具链：当时的
+DevEco Studio 26.0.1.290（Beta 线）自带 **HarmonyOS 26.0.1 Beta1**
+SDK（`sdk/default/sdk-pkg.json` 的 `stage`），hvigor 打包时原样写进
+包体。26 线当时没有 Release（版本清单页 2026-06 快照里 26.0.0 只有
+Beta1），Release 线最新是 6.1.1(24)；到 2026-11 重装时
+**HarmonyOS 26.0.0 已转 Release**（sdk-pkg.json `stage: Release`，
+version 26.0.0.105），于是直接用它。
+
+修复（无任何代码改动，.so 与 ArkTS 原样）：
+
+1. 重装 DevEco Studio **26.0.0.865**（Release 线，与旧版并排装在
+   `D:\Program Files\Huawei\DevEco Studio 26.0.0\`）；旧安装目录随即
+   失效，`D:\ohos-sdk-parent` / `D:\ohos-sdk` 两个 junction 重新指到
+   新装的 `sdk\default` 与 `sdk\default\openharmony`（空间路径规避，
+  junction 创建用 PowerShell `New-Item -ItemType Junction`）。
+2. 本机 `build-profile.json5`（gitignored）products 增加
+   `compileSdkVersion: "26.0.0"`、`targetSdkVersion` 由 `26.0.1` 改为
+   `"26.0.0"`；`compatibleSdkVersion` 保持 `"6.1.0(23)"`（HarmonyOS
+   版本串，= API 23，实测底线不变）。模板同步更新——26 起版本字段用
+   点分串，低于 26 的 compatible 在 HarmonyOS runtimeOS 下仍是
+   `x.y.z(api)` 版本串（OpenHarmony runtimeOS 下则是数字，见 CI
+   profile）。
+3. x86_64 `.so` 顺带重编：包内 x86_64 那份还是 11-12 的未打补丁构建
+   （同款 rotation panic），云测跑 arm64 没暴露而已。
+   `OHOS_NDK_HOME='D:\ohos-sdk-parent\openharmony' ohrs build --arch
+   x86_64 --release` 后把 `dist/x86_64/{libluban_ohos.so,
+   libc++_shared.so}` 拷进 `ohos/entry/libs/x86_64/`。
+4. 构建（hvigorw 在 DevEco 内嵌 tools 下，node 用 PATH 上的即可）：
+
+   ```sh
+   cd ohos
+   DEVECO_SDK_HOME='D:\Program Files\Huawei\DevEco Studio 26.0.0\sdk' \
+     node "D:/Program Files/Huawei/DevEco Studio 26.0.0/tools/hvigor/bin/hvigorw.js" \
+     -p product=default -p buildMode=release assembleApp --no-daemon
+   ```
+
+   口令在材料库里，signingConfig 原样可用，无需重输。
+5. 校验：`pack.info` → `{compatible: 23, releaseType: "Release",
+   target: 26}`；容器 `verify-app` 通过；内嵌 profile 与 AGC 原件
+   逐字节相同；包内两个 ABI 的 .so 均无 `Invalid attribute value`。
+
+工具怪癖补充：`verify-app` 的输入参数名是 **`-inFile`**（不是
+`-appFile`，传错只会报语焉不详的 `11011005 Param is not trusted`）；
+`-outCertChain` 只认 `.cer`、`-outProfile` 认 `.p7b`。
+
+## 2026-11-15 深开鸿（KaihongOS）市场发布版本
+
+增加第二个发行渠道：深开鸿 KaihongOS 应用市场。KaihongOS 是 OpenHarmony
+发行版，与 AppGallery（HarmonyOS + AGC）是两套包体，档位、签名、产物全部
+并行，AppGallery 链路零改动。
+
+**签名材料现状（2026-11-15）**：开鸿开发者服务平台已签发发布证书
+`深开鸿-证书/luban-padnote.cer`（issuer `CN=Kaihong Application Sub CA,
+O=ShenKaiHong`，ECC P-256，Code Signing EKU，有效期 2026-11-15 →
+2027-11-15，文件内含 Root → Sub CA → 叶子 3 级链）。关键发现：**这份证书
+与 AGC 发布证书是同一把私钥**——`luban-notepad.csr` 同时上传给了 AGC 与
+开鸿，公钥 SHA256 `04104337…b3f9` 在四处一致（CSR、`证书/luban-notepad.p12`
+别名 `luban-notepad`、AGC 发布证书叶子与 `prdRelease.p7b` 内嵌分发证书、
+开鸿证书叶子）。
+
+**profile 直接用鸿蒙的**（用户查证 + 实测签名通过）：AGC 的
+`prdRelease.p7b` 可以直接签深开鸿包——bundle 名一致、内嵌分发证书与 p12
+同钥、两条 ACL 已在 profile 里，`sign-hap.sh` 三道守卫加 key↔cert 匹配全
+过，产出
+`dist-release/kaihongos/luban-notepad-2.0.0-kaihongos-agcprofile-signed.hap`。
+设备与开鸿后台是否认华为信任链待验证（虚机安装/后台上传）；若后台要求
+开鸿自签 profile，把命令里的 `--profile` 换成开鸿签发的 p7b 即可，其余参
+数不动。签名统一走 `sign-hap.sh` 发布材料模式（措辞已放宽为"市场发布材
+料"，守卫不变）。注意 p12 里没有证书链，hap-sign-tool 的 `-appCertFile`
+用 `.cer` 提供。
+
+**档位**：`ohos/build-profile.kaihongos.json5` —— `runtimeOS: OpenHarmony`、
+`compileSdkVersion/targetSdkVersion: "26.0.0"`（本机 DevEco 26.0.0.865
+自带的 OpenHarmony 26.0.0 Release SDK，点分串；Release stage 写进
+pack.info，AGC 拒审 Beta 的教训对所有检查包体的市场适用）、
+`compatibleSdkVersion: 15`（数值，`@ohos-rs/ability` 窗口接口的 API
+下限；KaihongOS 6.1 = API 23 可安装）。API 26+ 的符号（如
+`zLevelAboveParentLoosened`）带运行时 `sdkApiVersion` 守卫，不会在
+API 23 上执行。没有走 11-11 的 API 23 组合（API 23 SDK + hvigor 5.18.5 +
+modelVersion 5.1.0 + 3 处 `@ohos-rs/ability` 本地补丁）是因为那需要整套
+独立工具链；若 6.1 虚机拒装 target 26 的包，后备方案就是切回该组合，
+只需改这一个档位文件。
+
+**构建**：`scripts/build-kaihongos-hap.sh` 一次完成 ohrs 双 ABI（arm64 +
+x86_64，`build-hap.sh` 新增 `--abi arm64|x86_64|both`，默认 arm64 与 CI
+一致）、ohpm、hvigor `assembleHap`（`--mode module`）、pack.info 断言
+（Release / compatible 15 / target 26 / 双 ABI .so），产物落到
+`dist-release/kaihongos/`（与 AppGallery 的 `ohos/build/outputs` 分离）。
+本机用法：
+
+```sh
+export OHOS_NDK_HOME='D:\ohos-sdk-parent\openharmony'
+export OHOS_BASE_SDK_HOME='D:\ohos-ohsdk-26'   # junction 树，见下方 SDK 解析坑
+export HVIGORW='D:/Program Files/Huawei/DevEco Studio 26.0.0/tools/hvigor/bin/hvigorw.js'
+
+crates/luban-ohos/scripts/build-kaihongos-hap.sh            # 未签名 HAP
+crates/luban-ohos/scripts/build-kaihongos-hap.sh --sign     # + SDK 测试材料（KaihongOS 6.1 虚机验收）
+crates/luban-ohos/scripts/build-kaihongos-hap.sh --sign -- \
+  --profile 'D:\工作文件\00. 简洛\luban-notepad\证书\luban-notepad-prdRelease.p7b' \
+  --app-cert 'D:\工作文件\00. 简洛\luban-notepad\证书\luban-notepad - 发布证书.cer' \
+  --keystore 'D:\工作文件\00. 简洛\luban-notepad\证书\luban-notepad.p12' \
+  --app-key-alias luban-notepad
+```
+
+**SDK 解析坑（00308018，2026-11-15 实测）**：hvigor 6 对 OpenHarmony
+runtimeOS 产品的 SDK 只认 `local.properties` 的 `sdk.dir` 或
+`OHOS_BASE_SDK_HOME`（`DEVECO_SDK_HOME` 只服务 HarmonyOS 侧产品）；把这两者
+指到 DevEco 托管的 `sdk/default` 根会报 "The SDK management mode has
+changed"——托管根里的统一布局组件（`oh-uni-package.json`）对独立 hvigor 是
+旧模式，`local.properties` 也一样。解决办法是 CI 同款外部布局：用 junction
+把 DevEco 的 OpenHarmony 26.0.0 Release 组件（`releaseType: Release`，正是
+市场要的 stage）拼成 `D:\ohos-ohsdk-26\26.0.0\{ets,js,native,previewer,
+toolchains}`（PowerShell `New-Item -ItemType Junction`），`OHOS_BASE_SDK_HOME`
+指向 `D:\ohos-ohsdk-26`，不要写 `local.properties`。
+
+已完成的链路验证：构建 → `pack.info` 断言（Release/15/26/双 ABI）→ SDK
+测试材料签名成功（`luban-notepad-2.0.0-kaihongos-signed.hap`，bundle 与两条
+ACL 正确）；`ohos/build-profile.json5` 在成功与失败路径上都逐字节还原。
+
+**防误伤 AppGallery**：本机 `ohos/build-profile.json5` 是 DevEco 手工维护
+的 AGC 签名配置，`build-hap.sh --profile` 会覆盖它。现在 `build-hap.sh`
+覆盖前先备份到 `build-profile.json5.bak`；`build-kaihongos-hap.sh` 另有
+快照 + trap 还原 + 哈希一致性校验，构建成功、失败或中断后 AGC 配置都必然
+复原。`AppScope/app.json5`（bundle 名、versionCode 2 / versionName 2.0.0）
+与 `build-profile.template.json5` 两个市场共用、均未改动——versionCode
+命名空间按市场独立，共用数字没有影响。
+
+**上传格式（2026-11-15 实测确定）**：开鸿开发者平台"发布版本软件包"仅收
+**zip（≤2G）**，且解包后在 zip 根目录找配置文件——直接把签名 HAP 塞进
+zip 会报"软件包未找到配置文件"。正确形态是 **APP 容器**：`assembleApp`
+（工程级，`build-kaihongos-hap.sh --app` 已支持）出
+`ohos-default-unsigned.app` → `sign-hap.sh` 用 AGC 材料签容器（内嵌 HAP
+保持未签名，与 AGC 流程一致）→ `verify-app` 通过、内嵌 profile 与 AGC
+原件逐字节相同 → 签名后的 `.app` 本身就是 zip（根目录 `pac.json` +
+`pack.info` + `entry-default.hap`），改名 `.zip` 直接上传。产物
+`dist-release/kaihongos/luban-notepad-2.0.0-kaihongos.zip`。
+
+**待办**：
+
+1. ~~KaihongOS 6.1 虚机验证~~ **已完成（2026-11-15，见下一节）**：AGC
+   profile 签名的 HAP 在 KaihongOS 6.1 上安装、启动、交互全部通过；
+2. 开鸿后台上传校验；若后台要求开鸿自签 profile，等平台签发 p7b 后把签名
+   命令里的 `--profile` 换掉重签（keystore/别名/证书已齐）；
+3. KaihongOS 5.0.2（API 14）仍不支持——`@ohos-rs/ability` 的 ArkTS 需要
+   API 15+，`compatibleSdkVersion 15` 已是下限。
+
+## 2026-11-15 KaihongOS 6.1 QEMU 虚机：AGC 签名包安装/运行验证通过
+
+**结论（本节最重要的一句）：KaihongOS 6.1 的包管理器接受华为 AGC 的发布
+证书链 + profile**。`bm install` AGC-profile 签名的
+`luban-notepad-2.0.0-kaihongos-agcprofile-signed.hap` 直接成功，`bm dump`
+显示 `appProvisionType: release`，`aa start` 启动、GPUI/virgl 渲染、菜单
+交互全部正常。"鸿蒙 profile 直接用于开鸿市场"从查证升级为设备实证。
+
+### QEMU 环境（`D:\dev\KaihongOS6.1\qemu\launch_qemu.bat`，已改好）
+
+在官方包的 `launch_qemu.bat` 基础上改了四处，其余照官方 `QEMU_USAGE.md`：
+
+1. **路径**：`DISK_IMG`/`ISO_IMG`/`QEMU` 指向本机位置；磁盘
+   `qemu-img create -f raw disk.img 64G`。
+2. **固件必须走 pflash，不能用 `-bios`**：本机的 QEMU 11.1 构建
+   （`v11.1.0-12130`）对任何显式 `-bios` 路径都报 "could not load PC
+   BIOS"（默认 SeaBIOS 与块层文件打开都正常，唯独 `-bios` 的 access()
+   解析坏了）。解法：
+   `-drive if=pflash,format=raw,readonly=on,file=OVMF.fd` +
+   `-drive if=pflash,format=raw,file=OVMF_VARS.fd`（两个 .fd 从
+   `<qemu>\share\edk2-x86_64-code.fd` / `edk2-i386-vars.fd` 拷贝）。
+3. **自动化通道**：`-monitor tcp:127.0.0.1:4444,server,nowait` +
+   `-qmp tcp:127.0.0.1:4445,server,nowait`（QMP `input-send-event` 注入
+   绝对坐标点击/键盘，`screendump` 在 UEFI 阶段可用）；hdc 端口转发
+   `-netdev user,id=n0,hostfwd=tcp:127.0.0.1:10178-:10178 -device
+   virtio-net-pci,netdev=n0`。
+4. **显示**：官方 `sdl,gl=on` 可用（guest 渲染正常），但 QMP `screendump`
+   在 guest 进 GL 后报 "no surface"；`egl-headless,gl=on` 下 guest 进 GL
+   后同样没有 surface；`gl=readback` 该构建不认；`-vnc` 与 GL 上下文互斥。
+   拿画面的可靠办法是 **Windows GDI 窗口截屏**（PowerShell
+   GetWindowRect + CopyFromScreen，脚本见
+   `~/.zcode/tmp/kaihong-vm/capture.ps1`）——bash 会话就是控制台会话，
+   窗口在用户桌面上可见，人可以直接操作，机器靠 QMP 注入。
+
+### 安装与引导
+
+- 首次开机 OVMF 落到 UEFI Shell（不自动引导 ISO）：`map -r` 看 FS 别名，
+  `fs0:\efi\boot\bootx64.efi`（全小写，UEFI Shell 大小写不敏感）进 grub。
+  QMP 注入键盘时**必须放慢节奏**（每键 ≥60ms），否则 guest 键盘缓冲丢键。
+- 安装器（欢迎→分区→摘要→安装→结束）和首次 OOBE 是图形交互，人工点完
+  最快；OOBE 的"登录密码"必须设置（≥6 位），跳过会卡死。
+- 安装后 guest 关机，QEMU 窗口标题变 `[Stopped]`——正常，重跑
+  launch_qemu.bat 即进系统（grub 会弹菜单选 QEMU 项）。
+- 装好的系统 hdcd 自启，`hdc tconn 127.0.0.1:10178` 直连（hostfwd 生效）；
+  内核日志走串口（任务输出文件可看）。
+
+### 验证过程与结果
+
+1. `hdc file send <hap> /data/local/tmp/…`（注意 Git Bash 要
+   `MSYS_NO_PATHCONV=1`，否则远端路径被转成 `C:/Program Files/Git/...`；
+   本地路径用纯反斜杠）→ 84MB 约 1.6s。
+2. `bm install -p /data/local/tmp/luban-kaihongos-agcprofile.hap` →
+   **install bundle successfully**（华为 Root CA G2 → Developer Relations
+   CA G2 → 杨依宁 Release 的链 + AGC prdRelease profile 被 KaihongOS
+   接受）。
+3. `aa start -a EntryAbility -b com.janeluo.lubannotepad` → 启动成功，
+   编辑器完整渲染（菜单/工具栏/标签页/行号），人工交互（偏好设置、切
+   简体中文）正常；`appProvisionType: release`。
+4. guest 分辨率 1920x1080（fb0），网络 eth0(virtio_net) 10.0.2.15，网关
+   与公网（baidu/223.5.5.5）ping 全通。
+
+**OOBE"网络连接失败"排查记录**：弹窗报错时 guest 网络实际完全正常
+（DNS 解析 + 公网 ICMP 都通），判定为 Kaihong 云端验证服务侧/其网络状态
+检查的问题，与 QEMU 网络配置无关；手动跳过后不影响后续使用。
+
+**未验项**：KaihongOS 应用中心（市场后端）的上传校验仍待真流程；中文
+IME 提交与系统 picker 在 KaihongOS 上的表现沿用 11-11/11-12 的已知限制
+记录。
 
 ## 2026-11-11 e2e 回归（KaihongOS 6.1 虚机）
 
