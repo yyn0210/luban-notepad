@@ -15,7 +15,6 @@ edition = "2021"
 license = "MulanPubL-2.0"
 authors = ["Luban Notepad Contributors"]
 repository = "https://github.com/luban-notepad/luban-notepad"
-description = "A cross-platform, Rust reimplementation of the Notepad++ editing experience"
 
 [workspace.dependencies]
 anyhow = "1.0"

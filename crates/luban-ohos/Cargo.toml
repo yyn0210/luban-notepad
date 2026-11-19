@@ -14,14 +14,11 @@ crate-type = ["cdylib"]
 doctest = false
 test = false
 
-[dependencies]
-luban-app = { path = "../luban-app" }
-log.workspace = true
-
 # The OpenHarmony dependencies are target-gated so that this package stays a
 # cheap, buildable member of the desktop workspace. `ohrs build --arch arm64`
 # targets `aarch64-unknown-linux-ohos` (target_env = "ohos") and activates them.
 [target.'cfg(target_env = "ohos")'.dependencies]
+luban-app = { path = "../luban-app" }
 gpui = { package = "gpui-pre", version = "=0.3.11" }
 gpui-ohos = { path = "../../vendor/gpui-ohos", default-features = false, features = ["gles"] }
 openharmony-ability = { version = "1.0.0-beta.5", features = ["keyboard", "mouse", "drag"] }

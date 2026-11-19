@@ -417,9 +417,9 @@ impl LubanApp {
         language::set_user_languages(user_languages);
         self.snippets = packages.snippets.clone();
         self.packages = packages;
-        for index in 0..self.tabs.len() {
-            let language = language_key(&self.tabs[index].doc.language).to_string();
-            let editor = self.tabs[index].editor.clone();
+        for tab in &self.tabs {
+            let language = language_key(&tab.doc.language).to_string();
+            let editor = tab.editor.clone();
             editor.update(cx, |state, cx| {
                 state.set_highlighter_factory(crate::highlighter::factory(), cx);
                 state.set_highlighter(&language, cx);
