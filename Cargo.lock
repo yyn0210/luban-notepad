@@ -4143,6 +4143,7 @@ version = "2.0.0"
 dependencies = [
  "gpui-ohos",
  "gpui-pre",
+ "log",
  "luban-app",
  "napi-build-ohos",
  "napi-derive-ohos",

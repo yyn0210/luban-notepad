@@ -19,6 +19,9 @@ test = false
 # targets `aarch64-unknown-linux-ohos` (target_env = "ohos") and activates them.
 [target.'cfg(target_env = "ohos")'.dependencies]
 luban-app = { path = "../luban-app" }
+# `log` is not named in this crate's sources, but the `#[ability]` macro that
+# openharmony-ability-derive expands on the ohos target refers to it.
+log.workspace = true
 gpui = { package = "gpui-pre", version = "=0.3.11" }
 gpui-ohos = { path = "../../vendor/gpui-ohos", default-features = false, features = ["gles"] }
 openharmony-ability = { version = "1.0.0-beta.5", features = ["keyboard", "mouse", "drag"] }
