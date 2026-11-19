@@ -425,7 +425,6 @@ impl SearchEngine {
                 }
             }
         }
-        drop(visit);
         if !forward {
             if before.is_some() {
                 return before;
