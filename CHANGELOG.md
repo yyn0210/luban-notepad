@@ -15,6 +15,12 @@
 
 ### 新增
 
+- 新增深开鸿 KaihongOS 应用市场发布链路：`ohos/build-profile.kaihongos.json5`
+  档位（OpenHarmony runtimeOS、OpenHarmony 26.0.0 Release SDK、
+  `compatibleSdkVersion 15`），`build-hap.sh --abi` 双 ABI 支持，
+  `build-kaihongos-hap.sh` 一键构建（`--app` 出 APP 容器适配开鸿平台的
+  zip 上传要求；快照还原本机 AGC 签名配置、pack.info 断言、`--sign` 可接
+  SDK 测试材料或开鸿发布材料）。AppGallery 链路与产物不受影响。
 - Linux 打包新增 RPM 产物 `dist/luban-notepad-<版本>-1.<架构>.rpm`，内容与
   deb 相同（二进制、桌面入口、hicolor 图标和文档）；发布工作流会构建并上传
   该包，同时校验其 glibc 依赖不超过 2.35 基线。打包需要 `rpmbuild`

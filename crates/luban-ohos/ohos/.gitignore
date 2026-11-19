@@ -2,6 +2,7 @@ node_modules
 oh_modules
 /local.properties
 /build-profile.json5
+/build-profile.json5.bak
 /AppScope/app.json5
 /.hvigor
 **/build

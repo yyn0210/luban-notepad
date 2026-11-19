@@ -99,12 +99,58 @@ crates/luban-ohos/scripts/sign-hap.sh \
   --out entry-release-signed.hap
 ```
 
-该模式下 profile 原样使用（ACL、bundle 名、有效期都来自 AGC），脚本会
+该模式下 profile 原样使用（ACL、bundle 名、有效期都来自签发平台），脚本会
 先做三道校验：`verify-profile`、profile 的 bundle 名与 `AppScope/app.json5`
 一致、profile 内嵌的分发证书必须包含在 `--app-cert` 里。ECC 证书用默认
 的 `SHA256withECDSA`，RSA 证书加 `--sign-alg SHA256withRSA/PSS`。覆盖
 安装签名不一致的旧包仍需先 `hdc uninstall`（会丢应用数据）。路径、口令
 和别名不入库。
+
+### 深开鸿（KaihongOS）市场发布
+
+KaihongOS 是 OpenHarmony 发行版，市场包必须 `runtimeOS: OpenHarmony`，档位
+是 `ohos/build-profile.kaihongos.json5`（OpenHarmony 26.0.0 Release SDK、
+`compatibleSdkVersion: 15`——`@ohos-rs/ability` 窗口接口的 API 下限，
+KaihongOS 6.1（API 23）可安装；`pack.info` 保持 `releaseType: Release`，
+Beta stage 的教训对所有检查包体的市场适用）。AppGallery 的 HarmonyOS
+档位与本机签名配置不受影响：`build-kaihongos-hap.sh` 会快照并逐字节还原
+`ohos/build-profile.json5`，`build-hap.sh --profile` 覆盖前也会留 `.bak`。
+
+```sh
+export OHOS_NDK_HOME='<NDK 根>'
+export OHOS_BASE_SDK_HOME='<OpenHarmony SDK 根：布局为 <root>/<compileSdkVersion>/{ets,js,native,previewer,toolchains}>'
+export HVIGORW='<DevEco>/tools/hvigor/bin/hvigorw.js'
+
+crates/luban-ohos/scripts/build-kaihongos-hap.sh            # 未签名 HAP
+crates/luban-ohos/scripts/build-kaihongos-hap.sh --sign     # + SDK 测试材料签名（虚机验收）
+```
+
+注意 `OHOS_BASE_SDK_HOME` 不能指向 DevEco 托管的 `sdk/default` 目录——
+hvigor 6 对 OpenHarmony 产品会报 00308018（"SDK management mode has
+changed"）；要用公开 SDK 的解包布局，或用 junction 把 DevEco 的
+OpenHarmony 组件拼成 `<root>/<compileSdkVersion>/` 外部布局（详见
+`docs/HARMONYOS.md` 2026-11-15 一节）。
+
+构建产物在 `dist-release/kaihongos/`（与 AppGallery 输出分离），arm64-v8a +
+x86_64 双 ABI；脚本校验 `pack.info`（Release / compatible 15 / target 26）
+通过后才落盘。正式签名直接复用鸿蒙（AGC）的 profile + 发布证书 + 密钥库
+（同一条 CSR 同时签发两家的证书；**KaihongOS 6.1 设备已实证接受该信任
+链**：bm install 成功、appProvisionType release、应用正常启动交互，见
+`docs/HARMONYOS.md` 2026-11-15 两节），参数与 AGC 模式完全一致：
+
+```sh
+crates/luban-ohos/scripts/build-kaihongos-hap.sh --sign -- \
+  --profile <开鸿平台 profile.p7b> \
+  --app-cert <开鸿发布证书.cer> \
+  --keystore <发布密钥库.p12> \
+  --app-key-alias <别名>
+```
+
+KaihongOS 6.1 虚机验收用 `hdc tconn` 连接后 `hdc install` +
+`aa start -a EntryAbility -b com.janeluo.lubannotepad`；覆盖安装签名不一致
+的旧包先 `hdc uninstall`（数据会丢）。本 CSR/私钥同时用于 AppGallery 与
+开鸿两个市场（见 `docs/HARMONYOS.md` 2026-11-15 一节）。如开鸿平台要求
+APP 容器而非 HAP，再按 AGC 的 `assembleApp` 经验补工程级打包步骤。
 
 ## 权限
 

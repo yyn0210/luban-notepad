@@ -1,0 +1,41 @@
+{
+  // 深开鸿 KaihongOS 市场档位。KaihongOS 是 OpenHarmony 发行版，市场包必须
+  // runtimeOS OpenHarmony；AppGallery/HarmonyOS 的档位见
+  // build-profile.template.json5（两者互不影响）。
+  //
+  // compileSdk/targetSdk 用本机 DevEco 自带 OpenHarmony 26.0.0 Release SDK 的
+  // 点分串（Release stage 写进 pack.info——AGC 拒审 Beta API 的教训对任何会
+  // 检查包体的市场都适用）。compatibleSdkVersion 低于 API 26 保持数字；15 是
+  // @ohos-rs/ability 窗口接口的 API 下限，KaihongOS 6.1（API 23，已验证的
+  // 虚机基线）可安装。API 26+ 的符号（如 zLevelAboveParentLoosened）带运行时
+  // sdkApiVersion 守卫，不会在 API 23 上执行。
+  //
+  // 本档位不带 signingConfig：HAP 统一用 scripts/sign-hap.sh 签名——SDK 测试
+  // 材料用于 KaihongOS 虚机验收，开鸿开发者服务平台的发布材料（.p7b profile
+  // + .cer + .p12）用于正式上架，参数与 AGC 模式完全一致。
+  "app": {
+    "products": [
+      {
+        "name": "default",
+        "compileSdkVersion": "26.0.0",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": 15,
+        "runtimeOS": "OpenHarmony",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [{ "name": "debug" }, { "name": "release" }]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [{ "name": "default", "applyToProducts": ["default"] }]
+    }
+  ]
+}

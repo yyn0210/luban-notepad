@@ -1,17 +1,18 @@
 #!/bin/sh
 # Sign a HAP either with the OpenHarmony SDK test profile (default) or with
-# AppGallery Connect release material.
+# market release material (AppGallery Connect, or the KaihongOS developer
+# platform for the 深开鸿 market).
 #
 # Default (no --profile): mints a profile from the SDK test template and adds
 # ACL permissions. This path is for emulators and OpenHarmony development
 # images only.
 #
-# AGC release mode (--profile <p7b>): signs with a profile and distribution
-# certificate issued by AppGallery Connect, using the .p12 keystore that
-# matches the CSR uploaded to AGC. The profile is used as-is: ACLs, bundle
-# name and validity come from AGC, and the distribution certificate embedded
-# in the profile must be part of --app-cert. Use this for retail HarmonyOS
-# devices and AppGallery uploads.
+# Market release mode (--profile <p7b>): signs with a profile and distribution
+# certificate issued by a market developer platform (AppGallery Connect, or
+# the KaihongOS developer platform), using the .p12 keystore that matches the
+# uploaded CSR. The profile is used as-is: ACLs, bundle name and validity come
+# from the platform, and the distribution certificate embedded in the profile
+# must be part of --app-cert. Use this for retail devices and market uploads.
 #
 # Required (environment or options):
 #   OHOS_SDK_LIB                 SDK toolchains/lib directory
@@ -75,8 +76,8 @@ die() {
 
 usage() {
     cat <<'EOF'
-Sign a HAP with the OpenHarmony SDK test profile (default) or with AGC
-release material (--profile).
+Sign a HAP with the OpenHarmony SDK test profile (default) or with market
+release material (--profile; AGC or the KaihongOS developer platform).
 
 Required:
   --sdk-lib <dir>            SDK toolchains/lib directory
@@ -115,12 +116,13 @@ Test-material options (default; emulators and OpenHarmony dev images only):
   --profile-key-alias <a>    profile key alias
   --app-key-alias <a>        application key alias
 
-AGC release options (real devices / AppGallery):
-  --profile <p7b>            AGC-signed profile, used as-is
-  --app-cert <cer|pem>       distribution certificate chain issued by AGC
-                             (the one matching the profile); the keystore must
-                             contain the matching private key
-  --keystore <file>          AGC keystore (.p12), required in this mode
+Market release options (real devices / market submission):
+  --profile <p7b>            market-signed profile (AGC / KaihongOS platform),
+                             used as-is
+  --app-cert <cer|pem>       distribution certificate chain issued by the
+                             platform (the one matching the profile); the
+                             keystore must contain the matching private key
+  --keystore <file>          release keystore (.p12), required in this mode
   --app-key-alias <a>        keystore alias of the release key, required in
                              this mode
 
@@ -166,8 +168,8 @@ done
 
 if [ -n "$PROFILE" ]; then
     AGC_MODE=1
-    [ -z "$ACLS" ] || die "--acls cannot be combined with --profile (ACLs come from the AGC profile)"
-    [ -z "$VALIDITY_DAYS" ] || die "--validity-days cannot be combined with --profile (validity comes from the AGC profile)"
+    [ -z "$ACLS" ] || die "--acls cannot be combined with --profile (ACLs come from the release profile)"
+    [ -z "$VALIDITY_DAYS" ] || die "--validity-days cannot be combined with --profile (validity comes from the release profile)"
     [ -z "$PROFILE_TEMPLATE" ] || die "--profile-template cannot be combined with --profile"
     [ -z "$PROFILE_CERT" ] || die "--profile-cert cannot be combined with --profile"
     [ -z "$PROFILE_KEY_ALIAS" ] || die "--profile-key-alias cannot be combined with --profile"
@@ -193,7 +195,7 @@ if [ "$AGC_MODE" = 1 ]; then
     [ -f "$PROFILE" ] || die "profile not found: $PROFILE"
     [ -n "$APP_CERT" ] || die "--app-cert is required together with --profile"
     [ -f "$APP_CERT" ] || die "app certificate not found: $APP_CERT"
-    [ -n "$KEYSTORE" ] || die "--keystore <AGC .p12> is required together with --profile (never sign a release HAP with the SDK test keystore)"
+    [ -n "$KEYSTORE" ] || die "--keystore <release .p12> is required together with --profile (never sign a release HAP with the SDK test keystore)"
     [ -n "$APP_KEY_ALIAS" ] || die "--app-key-alias is required together with --profile (list aliases with: keytool -list -keystore <p12>)"
 else
     [ -n "$ACLS" ] || ACLS=ohos.permission.READ_PASTEBOARD,ohos.permission.FILE_ACCESS_PERSIST
