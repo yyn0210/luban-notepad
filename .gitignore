@@ -30,3 +30,8 @@ rustc-ice-*.txt
 
 # Packaging output
 /dist/
+# >>> Comet managed project state >>>
+# Keep the whole Comet tree local: runtime state, config and plans stay
+# out of the repo (specs/archives under docs/comet are untracked too).
+/.comet/
+# <<< Comet managed project state <<<
