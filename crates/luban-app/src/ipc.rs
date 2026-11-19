@@ -247,7 +247,7 @@ pub fn start(config_dir: &Path) -> Result<(IpcServer, IpcBridge), String> {
                 .and_then(|text| serde_json::from_str::<LockInfo>(&text).ok())
                 .is_some_and(|info| process_alive(info.pid));
             if alive {
-                return Err("another Luban Notepad instance is already running".to_string());
+                return Err("another 鲁班编辑器 instance is already running".to_string());
             }
             cleanup(config_dir);
             fs::OpenOptions::new()

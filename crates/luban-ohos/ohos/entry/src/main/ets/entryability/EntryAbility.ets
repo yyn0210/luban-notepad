@@ -43,7 +43,7 @@ export default class EntryAbility extends NativeAbility {
 
   override onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     if (typeof nativeModule.init !== "function") {
-      throw new Error("Luban Notepad native module is unavailable");
+      throw new Error("鲁班编辑器 native module is unavailable");
     }
     super.onCreate(want, launchParam);
   }

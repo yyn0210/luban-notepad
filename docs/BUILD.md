@@ -1,6 +1,6 @@
 # 构建与运行
 
-Luban Notepad 使用 GPUI Kit `0.9.0`（精确固定 `gpui-pre 0.3.11`，与
+鲁班编辑器使用 GPUI Kit `0.9.0`（精确固定 `gpui-pre 0.3.11`，与
 `gpui-ohos` 对齐），并要求
 较新的 stable Rust 工具链。仓库的 `rust-toolchain.toml` 会选择 stable 以及
 `rustfmt`/`clippy` 组件。
@@ -53,7 +53,7 @@ sudo dnf install ./dist/luban-notepad-*.rpm
 
 ### macOS
 
-`scripts/package-macos.sh` 会生成 `dist/Luban Notepad.app`，其中包含
+`scripts/package-macos.sh` 会生成 `dist/鲁班编辑器.app`，其中包含
 `Contents/Resources/luban-notepad.icns` 和对应的 `Info.plist`，并打包为 zip：
 
 ```bash
@@ -191,11 +191,11 @@ WGPU_BACKEND=gl target/release/luban-notepad
 - 需要支持 Metal 的 Mac。
 
 `scripts/package-macos.sh` 会构建 release 并生成可双击运行的
-`dist/Luban Notepad.app`：
+`dist/鲁班编辑器.app`：
 
 ```bash
 scripts/package-macos.sh
-open "dist/Luban Notepad.app"
+open "dist/鲁班编辑器.app"
 ```
 
 直接运行 `target/release/luban-notepad` 时没有 app bundle，Dock 会显示通用图标；
@@ -323,4 +323,4 @@ Windows 便携版通常不需要设置该环境变量：只要可执行文件旁
 | 窗口创建失败 / 没有 Vulkan 设备 | 安装 `mesa-vulkan-drivers`，或尝试 `WGPU_BACKEND=gl`。 |
 | macOS 上没有文字字形 | 确保已安装 Xcode Command Line Tools；GPUI 的文本后端使用 CoreText/Metal。 |
 | 中日韩文字显示为方框 | 安装 CJK 系统字体；重启应用。 |
-| 其他桌面应用的文件对话框不出现 | Luban Notepad 使用自己的对话框，因此不应影响打开/保存。 |
+| 其他桌面应用的文件对话框不出现 | 鲁班编辑器使用自己的对话框，因此不应影响打开/保存。 |

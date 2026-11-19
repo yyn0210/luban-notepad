@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a macOS .app bundle and zip for Luban Notepad.
+# Build a macOS .app bundle and zip for 鲁班编辑器.
 #
 # Usage:
 #   scripts/package-macos.sh              # build release + package
@@ -30,7 +30,7 @@ version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 binary="$target_dir/release/luban-notepad"
 dist="$root/dist"
-app_name="Luban Notepad"
+app_name="鲁班编辑器"
 app="$dist/$app_name.app"
 arch=$(uname -m)
 zip_name="luban-notepad-${version}-macos-${arch}.zip"

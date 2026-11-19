@@ -1,11 +1,11 @@
-# Luban Notepad（鲁班编辑器）
+# 鲁班编辑器
 
 > 一个使用 Rust 重新实现、跨平台的 Notepad++ 编辑体验，
 > 基于 [GPUI Kit](https://gpui-kit.com) 构建。
 
-![Luban Notepad 浅色主题](docs/screenshots/editor-light.png)
+![鲁班编辑器 浅色主题](docs/screenshots/editor-light.png)
 
-Luban Notepad 是一个完全使用 Rust 编写的原生桌面文本与源代码编辑器。它保留了
+鲁班编辑器是一个完全使用 Rust 编写的原生桌面文本与源代码编辑器。它保留了
 Notepad++ 中人们日常最常用的部分——快速的标签页编辑、语法高亮、跨文件查找/替换、
 编码与换行符控制、会话恢复——并在现代、跨平台的基础上重新实现。
 
@@ -104,7 +104,7 @@ Notepad++ 中人们日常最常用的部分——快速的标签页编辑、语�
 
 ## 架构
 
-Luban Notepad 分为无界面的核心引擎和 GPUI 应用两部分：
+鲁班编辑器分为无界面的核心引擎和 GPUI 应用两部分：
 
 | Crate | 职责 |
 | --- | --- |
@@ -167,7 +167,7 @@ cargo build --release -p luban-app
 
 ```bash
 scripts/package-linux.sh   # dist/*.tar.gz, dist/*.deb, dist/*.rpm
-scripts/package-macos.sh   # dist/Luban Notepad.app, dist/*.zip
+scripts/package-macos.sh   # dist/鲁班编辑器.app, dist/*.zip
 ```
 
 Debian 和 RPM 包分别需要系统提供 `dpkg-deb` 与 `rpmbuild`（Debian/Ubuntu 上
@@ -237,7 +237,7 @@ WGPU_BACKEND=gl target/release/luban-notepad
 
 ## 配置与会话
 
-Luban Notepad 使用平台的配置目录：
+鲁班编辑器使用平台的配置目录：
 
 | 平台 | 位置 |
 | --- | --- |
@@ -337,7 +337,7 @@ xvfb-run -a -s "-screen 0 1440x900x24" \
 
 ## 功能对齐程度
 
-Luban Notepad 实现了 Notepad++ 的核心编辑工作流，并提供 1.0 的插件 API、Lua
+鲁班编辑器实现了 Notepad++ 的核心编辑工作流，并提供 1.0 的插件 API、Lua
 运行时和用户包；它不追求 Notepad++ 的二进制插件兼容生态。详细对照表见
 [docs/FEATURES.md](docs/FEATURES.md)。主要差距：
 
@@ -358,7 +358,7 @@ Luban Notepad 实现了 Notepad++ 的核心编辑工作流，并提供 1.0 的�
 
 ## 许可证
 
-Luban Notepad 以 **木兰公共许可证第 2 版（Mulan PubL v2，MulanPubL-2.0）** 授权，
+鲁班编辑器以 **木兰公共许可证第 2 版（Mulan PubL v2，MulanPubL-2.0）** 授权，
 参见 [LICENSE](LICENSE)。
 
 Notepad++ 是 Don Ho 及贡献者的项目，本身以 GPL-3.0 授权。本仓库是一个独立的

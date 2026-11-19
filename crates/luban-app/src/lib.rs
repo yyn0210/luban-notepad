@@ -572,7 +572,7 @@ fn run_ui(
             if let Err(error) =
                 window_registry::open_window_with(options, bounds, launch.manual_chrome, cx)
             {
-                log::error!("failed to open Luban Notepad window: {error:#}");
+                log::error!("failed to open 鲁班编辑器 window: {error:#}");
                 if first {
                     cx.quit();
                     return;

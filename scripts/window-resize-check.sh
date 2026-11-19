@@ -251,7 +251,7 @@ chmod 700 "$XDG_RUNTIME_DIR"
 APP_PID=$!
 WID=""
 for _ in $(seq 1 150); do
-  WID="$(xdotool search --onlyvisible --name "Luban Notepad" 2>/dev/null | head -1 || true)"
+  WID="$(xdotool search --onlyvisible --name "鲁班编辑器" 2>/dev/null | head -1 || true)"
   [ -n "$WID" ] && break
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     tail -20 "$TMP/app.out" >&2

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a portable Linux tarball plus Debian and RPM packages for Luban Notepad.
+# Build a portable Linux tarball plus Debian and RPM packages for 鲁班编辑器.
 #
 # Usage:
 #   scripts/package-linux.sh              # build release + package
@@ -151,7 +151,7 @@ Installed-Size: $installed_size
 Depends: $computed
 Homepage: https://github.com/luban-notepad/luban-notepad
 Description: cross-platform tabbed text and source code editor
- Luban Notepad is a native desktop text and source code editor written in
+ 鲁班编辑器 is a native desktop text and source code editor written in
  Rust and rendered with GPUI. It offers tabbed editing, syntax highlighting,
  find and replace across files, encoding and line-ending control, session
  restore, and a folder explorer.
@@ -187,7 +187,7 @@ URL: https://github.com/luban-notepad/luban-notepad
 BuildArch: $rpm_arch
 
 %description
-Luban Notepad is a native desktop text and source code editor written in
+鲁班编辑器 is a native desktop text and source code editor written in
 Rust and rendered with GPUI. It offers tabbed editing, syntax highlighting,
 find and replace across files, encoding and line-ending control, session
 restore, and a folder explorer.

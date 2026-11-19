@@ -222,7 +222,7 @@ step "launch"
 "$BIN" "$SAMPLE" >"$TMP/app.out" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 150); do
-  WID="$(xdotool search --onlyvisible --name "Luban Notepad" 2>/dev/null | head -1 || true)"
+  WID="$(xdotool search --onlyvisible --name "鲁班编辑器" 2>/dev/null | head -1 || true)"
   [ -n "$WID" ] && break
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     fail "the application exited during startup"
@@ -231,7 +231,7 @@ for _ in $(seq 1 150); do
 done
 [ -n "$WID" ] || fail "no editor window appeared"
 xdotool windowfocus "$WID" 2>/dev/null || true
-wait_for_title "sample.txt - Luban Notepad" 20 || fail "unexpected start title: $(window_title)"
+wait_for_title "sample.txt - 鲁班编辑器" 20 || fail "unexpected start title: $(window_title)"
 
 step "mouse click positions the caret and Ctrl+S saves"
 editor_click

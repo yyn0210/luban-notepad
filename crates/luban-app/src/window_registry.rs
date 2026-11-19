@@ -143,7 +143,7 @@ pub fn window_options(
     WindowOptions {
         window_bounds: Some(bounds),
         titlebar: Some(TitlebarOptions {
-            title: Some("Luban Notepad".into()),
+            title: Some("鲁班编辑器".into()),
             ..TitleBar::title_bar_options()
         }),
         // All desktop platforms request `Client` decorations. On X11 with

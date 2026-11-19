@@ -894,7 +894,7 @@ impl LubanApp {
             recovery_prompt: None,
             recovery_restoring: None,
             pending_huge_at: None,
-            window_title: "Luban Notepad".to_string(),
+            window_title: "鲁班编辑器".to_string(),
             window_width: 1280.0,
             window_height: 820.0,
             window_maximized: false,
@@ -3467,7 +3467,7 @@ impl LubanApp {
         let title = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Luban Notepad".to_string());
+            .unwrap_or_else(|| "鲁班编辑器".to_string());
         let content = match format {
             ExportFormat::Html => export::to_html(&text, &token, &theme, &title),
             ExportFormat::Rtf => export::to_rtf(&text, &token, &theme),
@@ -7720,7 +7720,7 @@ impl LubanApp {
                 div()
                     .text_2xl()
                     .font_weight(FontWeight::BOLD)
-                    .child("Luban Notepad"),
+                    .child("鲁班编辑器"),
             )
             .child(div().text_sm().child(tr_args(
                 "about.version",
@@ -7910,12 +7910,12 @@ impl Render for LubanApp {
             .active_doc()
             .map(|doc| {
                 format!(
-                    "{}{} - Luban Notepad",
+                    "{}{} - 鲁班编辑器",
                     doc.display_name(),
                     if doc.is_modified() { " *" } else { "" }
                 )
             })
-            .unwrap_or_else(|| "Luban Notepad".to_string());
+            .unwrap_or_else(|| "鲁班编辑器".to_string());
         if title != self.window_title {
             self.window_title = title;
             window.set_window_title(&self.window_title);

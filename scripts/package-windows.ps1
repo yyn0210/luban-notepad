@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Build the Windows portable zip and installer for Luban Notepad.
+Build the Windows portable zip and installer for 鲁班编辑器.
 
 .DESCRIPTION
 Builds the release executable (unless -SkipBuild), stages the portable

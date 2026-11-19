@@ -1573,7 +1573,7 @@ impl LubanApp {
                             .flex_shrink_0()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Luban Notepad"),
+                            .child("鲁班编辑器"),
                     )
                     .child(div().flex_shrink_0().child(menus)),
             )

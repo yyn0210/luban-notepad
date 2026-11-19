@@ -1,4 +1,4 @@
-; Inno Setup 6 script for the Luban Notepad installer.
+; Inno Setup 6 script for the 鲁班编辑器 installer.
 ;
 ; Build it through scripts/package-windows.ps1, which passes the required
 ; defines and stages the files first:
@@ -32,6 +32,7 @@
 #endif
 
 #define MyAppName "Luban Notepad"
+#define MyAppDisplayName "鲁班编辑器"
 #define MyAppExeName "luban-notepad.exe"
 #define MyAppPublisher "Luban Notepad Contributors"
 #define MyAppURL "https://github.com/luban-notepad/luban-notepad"
@@ -40,22 +41,22 @@
 ; Keep this AppId stable: it is how Windows recognizes upgrades of the same
 ; product. Changing it makes the new installer install side by side instead.
 AppId={{8C41A5F7-8C3B-4F4F-9C62-3A1C9B6D2E71}
-AppName={#MyAppName}
+AppName={#MyAppDisplayName}
 AppVersion={#AppVersion}
-AppVerName={#MyAppName} {#AppVersion}
+AppVerName={#MyAppDisplayName} {#AppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
-DefaultGroupName={#MyAppName}
+DefaultGroupName={#MyAppDisplayName}
 DisableProgramGroupPage=yes
 LicenseFile={#SourceDir}\LICENSE.utf8.txt
 OutputDir={#OutputDir}
 OutputBaseFilename=luban-notepad-{#AppVersion}-windows-{#Arch}-setup
 SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\{#MyAppExeName}
-UninstallDisplayName={#MyAppName}
+UninstallDisplayName={#MyAppDisplayName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -83,8 +84,8 @@ Name: "chinesesimplified"; MessagesFile: "{#ChineseMessagesFile}"
 #endif
 
 [CustomMessages]
-english.ContextMenu=Add "Open with Luban Notepad" to the context menu
-english.DeleteSettings=Delete Luban Notepad settings, session, and recent file history?
+english.ContextMenu=Add "Open with 鲁班编辑器" to the context menu
+english.DeleteSettings=Delete 鲁班编辑器 settings, session, and recent file history?
 #if ChineseLanguage
 chinesesimplified.ContextMenu=将“使用鲁班编辑器打开”添加到右键菜单
 chinesesimplified.DeleteSettings=是否删除鲁班编辑器的设置、会话和最近文件记录？
@@ -107,21 +108,21 @@ Source: "{#SourceDir}\THIRD_PARTY_LICENSES.md"; DestDir: "{app}"; Flags: ignorev
 Type: files; Name: "{app}\luban-notepad.portable"
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{cm:UninstallProgram,{#MyAppDisplayName}}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
 ; Allow starting the app from the Run dialog and other launchers.
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 ; Optional Explorer integration; uninsdeletekey removes the command subkey too.
-Root: HKA; Subkey: "Software\Classes\*\shell\LubanNotepad"; ValueType: string; ValueName: ""; ValueData: "Open with Luban Notepad"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\*\shell\LubanNotepad"; ValueType: string; ValueName: ""; ValueData: "使用鲁班编辑器打开"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\*\shell\LubanNotepad"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppExeName},0"; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\*\shell\LubanNotepad\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: contextmenu
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppDisplayName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

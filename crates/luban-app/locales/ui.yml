@@ -1,7 +1,7 @@
 _version: 2
 
 cli.help:
-  en: "Luban Notepad %{version}\n\nUsage: luban-notepad [OPTIONS] [FILE ...]\n\nOptions:\n  --goto <path>:<line>[:<col>]  Open a file at a line and column\n  --new-window                  Open a new window\n  --wait                        Wait until the opened tabs close\n  --diff <left> <right>         Open a read-only diff\n  --stdin                       Read standard input as a new document\n  --command <id>                Run a command after opening files\n  --safe-mode                   Start without plugins\n  --new, -n                     Start without restoring the session\n  --smoke-test                  Start and exit (CI)\n  --help, -h                    Show this help\n  --version, -V                 Show the version\n\nA cross-platform Rust reimplementation of the Notepad++ editing experience."
+  en: "鲁班编辑器 %{version}\n\nUsage: luban-notepad [OPTIONS] [FILE ...]\n\nOptions:\n  --goto <path>:<line>[:<col>]  Open a file at a line and column\n  --new-window                  Open a new window\n  --wait                        Wait until the opened tabs close\n  --diff <left> <right>         Open a read-only diff\n  --stdin                       Read standard input as a new document\n  --command <id>                Run a command after opening files\n  --safe-mode                   Start without plugins\n  --new, -n                     Start without restoring the session\n  --smoke-test                  Start and exit (CI)\n  --help, -h                    Show this help\n  --version, -V                 Show the version\n\nA cross-platform Rust reimplementation of the Notepad++ editing experience."
   zh-CN: "鲁班编辑器 %{version}\n\n用法：luban-notepad [选项] [文件 ...]\n\n选项：\n  --goto <路径>:<行>[:<列>]     打开文件并定位到行列\n  --new-window                  打开新窗口\n  --wait                        等到打开的标签页关闭后退出\n  --diff <左> <右>              打开只读差异视图\n  --stdin                       把标准输入读入新文档\n  --command <id>                打开文件后执行命令\n  --safe-mode                   以安全模式启动（禁用插件）\n  --new, -n                     启动时不恢复会话\n  --smoke-test                  启动后退出（CI）\n  --help, -h                    显示帮助\n  --version, -V                 显示版本\n\n使用 Rust 与 GPUI 跨平台重新实现 Notepad++ 的编辑体验。"
 
 common.close:
@@ -193,7 +193,7 @@ menu.help.shortcuts:
   en: "Keyboard Shortcuts"
   zh-CN: "键盘快捷键"
 menu.help.about:
-  en: "About Luban Notepad"
+  en: "About 鲁班编辑器"
   zh-CN: "关于鲁班编辑器"
 
 toolbar.new:
@@ -905,7 +905,7 @@ prefs.hidden_files:
   en: "Show hidden files in explorer"
   zh-CN: "在文件浏览器中显示隐藏文件"
 prefs.footer:
-  en: "Settings are applied immediately and stored in the Luban Notepad config directory."
+  en: "Settings are applied immediately and stored in the 鲁班编辑器 config directory."
   zh-CN: "设置会立即应用，并保存在鲁班编辑器配置目录中。"
 prefs.pixels:
   en: "%{size} px"

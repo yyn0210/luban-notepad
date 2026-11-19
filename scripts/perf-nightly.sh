@@ -164,7 +164,7 @@ PY
       APP_PID=$!
       FOUND=0
       for _ in $(seq 1 12000); do
-        if xdotool search --onlyvisible --name "perf-big.txt - Luban Notepad" >/dev/null 2>&1; then
+        if xdotool search --onlyvisible --name "perf-big.txt - 鲁班编辑器" >/dev/null 2>&1; then
           FOUND=1
           break
         fi
