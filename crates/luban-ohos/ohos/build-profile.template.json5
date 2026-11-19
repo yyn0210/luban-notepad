@@ -1,10 +1,15 @@
 {
+  // AppGallery/HarmonyOS profile. compileSdk/targetSdk use the dotted
+  // HarmonyOS 26.0.0 Release string (the 26 line is dotted, and AGC rejects
+  // packages whose SDK stage is Beta); compatibleSdkVersion is a HarmonyOS
+  // version string — "6.1.0(23)" means API 23, the validated floor.
   "app": {
     "products": [
       {
         "name": "default",
+        "compileSdkVersion": "26.0.0",
         "targetSdkVersion": "26.0.0",
-        "compatibleSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "6.1.0(23)",
         "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {
