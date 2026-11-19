@@ -5237,8 +5237,6 @@ dependencies = [
 [[package]]
 name = "ohos-enum-derive"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2988e3067c0c79d34254847f0ecce89ff7fea9a6bf45aa3874e192662ae1581"
 dependencies = [
  "convert_case 0.6.0",
  "proc-macro2",

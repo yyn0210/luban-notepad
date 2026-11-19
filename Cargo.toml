@@ -58,6 +58,10 @@ opt-level = 2
 #   evdev codes outside the generated OHOS enum.
 # - openharmony-ability ignores ArkUI key events with unknown raw key codes
 #   for the same reason (the ArkUI key path converts `key_code_raw` itself).
+# - ohos-enum-derive falls back to the first enum variant instead of
+#   `unreachable!` when a raw attribute value is out of range: a retail
+#   MateBook Pro reported display `rotation >= 4`, which aborted the process
+#   in `DisplayInfo::from_raw` during startup (AGC launch-test SIGABRT).
 #
 # See vendor/README.md.
 [patch.crates-io]
@@ -65,3 +69,4 @@ gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
 gpui-pre-platform = { path = "vendor/gpui-pre-platform" }
 ohos-xcomponent-binding = { path = "vendor/ohos-xcomponent-binding" }
 openharmony-ability = { path = "vendor/openharmony-ability" }
+ohos-enum-derive = { path = "vendor/ohos-enum-derive" }

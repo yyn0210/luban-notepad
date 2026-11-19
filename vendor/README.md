@@ -10,6 +10,8 @@
   “ohos-xcomponent-binding 补丁”。
 - `openharmony-ability`：ArkUI 键盘事件忽略未知键码，见文末
   “openharmony-ability 补丁”。
+- `ohos-enum-derive`：`EnumFrom` 派生的 raw→枚举转换对未知值回退到第一个
+  变体而不是 `unreachable!`，见文末 “ohos-enum-derive 补丁”。
 - `gpui-ohos`：OpenHarmony 平台后端（固定到上游 commit，独立 workspace，
   不属于 `[patch.crates-io]`）。
 
@@ -242,3 +244,27 @@ code: KeyCode::try_from_raw(code).unwrap_or(KeyCode::Unknown),
 
 删除条件：上游把 ArkUI 键盘路径也改为非 panic 转换（或不再使用该 crate）。
 
+
+## ohos-enum-derive 补丁
+
+`ohos-enum-derive` 0.1.2 的本地副本。所有 ohos-rs binding crate 的
+`EnumFrom` 派生都会生成 `impl From<raw> for 枚举`，未覆盖的 raw 值走
+`unreachable!("Invalid attribute value")` 直接 abort。前面两个补丁
+（键码）都是在调用点绕开它，而 2026-11-14 的真机崩溃证明调用点修不完：
+AGC 上架测试在 HUAWEI MateBook Pro（HarmonyOS 6.1.0.135）上启动即
+SIGABRT，符号化定位到 `ohos_display_binding::DisplayInfo::from_raw` 的
+`Rotation::from(raw.rotation)`——设备上报的 rotation 为 >= 4 的越界值
+（模拟器与 KaihongOS 虚机都是 0–3，所以从未触发）。与 SDK 头文件
+`oh_display_info.h` 逐字段核对过，结构体布局一致，不是 ABI 错位，
+就是设备/云测环境给出了枚举范围外的值。
+
+补丁只改 `src/lib.rs` 一处：`From<raw> for 枚举` 的 `_` 臂从
+`unreachable!` 改为回退到**第一个不带 cfg 的变体**（Rotation→Rotation0、
+State/Orientation→Unknown 类值；全部变体都带 cfg 时保留上游行为）。
+`枚举→raw` 方向的匹配本就穷尽，保持不动；`try_from_raw` 本就返回
+`Option`，不动。
+
+这样所有使用 `EnumFrom` 的 binding crate（display/window/input/…）对
+越界属性值统一变成“取默认值继续跑”，这一类崩溃从根上消除。删除条件：
+上游 ohos-enum-derive 把 fallback 改为非 panic（或 ohos-rs 全系换用
+`TryFrom`）。
